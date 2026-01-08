@@ -4,45 +4,31 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
-import { createClient } from '@supabase/supabase-js';
 import { z } from 'zod';
 import invariant from 'tiny-invariant';
 
-type Role =
-  | 'admin'
-  | 'super_admin'
-  | 'receptionist'
-  | 'nurse'
-  | 'finance'
-  | 'doctor'
-  | 'staff'
-  | string;
+// Config & Middleware
+import { supabaseAdmin } from './config/supabase';
+import { requireUser, superAdminGuard, adminKeyGuard } from './middleware/auth';
 
-const {
-  PORT = '4000',
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  ADMIN_API_SECRET,
-  ALLOWED_ORIGINS,
-} = process.env;
-
-invariant(SUPABASE_URL, 'SUPABASE_URL is required for the backend');
-invariant(SUPABASE_SERVICE_ROLE_KEY, 'SUPABASE_SERVICE_ROLE_KEY is required for the backend');
-invariant(ADMIN_API_SECRET, 'ADMIN_API_SECRET is required for administrative endpoints');
-
-const allowedOrigins = (ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
-
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
+// Routes
+import authRouter from './routes/auth';
+import masterDataRouter from './routes/master-data';
+import patientsRouter from './routes/patients';
+import staffRouter from './routes/staff';
+import financeRouter from './routes/finance';
+import inventoryRouter from './routes/inventory';
+import aiRouter from './routes/ai';
 
 const app = express();
+const port = process.env.PORT || 4000;
+
 app.use(helmet());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 app.use(
   cors({
-    origin: allowedOrigins.length > 0 ? allowedOrigins : '*',
-    credentials: false,
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:8080', 'http://localhost:5173'],
+    credentials: true
   })
 );
 app.use(morgan('combined'));
@@ -52,63 +38,20 @@ const globalLimiter = rateLimit({
   limit: 100,
 });
 
-const requireUser = async (req: express.Request) => {
-  const authHeader = req.header('authorization') || '';
-  const token = authHeader.toLowerCase().startsWith('bearer ')
-    ? authHeader.slice(7)
-    : undefined;
-
-  if (!token) {
-    return { error: 'Missing bearer token' as const };
-  }
-
-  const { data, error } = await supabaseAdmin.auth.getUser(token);
-  if (error || !data?.user) {
-    return { error: 'Invalid token' as const };
-  }
-
-  const authUserId = data.user.id;
-  const { data: profile } = await supabaseAdmin
-    .from('users')
-    .select('id, tenant_id, facility_id, user_role')
-    .eq('auth_user_id', authUserId)
-    .order('created_at', { ascending: true })
-    .limit(1)
-    .maybeSingle();
-
-  return {
-    user: {
-      authUserId,
-      profileId: profile?.id,
-      tenantId: profile?.tenant_id,
-      facilityId: profile?.facility_id,
-      role: (profile?.user_role as Role | null) || 'staff',
-    },
-  };
-};
-
-// Legacy admin key guard (used for some admin endpoints)
-const adminOnly = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const key = req.header('x-api-key');
-  if (key && key === ADMIN_API_SECRET) {
-    return next();
-  }
-  return res.status(401).json({ error: 'Unauthorized' });
-};
-
-const superAdminGuard = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
-  if (auth.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
-  (req as any).authUser = auth.user;
-  return next();
-};
-
 app.use(globalLimiter);
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
+
+// Mount Routes
+app.use('/api/auth', authRouter);
+app.use('/api/master-data', masterDataRouter);
+app.use('/api/patients', patientsRouter);
+app.use('/api/staff', staffRouter);
+app.use('/api/finance', financeRouter);
+app.use('/api/inventory', inventoryRouter);
+app.use('/api/ai', aiRouter);
 
 const clinicRegistrationSchema = z.object({
   clinic: z.object({
@@ -172,7 +115,7 @@ const superAdminSchema = z.object({
   name: z.string().min(2),
 });
 
-app.post('/api/admin/super-admin', adminOnly, async (req, res) => {
+app.post('/api/admin/super-admin', adminKeyGuard, async (req, res) => {
   const parsed = superAdminSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
@@ -288,15 +231,14 @@ const featureRequestSchema = z.object({
   attachment_urls: z.array(z.string()).optional(),
 });
 
-app.post('/api/feature-requests', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
+app.post('/api/feature-requests', requireUser, async (req, res) => {
   const parsed = featureRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
   }
 
-  const { user } = auth;
+  // Access user from request (populated by middleware)
+  const { profileId, facilityId } = req.user!;
   const body = parsed.data;
 
   try {
@@ -304,8 +246,8 @@ app.post('/api/feature-requests', async (req, res) => {
       .from('feature_requests')
       .insert({
         ...body,
-        user_id: user.profileId,
-        facility_id: user.facilityId,
+        user_id: profileId,
+        facility_id: facilityId,
       })
       .select()
       .single();
@@ -318,15 +260,13 @@ app.post('/api/feature-requests', async (req, res) => {
   }
 });
 
-app.get('/api/feature-requests/me', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
-
+app.get('/api/feature-requests/me', requireUser, async (req, res) => {
+  const { profileId } = req.user!;
   try {
     const { data, error } = await supabaseAdmin
       .from('feature_requests')
       .select('*, users(name, user_role), facilities(name)')
-      .eq('user_id', auth.user.profileId)
+      .eq('user_id', profileId)
       .neq('status', 'deleted')
       .order('created_at', { ascending: false });
 
@@ -338,10 +278,7 @@ app.get('/api/feature-requests/me', async (req, res) => {
   }
 });
 
-app.get('/api/feature-requests', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
-
+app.get('/api/feature-requests', requireUser, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from('feature_requests')
@@ -397,10 +334,7 @@ app.get('/api/feature-requests/duplicates', async (req, res) => {
   }
 });
 
-app.patch('/api/feature-requests/:id', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
-
+app.patch('/api/feature-requests/:id', requireUser, async (req, res) => {
   const allowedFields = ['description', 'priority', 'importance_tag', 'current_value', 'desired_value', 'use_case'];
   const updates = Object.fromEntries(
     Object.entries(req.body || {}).filter(([key]) => allowedFields.includes(key))
@@ -422,10 +356,9 @@ app.patch('/api/feature-requests/:id', async (req, res) => {
   }
 });
 
-app.patch('/api/feature-requests/:id/status', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
-  if (auth.user.role !== 'admin' && auth.user.role !== 'super_admin') {
+app.patch('/api/feature-requests/:id/status', requireUser, async (req, res) => {
+  const { role } = req.user!;
+  if (role !== 'admin' && role !== 'super_admin') {
     return res.status(403).json({ error: 'Forbidden' });
   }
 
@@ -456,16 +389,15 @@ app.patch('/api/feature-requests/:id/status', async (req, res) => {
   }
 });
 
-app.post('/api/feature-requests/:id/confirm', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
+app.post('/api/feature-requests/:id/confirm', requireUser, async (req, res) => {
+  const { profileId } = req.user!;
 
   try {
     const { data, error } = await supabaseAdmin
       .from('feature_requests')
       .update({
         confirmed_at: new Date().toISOString(),
-        confirmed_by_user_id: auth.user.profileId,
+        confirmed_by_user_id: profileId,
       })
       .eq('id', req.params.id)
       .select()
@@ -479,9 +411,8 @@ app.post('/api/feature-requests/:id/confirm', async (req, res) => {
   }
 });
 
-app.post('/api/feature-requests/:id/vote', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
+app.post('/api/feature-requests/:id/vote', requireUser, async (req, res) => {
+  const { profileId } = req.user!;
   const voteType = req.body?.voteType as 'upvote' | 'downvote' | undefined;
   if (!voteType) return res.status(400).json({ error: 'voteType is required' });
 
@@ -490,7 +421,7 @@ app.post('/api/feature-requests/:id/vote', async (req, res) => {
       .from('feature_request_votes')
       .select('*')
       .eq('feature_request_id', req.params.id)
-      .eq('user_id', auth.user.profileId)
+      .eq('user_id', profileId)
       .maybeSingle();
 
     if (existingVote) {
@@ -514,7 +445,7 @@ app.post('/api/feature-requests/:id/vote', async (req, res) => {
         .from('feature_request_votes')
         .insert({
           feature_request_id: req.params.id,
-          user_id: auth.user.profileId,
+          user_id: profileId,
           vote_type: voteType,
         });
       if (insertErr) return res.status(500).json({ error: insertErr.message });
@@ -526,10 +457,7 @@ app.post('/api/feature-requests/:id/vote', async (req, res) => {
   }
 });
 
-app.delete('/api/feature-requests/:id', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
-
+app.delete('/api/feature-requests/:id', requireUser, async (req, res) => {
   try {
     const { error } = await supabaseAdmin.from('feature_requests').delete().eq('id', req.params.id);
     if (!error) return res.json({ action: 'deleted' });
@@ -548,11 +476,10 @@ app.delete('/api/feature-requests/:id', async (req, res) => {
 });
 
 // Clinic Admin overview (BFF for dashboard)
-app.get('/api/clinic-admin/overview', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
+app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
+  const { facilityId: userFacilityId } = req.user!;
+  const facilityId = (req.query.facilityId as string | undefined) || userFacilityId;
 
-  const facilityId = (req.query.facilityId as string | undefined) || auth.user.facilityId;
   if (!facilityId) return res.status(400).json({ error: 'Missing facilityId' });
 
   try {
@@ -643,48 +570,11 @@ app.get('/api/clinic-admin/overview', async (req, res) => {
 });
 
 // Super admin dashboard data
-app.get('/api/super-admin/dashboard', async (req, res) => {
-  const auth = await requireUser(req);
-  if ('error' in auth) return res.status(401).json({ error: auth.error });
-  if (auth.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
+app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
+  const { role } = req.user!;
+  if (role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
 
-  try {
-    const [{ data: tenants }, { data: facilities }, { data: users }, { data: approvals }] = await Promise.all([
-      supabaseAdmin.from('tenants').select('id, name, subdomain, is_active, created_at'),
-      supabaseAdmin
-        .from('facilities')
-        .select('id, tenant_id, name, facility_type, location, address, verified, clinic_code, admin_user_id'),
-      supabaseAdmin
-        .from('users')
-        .select('id, auth_user_id, user_role, tenant_id, facility_id, verified, created_at, full_name'),
-      supabaseAdmin
-        .from('staff_registration_requests')
-        .select('id, facility_id, auth_user_id, status, created_at')
-        .eq('status', 'pending'),
-    ]);
-
-    return res.json({
-      tenants: tenants ?? [],
-      facilities: facilities ?? [],
-      users: users ?? [],
-      approvals: approvals ?? [],
-      health: {
-        api: { uptime: 99.9, p95ms: 250, errorRate: 0.5 },
-        db: { slowQueries: 0, connections: 10, storageGb: 20 },
-        queues: { natsLag: 0, outboxBacklog: 0, failedJobs: 0 },
-        sync: { offlineDevices: 0, stuckOver2h: 0 },
-        sms: { successRate: 97.5, failures24h: 0 },
-        incidents: { active: false },
-      },
-    });
-  } catch (err) {
-    console.error('super-admin/dashboard failed', err);
-    return res.status(500).json({ error: 'Unexpected error fetching super admin data' });
-  }
-});
-
-// Super admin dashboard data with filtering
-app.get('/api/super-admin/dashboard', superAdminGuard, async (req, res) => {
+  // Filtering params
   const q = (req.query.q as string | undefined)?.toLowerCase() || '';
   const filterTenantId = (req.query.tenantId as string | undefined) || 'all';
   const filterFacilityId = (req.query.facilityId as string | undefined) || 'all';
@@ -778,6 +668,6 @@ app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-app.listen(Number(PORT), () => {
-  console.log(`API server listening on :${PORT}`);
+app.listen(port, () => {
+  console.log(`API server listening on :${port}`);
 });
