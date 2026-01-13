@@ -65,14 +65,24 @@ router.get('/search', async (req, res) => {
  * GET /api/patients/:id/visits/history
  */
 router.get('/:id/visits/history', async (req, res) => {
+    const { facilityId, tenantId } = req.user!;
     const limit = parseInt(req.query.limit as string) || 5;
     try {
-        const { data, error } = await supabaseAdmin
+        let query = supabaseAdmin
             .from('visits')
             .select('id, visit_date, reason, status, provider, visit_notes, clinical_notes, fee_paid, temperature, weight, blood_pressure, heart_rate, respiratory_rate, oxygen_saturation, pain_score')
             .eq('patient_id', req.params.id)
             .order('visit_date', { ascending: false })
             .limit(limit);
+
+        if (facilityId) {
+            query = query.eq('facility_id', facilityId);
+        }
+        if (tenantId) {
+            query = query.eq('tenant_id', tenantId);
+        }
+
+        const { data, error } = await query;
 
         if (error) throw error;
         res.json(data);
@@ -93,11 +103,29 @@ router.post('/:id/visits', async (req, res) => {
         const payload = createVisitSchema.parse(req.body);
 
         // 0. CHECK FOR ACTIVE VISITS
+        const activeStatuses = [
+            'registered',
+            'triage',
+            'doctor',
+            'lab',
+            'pharmacy',
+            'procedure',
+            'at_triage',
+            'vitals_taken',
+            'with_doctor',
+            'at_lab',
+            'at_imaging',
+            'paying_consultation',
+            'paying_diagnosis',
+            'paying_pharmacy',
+            'at_pharmacy',
+        ];
+
         const { data: activeVisits } = await supabaseAdmin
             .from('visits')
             .select('id, status')
             .eq('patient_id', patientId)
-            .in('status', ['registered', 'triage', 'doctor', 'lab', 'pharmacy', 'procedure'])
+            .in('status', activeStatuses)
             .order('visit_date', { ascending: false })
             .limit(1);
 
@@ -253,6 +281,11 @@ const registerIntakeSchema = z.object({
     requestedProfessionalId: z.string().optional()
 });
 
+const routeVisitSchema = z.object({
+    destinationStage: z.string(),
+    force: z.boolean().optional(),
+});
+
 /**
  * POST /api/patients/register-intake
  * Registers a new patient with visit and billing
@@ -262,6 +295,17 @@ router.post('/register-intake', async (req, res) => {
 
     try {
         const payload = registerIntakeSchema.parse(req.body);
+        const normalizePaymentType = (value?: string) => {
+            const normalized = (value || 'paying').trim().toLowerCase();
+            if (normalized === 'digital') return 'paying';
+            if (normalized === 'insurance') return 'insured';
+            return normalized;
+        };
+        const consultationPaymentType = normalizePaymentType(payload.consultationPaymentType);
+        const allowedPaymentTypes = new Set(['paying', 'free', 'credit', 'insured']);
+        if (!allowedPaymentTypes.has(consultationPaymentType)) {
+            return res.status(400).json({ error: 'Invalid consultation payment type' });
+        }
 
         // 1. Duplicate Check (Fayida ID)
         if (payload.fayidaId) {
@@ -298,7 +342,7 @@ router.post('/register-intake', async (req, res) => {
             p_occupation: payload.occupation || null,
             p_intake_timestamp: payload.intakeTimestamp,
             p_intake_patient_id: payload.intakePatientId,
-            p_consultation_payment_type: payload.consultationPaymentType,
+            p_consultation_payment_type: consultationPaymentType,
             p_program_id: payload.programId || null,
             p_creditor_id: payload.creditorId || null,
             p_insurer_id: payload.insuranceProviderId || null,
@@ -309,7 +353,28 @@ router.post('/register-intake', async (req, res) => {
 
         if (rpcError) throw rpcError;
 
-        // 3. Update visit notes with warnings/flags
+        const visitId = (result as { visit_id?: string } | null)?.visit_id;
+
+        // 3. Cleanup unexpected dressing charges (legacy data/trigger safety)
+        if (visitId) {
+            const { data: dressingServices } = await supabaseAdmin
+                .from('medical_services')
+                .select('id')
+                .eq('facility_id', facilityId)
+                .ilike('name', '%Dressing%');
+
+            const dressingServiceIds = (dressingServices || []).map((service) => service.id);
+            if (dressingServiceIds.length > 0) {
+                await supabaseAdmin
+                    .from('billing_items')
+                    .delete()
+                    .eq('visit_id', visitId)
+                    .in('service_id', dressingServiceIds)
+                    .in('payment_status', ['unpaid', 'pending']);
+            }
+        }
+
+        // 4. Update visit notes with warnings/flags
         const intakeFlags: string[] = [];
         if (payload.visitType === 'Follow-up') {
             intakeFlags.push('Follow-up visit');
@@ -324,16 +389,12 @@ router.post('/register-intake', async (req, res) => {
             intakeFlags.push(`Emergency flag: ${payload.emergencyDescription || 'unspecified'}`);
         }
 
-        if (intakeFlags.length > 0) {
+        if (intakeFlags.length > 0 && visitId) {
             const note = `Intake flags — ${intakeFlags.join(' | ')}`;
-            // We need to fetch the visit ID from result. Result is object { visit_id, ... }
-            const visitId = (result as any).visit_id;
-            if (visitId) {
-                await supabaseAdmin
-                    .from('visits')
-                    .update({ visit_notes: note })
-                    .eq('id', visitId);
-            }
+            await supabaseAdmin
+                .from('visits')
+                .update({ visit_notes: note })
+                .eq('id', visitId);
         }
 
         res.json(result);
@@ -341,6 +402,65 @@ router.post('/register-intake', async (req, res) => {
     } catch (error: any) {
         if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues });
         res.status(500).json({ error: error.message });
+    }
+});
+
+/**
+ * POST /api/patients/visits/:id/route
+ * Route a visit to the next journey stage.
+ */
+router.post('/visits/:id/route', async (req, res) => {
+    const { facilityId, profileId, role } = req.user!;
+    const visitId = req.params.id;
+
+    try {
+        const { destinationStage, force } = routeVisitSchema.parse(req.body);
+
+        const { data: visitRow, error: visitError } = await supabaseAdmin
+            .from('visits')
+            .select('id, facility_id')
+            .eq('id', visitId)
+            .maybeSingle();
+
+        if (visitError) throw visitError;
+        if (!visitRow) return res.status(404).json({ error: 'Visit not found' });
+
+        if (facilityId && visitRow.facility_id !== facilityId) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        const { error: advanceError } = await supabaseAdmin.rpc('advance_patient_stage', {
+            p_visit_id: visitId,
+            p_next_stage: destinationStage,
+            p_user_id: profileId || null,
+        });
+
+        if (!advanceError) {
+            return res.json({ success: true });
+        }
+
+        const canForce = force && ['admin', 'super_admin', 'finance'].includes(role);
+        if (!canForce) {
+            return res.status(400).json({ error: advanceError.message || 'Routing failed' });
+        }
+
+        const now = new Date().toISOString();
+        const { error: updateError } = await supabaseAdmin
+            .from('visits')
+            .update({
+                current_journey_stage: destinationStage,
+                journey_stage: destinationStage,
+                routing_status: 'routing_in_progress',
+                status_updated_at: now,
+            })
+            .eq('id', visitId);
+
+        if (updateError) throw updateError;
+
+        return res.json({ success: true, forced: true });
+    } catch (error: any) {
+        if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues });
+        res.status(500).json({ error: error.message || 'Routing failed' });
     }
 });
 

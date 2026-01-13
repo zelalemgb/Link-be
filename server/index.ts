@@ -5,11 +5,10 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
-import invariant from 'tiny-invariant';
 
 // Config & Middleware
 import { supabaseAdmin } from './config/supabase';
-import { requireUser, superAdminGuard, adminKeyGuard } from './middleware/auth';
+import { requireUser, adminKeyGuard } from './middleware/auth';
 
 // Routes
 import authRouter from './routes/auth';
@@ -19,15 +18,25 @@ import staffRouter from './routes/staff';
 import financeRouter from './routes/finance';
 import inventoryRouter from './routes/inventory';
 import aiRouter from './routes/ai';
+import receptionRouter from './routes/reception';
+import ordersRouter from './routes/orders';
 
 const app = express();
 const port = process.env.PORT || 4000;
 
 app.use(helmet());
 app.use(express.json());
+app.use((req, res, next) => {
+  console.log(`[Incoming Request] ${req.method} ${req.url} from ${req.headers.origin}`);
+  next();
+});
+
 app.use(
   cors({
-    origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:8080', 'http://localhost:5173'],
+    origin: (origin, callback) => {
+      // Allow any origin for now to rule out CORS issues
+      callback(null, true);
+    },
     credentials: true
   })
 );
@@ -39,6 +48,22 @@ const globalLimiter = rateLimit({
 });
 
 app.use(globalLimiter);
+
+const findAuthUserByEmail = async (email: string) => {
+  const normalized = email.trim().toLowerCase();
+  const perPage = 200;
+
+  for (let page = 1; page <= 50; page += 1) {
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage });
+    if (error) throw error;
+    const users = data?.users ?? [];
+    const match = users.find((user) => user.email?.toLowerCase() === normalized);
+    if (match) return match;
+    if (users.length < perPage) break;
+  }
+
+  return null;
+};
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
@@ -52,6 +77,8 @@ app.use('/api/staff', staffRouter);
 app.use('/api/finance', financeRouter);
 app.use('/api/inventory', inventoryRouter);
 app.use('/api/ai', aiRouter);
+app.use('/api/reception', receptionRouter);
+app.use('/api/orders', ordersRouter);
 
 const clinicRegistrationSchema = z.object({
   clinic: z.object({
@@ -115,6 +142,22 @@ const superAdminSchema = z.object({
   name: z.string().min(2),
 });
 
+const betaRegistrationSchema = z.object({
+  clinic_name: z.string().min(2).max(100),
+  clinic_type: z.string().min(2).max(50),
+  contact_person_name: z.string().min(2).max(100),
+  contact_person_role: z.string().min(2).max(50),
+  contact_phone: z.string().min(7).max(20),
+  contact_email: z.string().email(),
+  region: z.string().min(1).max(100),
+  patient_volume_monthly: z.string().optional(),
+  city: z.string().optional(),
+  country: z.string().optional(),
+  clinic_address: z.string().optional(),
+  beta_motivation: z.string().optional().nullable(),
+  status: z.string().optional(),
+});
+
 app.post('/api/admin/super-admin', adminKeyGuard, async (req, res) => {
   const parsed = superAdminSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -140,8 +183,8 @@ app.post('/api/admin/super-admin', adminKeyGuard, async (req, res) => {
 
     const facilityId = existingFacility?.id;
 
-    const { data: users } = await supabaseAdmin.auth.admin.listUsers();
-    if (users?.users?.some(u => u.email?.toLowerCase() === email.toLowerCase())) {
+    const existingUser = await findAuthUserByEmail(email);
+    if (existingUser) {
       return res.status(409).json({ error: 'User already exists' });
     }
 
@@ -215,6 +258,37 @@ app.post('/api/admin/super-admin', adminKeyGuard, async (req, res) => {
   }
 });
 
+app.post('/api/beta-registrations', async (req, res) => {
+  const parsed = betaRegistrationSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
+  }
+
+  try {
+    const payload = parsed.data;
+    const { data, error } = await supabaseAdmin
+      .from('beta_registrations')
+      .insert({
+        ...payload,
+        clinic_name: payload.clinic_name.trim(),
+        contact_person_name: payload.contact_person_name.trim(),
+        contact_person_role: payload.contact_person_role.trim(),
+        contact_phone: payload.contact_phone.replace(/\s+/g, ''),
+        contact_email: payload.contact_email.trim().toLowerCase(),
+        region: payload.region.trim(),
+        status: payload.status || 'pending',
+      })
+      .select('id')
+      .single();
+
+    if (error) throw error;
+    return res.status(201).json({ id: data?.id });
+  } catch (err: any) {
+    console.error('beta registration failed', err);
+    return res.status(500).json({ error: err.message || 'Unable to submit registration' });
+  }
+});
+
 // Feature Requests API (BFF)
 const featureRequestSchema = z.object({
   form_type: z.string(),
@@ -231,6 +305,47 @@ const featureRequestSchema = z.object({
   attachment_urls: z.array(z.string()).optional(),
 });
 
+const getFeatureRequestScope = (req: express.Request, res: express.Response) => {
+  const user = req.user;
+  if (!user?.profileId) {
+    res.status(403).json({ error: 'User profile required' });
+    return null;
+  }
+  if (user.role !== 'super_admin' && !user.facilityId) {
+    res.status(403).json({ error: 'Facility context required' });
+    return null;
+  }
+  return {
+    profileId: user.profileId,
+    facilityId: user.facilityId,
+    role: user.role,
+  };
+};
+
+type FeatureRequestScopedQuery<T> = {
+  eq: (column: string, value: string) => T;
+};
+
+const applyFeatureRequestScope = <T extends FeatureRequestScopedQuery<T>>(
+  query: T,
+  scope: { facilityId?: string; role: string }
+) => {
+  if (scope.role !== 'super_admin' && scope.facilityId) {
+    return query.eq('facility_id', scope.facilityId);
+  }
+  return query;
+};
+
+const getScopedFeatureRequest = async (id: string, scope: { facilityId?: string; role: string }) => {
+  let query = supabaseAdmin
+    .from('feature_requests')
+    .select('id, user_id, facility_id')
+    .eq('id', id);
+
+  query = applyFeatureRequestScope(query, scope);
+  return query.maybeSingle();
+};
+
 app.post('/api/feature-requests', requireUser, async (req, res) => {
   const parsed = featureRequestSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -238,7 +353,9 @@ app.post('/api/feature-requests', requireUser, async (req, res) => {
   }
 
   // Access user from request (populated by middleware)
-  const { profileId, facilityId } = req.user!;
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
+  const { profileId, facilityId } = scope;
   const body = parsed.data;
 
   try {
@@ -261,14 +378,22 @@ app.post('/api/feature-requests', requireUser, async (req, res) => {
 });
 
 app.get('/api/feature-requests/me', requireUser, async (req, res) => {
-  const { profileId } = req.user!;
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
+  const { profileId, facilityId, role } = scope;
   try {
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('feature_requests')
       .select('*, users(name, user_role), facilities(name)')
       .eq('user_id', profileId)
       .neq('status', 'deleted')
       .order('created_at', { ascending: false });
+
+    if (role !== 'super_admin' && facilityId) {
+      query = query.eq('facility_id', facilityId);
+    }
+
+    const { data, error } = await query;
 
     if (error) return res.status(500).json({ error: error.message });
     return res.json(data || []);
@@ -279,11 +404,16 @@ app.get('/api/feature-requests/me', requireUser, async (req, res) => {
 });
 
 app.get('/api/feature-requests', requireUser, async (req, res) => {
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
   try {
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('feature_requests')
       .select('*, users(name, user_role), facilities(name)')
       .order('created_at', { ascending: false });
+
+    query = applyFeatureRequestScope(query, scope);
+    const { data, error } = await query;
 
     if (error) return res.status(500).json({ error: error.message });
     return res.json(data || []);
@@ -293,13 +423,18 @@ app.get('/api/feature-requests', requireUser, async (req, res) => {
   }
 });
 
-app.get('/api/feature-requests/community', async (_req, res) => {
+app.get('/api/feature-requests/community', requireUser, async (req, res) => {
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
   try {
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('feature_requests')
       .select('*, users(name, user_role), facilities(name)')
       .neq('status', 'deleted')
       .order('created_at', { ascending: false });
+
+    query = applyFeatureRequestScope(query, scope);
+    const { data, error } = await query;
 
     if (error) return res.status(500).json({ error: error.message });
     return res.json(data || []);
@@ -309,13 +444,15 @@ app.get('/api/feature-requests/community', async (_req, res) => {
   }
 });
 
-app.get('/api/feature-requests/duplicates', async (req, res) => {
+app.get('/api/feature-requests/duplicates', requireUser, async (req, res) => {
   const form_type = req.query.form_type as string | undefined;
   const request_type = req.query.request_type as string | undefined;
   const field_name = req.query.field_name as string | undefined;
   if (!form_type || !request_type) {
     return res.status(400).json({ error: 'form_type and request_type are required' });
   }
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
   try {
     let query = supabaseAdmin
       .from('feature_requests')
@@ -324,6 +461,7 @@ app.get('/api/feature-requests/duplicates', async (req, res) => {
       .eq('request_type', request_type);
 
     if (field_name) query = query.eq('field_name', field_name);
+    query = applyFeatureRequestScope(query, scope);
 
     const { data, error } = await query;
     if (error) return res.status(500).json({ error: error.message });
@@ -339,8 +477,20 @@ app.patch('/api/feature-requests/:id', requireUser, async (req, res) => {
   const updates = Object.fromEntries(
     Object.entries(req.body || {}).filter(([key]) => allowedFields.includes(key))
   );
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: 'No valid fields to update' });
+  }
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
 
   try {
+    const { data: requestRow, error: requestErr } = await getScopedFeatureRequest(req.params.id, scope);
+    if (requestErr) return res.status(500).json({ error: requestErr.message });
+    if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
+    if (scope.role !== 'admin' && scope.role !== 'super_admin' && requestRow.user_id !== scope.profileId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
     const { data, error } = await supabaseAdmin
       .from('feature_requests')
       .update(updates)
@@ -357,7 +507,9 @@ app.patch('/api/feature-requests/:id', requireUser, async (req, res) => {
 });
 
 app.patch('/api/feature-requests/:id/status', requireUser, async (req, res) => {
-  const { role } = req.user!;
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
+  const { role } = scope;
   if (role !== 'admin' && role !== 'super_admin') {
     return res.status(403).json({ error: 'Forbidden' });
   }
@@ -374,6 +526,10 @@ app.patch('/api/feature-requests/:id/status', requireUser, async (req, res) => {
   if (status === 'implemented') updateData.completed_at = new Date().toISOString();
 
   try {
+    const { data: requestRow, error: requestErr } = await getScopedFeatureRequest(req.params.id, scope);
+    if (requestErr) return res.status(500).json({ error: requestErr.message });
+    if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
+
     const { data, error } = await supabaseAdmin
       .from('feature_requests')
       .update(updateData)
@@ -390,9 +546,15 @@ app.patch('/api/feature-requests/:id/status', requireUser, async (req, res) => {
 });
 
 app.post('/api/feature-requests/:id/confirm', requireUser, async (req, res) => {
-  const { profileId } = req.user!;
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
+  const { profileId } = scope;
 
   try {
+    const { data: requestRow, error: requestErr } = await getScopedFeatureRequest(req.params.id, scope);
+    if (requestErr) return res.status(500).json({ error: requestErr.message });
+    if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
+
     const { data, error } = await supabaseAdmin
       .from('feature_requests')
       .update({
@@ -412,11 +574,17 @@ app.post('/api/feature-requests/:id/confirm', requireUser, async (req, res) => {
 });
 
 app.post('/api/feature-requests/:id/vote', requireUser, async (req, res) => {
-  const { profileId } = req.user!;
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
+  const { profileId } = scope;
   const voteType = req.body?.voteType as 'upvote' | 'downvote' | undefined;
   if (!voteType) return res.status(400).json({ error: 'voteType is required' });
 
   try {
+    const { data: requestRow, error: requestErr } = await getScopedFeatureRequest(req.params.id, scope);
+    if (requestErr) return res.status(500).json({ error: requestErr.message });
+    if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
+
     const { data: existingVote } = await supabaseAdmin
       .from('feature_request_votes')
       .select('*')
@@ -458,7 +626,16 @@ app.post('/api/feature-requests/:id/vote', requireUser, async (req, res) => {
 });
 
 app.delete('/api/feature-requests/:id', requireUser, async (req, res) => {
+  const scope = getFeatureRequestScope(req, res);
+  if (!scope) return;
   try {
+    const { data: requestRow, error: requestErr } = await getScopedFeatureRequest(req.params.id, scope);
+    if (requestErr) return res.status(500).json({ error: requestErr.message });
+    if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
+    if (scope.role !== 'admin' && scope.role !== 'super_admin' && requestRow.user_id !== scope.profileId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
     const { error } = await supabaseAdmin.from('feature_requests').delete().eq('id', req.params.id);
     if (!error) return res.json({ action: 'deleted' });
 

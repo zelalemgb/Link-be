@@ -2,16 +2,16 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
 import { requireUser } from '../middleware/auth';
+import { processPayment, type PaymentItem } from '../services/financeService';
+import {
+    fetchAwaitingRoutingPatients,
+    fetchDailyCollections,
+    fetchPaidPatients,
+    fetchPendingBills,
+} from '../services/cashierDataService';
 
 const router = Router();
 router.use(requireUser);
-
-const PAYMENT_STATUS = {
-    PAID: 'paid',
-    PARTIAL: 'partial',
-    UNPAID: 'unpaid',
-    PENDING: 'pending'
-};
 
 // --- Schemas ---
 
@@ -38,6 +38,10 @@ const externalOrderSchema = z.object({
     })),
 });
 
+const visitPaymentStatusSchema = z.object({
+    visitId: z.string(),
+});
+
 // --- Routes ---
 
 /**
@@ -46,166 +50,215 @@ const externalOrderSchema = z.object({
  */
 router.post('/payments', async (req, res) => {
     const { tenantId, facilityId, profileId: userId } = req.user!;
+    if (!tenantId || !facilityId || !userId) {
+        return res.status(403).json({ error: 'Missing tenant or facility context' });
+    }
 
     try {
-        const { visitId, patientId, items, allItemsPaid } = paymentSchema.parse(req.body);
-        const now = new Date().toISOString();
+        const parsed = paymentSchema.parse(req.body);
+        const items = parsed.items as PaymentItem[];
+        const { visitId, patientId, allItemsPaid } = parsed;
+        const response = await processPayment({
+            visitId,
+            patientId,
+            items,
+            allItemsPaid,
+            tenantId,
+            facilityId,
+            userId,
+        });
 
-        // 1. Update individual order tables
-        const medicationUpdates = items
-            .filter(i => i.itemType === 'medication')
-            .map(i => supabaseAdmin
-                .from('medication_orders')
-                .update({
-                    payment_status: PAYMENT_STATUS.PAID,
-                    payment_mode: i.payment,
-                    amount: i.price * i.qty,
-                    paid_at: now,
-                })
-                .eq('id', i.referenceId)
-            );
-
-        const labUpdates = items
-            .filter(i => i.itemType === 'lab_test')
-            .map(i => supabaseAdmin
-                .from('lab_orders')
-                .update({
-                    payment_status: PAYMENT_STATUS.PAID,
-                    payment_mode: i.payment,
-                    amount: i.price * i.qty,
-                    paid_at: now,
-                })
-                .eq('id', i.referenceId)
-            );
-
-        const imagingUpdates = items
-            .filter(i => i.itemType === 'imaging')
-            .map(i => supabaseAdmin
-                .from('imaging_orders')
-                .update({
-                    payment_status: PAYMENT_STATUS.PAID,
-                    payment_mode: i.payment,
-                    amount: i.price * i.qty,
-                    paid_at: now,
-                })
-                .eq('id', i.referenceId)
-            );
-
-        const serviceUpdates = items
-            .filter(i => i.itemType === 'service')
-            .map(i => supabaseAdmin
-                .from('billing_items')
-                .update({
-                    payment_status: PAYMENT_STATUS.PAID,
-                    payment_mode: i.payment,
-                    paid_at: now,
-                })
-                .eq('id', i.referenceId)
-            );
-
-        await Promise.all([
-            ...medicationUpdates,
-            ...labUpdates,
-            ...imagingUpdates,
-            ...serviceUpdates
-        ]);
-
-        // 2. Insert Payment Line Items (History Log)
-        if (items.length > 0) {
-            const lineItems = items.map(line => ({
-                payment_id: null, // Will be linked later
-                item_type: line.itemType,
-                item_reference_id: line.referenceId,
-                description: line.description || '',
-                quantity: line.qty,
-                unit_price: line.price,
-                subtotal: line.price * line.qty,
-                payment_method: line.payment,
-                payment_status: PAYMENT_STATUS.PAID,
-                final_amount: line.payment === 'free' ? 0 : line.price * line.qty,
-                discount_percentage: 0,
-                discount_amount: 0
-            }));
-
-            // We need a payment header to link these? Frontend logic:
-            // 1. Update orders.
-            // 2. Upsert payment header.
-            // 3. Insert payment line items (it didn't link them to payment header in the frontend code shown? line 910 insert(lineItems)). 
-            // If the schema requires payment_id, this would fail. 
-            // Assuming we should follow the same pattern but clearer.
-
-            // Let's create/get payment header first.
-            const { data: existingPayment } = await supabaseAdmin
-                .from('payments')
-                .select('id')
-                .eq('visit_id', visitId)
-                .eq('facility_id', facilityId)
-                .maybeSingle();
-
-            let paymentId = existingPayment?.id;
-            const status = allItemsPaid ? PAYMENT_STATUS.PAID : PAYMENT_STATUS.PARTIAL;
-
-            if (!paymentId) {
-                const { data: newPayment, error: payError } = await supabaseAdmin
-                    .from('payments')
-                    .insert({
-                        visit_id: visitId,
-                        patient_id: patientId,
-                        facility_id: facilityId,
-                        tenant_id: tenantId,
-                        cashier_id: userId,
-                        payment_status: status
-                    })
-                    .select('id')
-                    .single();
-
-                if (payError) throw payError;
-                paymentId = newPayment.id;
-            } else {
-                await supabaseAdmin
-                    .from('payments')
-                    .update({
-                        cashier_id: userId,
-                        payment_status: status,
-                        updated_at: now
-                    })
-                    .eq('id', paymentId);
-            }
-
-            // Now insert line items linked to this payment
-            const lineItemsWithId = lineItems.map(li => ({
-                ...li,
-                payment_id: paymentId
-            }));
-
-            console.log('[Payment] Inserting', lineItemsWithId.length, 'line items for payment:', paymentId);
-            const { error: linesError } = await supabaseAdmin
-                .from('payment_line_items')
-                .insert(lineItemsWithId);
-
-            if (linesError) {
-                console.error("[Payment] ERROR inserting line items:", linesError);
-                console.error("[Payment] Failed line items:", JSON.stringify(lineItemsWithId, null, 2));
-            } else {
-                console.log('[Payment] Successfully inserted line items');
-            }
-            // We don't rollback for this, it's logging.
-        }
-
-        // 3. Update Visit Status to awaiting_routing
-        await supabaseAdmin
-            .from('visits')
-            .update({
-                routing_status: 'awaiting_routing',
-                status_updated_at: now
-            })
-            .eq('id', visitId);
-
-        res.json({ success: true });
+        res.json(response);
 
     } catch (error: any) {
         if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues });
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: error.message || 'Payment processing failed' });
+    }
+});
+
+/**
+ * GET /api/finance/visits/count
+ * Count visits for the current facility with optional start date (ISO).
+ */
+router.get('/visits/count', async (req, res) => {
+    const { facilityId } = req.user!;
+    const from = req.query.from as string | undefined;
+
+    try {
+        let query = supabaseAdmin
+            .from('visits')
+            .select('*', { count: 'exact', head: true })
+            .eq('facility_id', facilityId);
+
+        if (from) {
+            query = query.gte('created_at', from);
+        }
+
+        const { count, error } = await query;
+        if (error) throw error;
+
+        res.json({ count: count ?? 0 });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || 'Unable to fetch visit count' });
+    }
+});
+
+router.get('/cashier/pending', async (req, res) => {
+    const { facilityId } = req.user!;
+    if (!facilityId) {
+        return res.status(403).json({ error: 'Missing facility context' });
+    }
+    try {
+        const patients = await fetchPendingBills(facilityId);
+        res.json(patients);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || 'Unable to fetch pending bills' });
+    }
+});
+
+router.get('/cashier/paid', async (req, res) => {
+    const { facilityId } = req.user!;
+    if (!facilityId) {
+        return res.status(403).json({ error: 'Missing facility context' });
+    }
+    try {
+        const patients = await fetchPaidPatients(facilityId);
+        res.json(patients);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || 'Unable to fetch paid patients' });
+    }
+});
+
+router.get('/cashier/collections', async (req, res) => {
+    const { facilityId } = req.user!;
+    if (!facilityId) {
+        return res.status(403).json({ error: 'Missing facility context' });
+    }
+    try {
+        const collections = await fetchDailyCollections(facilityId);
+        res.json(collections);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || 'Unable to fetch collections' });
+    }
+});
+
+router.get('/cashier/awaiting-routing', async (req, res) => {
+    const { facilityId } = req.user!;
+    if (!facilityId) {
+        return res.status(403).json({ error: 'Missing facility context' });
+    }
+    try {
+        const patients = await fetchAwaitingRoutingPatients(facilityId);
+        res.json(patients);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || 'Unable to fetch routing queue' });
+    }
+});
+
+router.get('/visits/active', async (req, res) => {
+    const { facilityId } = req.user!;
+    if (!facilityId) {
+        return res.status(403).json({ error: 'Missing facility context' });
+    }
+    const fromDate = req.query.from as string | undefined;
+    try {
+        let query = supabaseAdmin
+            .from('visits')
+            .select('id, created_at, status, status_updated_at, journey_timeline')
+            .eq('facility_id', facilityId);
+
+        if (fromDate) {
+            query = query.gte('visit_date', fromDate);
+        }
+
+        const { data, error } = await query;
+        if (error) throw error;
+        res.json(data || []);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || 'Unable to fetch visits' });
+    }
+});
+
+/**
+ * GET /api/finance/visits/:id/payment-status
+ * Summary of unpaid items for reception displays.
+ */
+router.get('/visits/:id/payment-status', async (req, res) => {
+    const parsed = visitPaymentStatusSchema.safeParse({ visitId: req.params.id });
+    if (!parsed.success) {
+        return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid visit id' });
+    }
+
+    try {
+        const visitId = parsed.data.visitId;
+        const { data: medications, error: medError } = await supabaseAdmin
+            .from('medication_orders')
+            .select('id, amount')
+            .eq('visit_id', visitId)
+            .eq('payment_status', 'unpaid');
+
+        if (medError) throw medError;
+
+        const { data: labs, error: labError } = await supabaseAdmin
+            .from('lab_orders')
+            .select('id, amount')
+            .eq('visit_id', visitId)
+            .eq('payment_status', 'unpaid');
+
+        if (labError) throw labError;
+
+        const { data: imaging, error: imgError } = await supabaseAdmin
+            .from('imaging_orders')
+            .select('id, amount')
+            .eq('visit_id', visitId)
+            .eq('payment_status', 'unpaid');
+
+        if (imgError) throw imgError;
+
+        const { data: billingItems, error: billError } = await supabaseAdmin
+            .from('billing_items')
+            .select('id, total_amount')
+            .eq('visit_id', visitId)
+            .eq('payment_status', 'unpaid');
+
+        if (billError) throw billError;
+
+        const { data: visit, error: visitError } = await supabaseAdmin
+            .from('visits')
+            .select('fee_paid, consultation_payment_type')
+            .eq('id', visitId)
+            .single();
+
+        if (visitError) throw visitError;
+
+        const medTotal = medications?.reduce((sum, med) => sum + (med.amount || 0), 0) || 0;
+        const labTotal = labs?.reduce((sum, lab) => sum + (lab.amount || 0), 0) || 0;
+        const imgTotal = imaging?.reduce((sum, img) => sum + (img.amount || 0), 0) || 0;
+        const billTotalRaw = billingItems?.reduce((sum, bill) => sum + (bill.total_amount || 0), 0) || 0;
+
+        const paymentType = (visit as any)?.consultation_payment_type || 'paying';
+        const isNonPaying = ['free', 'credit', 'insured'].includes(paymentType);
+        const billTotal = isNonPaying ? 0 : billTotalRaw;
+
+        const totalDue = medTotal + labTotal + imgTotal + billTotal;
+        const hasUnpaidItems = totalDue > 0;
+        const billingCount = isNonPaying ? 0 : (billingItems?.length || 0);
+        const unpaidItemsCount = (medications?.length || 0) + (labs?.length || 0) + (imaging?.length || 0) + billingCount;
+
+        return res.json({
+            hasUnpaidItems,
+            totalDue,
+            consultationFeePaid: visit?.fee_paid || 0,
+            unpaidItemsCount,
+            unpaidBreakdown: {
+                medications: medTotal,
+                labs: labTotal,
+                imaging: imgTotal,
+                billing: billTotal,
+            },
+        });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message || 'Unable to fetch payment status' });
     }
 });
 
@@ -324,7 +377,8 @@ router.get('/daily-summary', async (req, res) => {
         if (!pendingError && pendingItems) {
             console.log('[DailySummary] Pending Unpaid Items Found:', pendingItems.length);
             pendingItems.forEach(item => {
-                let type = (item.visits?.consultation_payment_type || '').toLowerCase();
+                const visit = Array.isArray(item.visits) ? item.visits[0] : item.visits;
+                let type = (visit?.consultation_payment_type || '').toLowerCase();
                 const amount = item.total_amount || 0;
 
                 // Map 'paying' to 'cash' for consistency if needed, or keep as 'paying'
@@ -397,4 +451,3 @@ router.post('/close-day', async (req, res) => {
 });
 
 export default router;
-

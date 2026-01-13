@@ -2,11 +2,10 @@
     "name": "link-be",
     "version": "1.0.0",
     "description": "Backend for LinkHC",
-    "type": "module",
     "main": "server/index.ts",
     "scripts": {
         "dev": "tsx server/index.ts",
-        "start": "node dist/server/index.js",
+        "start": "tsx server/index.ts",
         "build": "tsc"
     },
     "dependencies": {

@@ -20,6 +20,27 @@ const isAuthorized = (req: Request) => {
   return ADMIN_SECRET && headerSecret === ADMIN_SECRET;
 };
 
+type AuthUser = {
+  id?: string;
+  email?: string | null;
+};
+
+const findAuthUserByEmail = async (client: ReturnType<typeof createClient>, email: string) => {
+  const normalized = email.trim().toLowerCase();
+  const perPage = 200;
+
+  for (let page = 1; page <= 50; page += 1) {
+    const { data, error } = await client.auth.admin.listUsers({ page, perPage });
+    if (error) throw error;
+    const users = (data?.users ?? []) as AuthUser[];
+    const match = users.find((user) => user.email?.toLowerCase() === normalized);
+    if (match) return match;
+    if (users.length < perPage) break;
+  }
+
+  return null;
+};
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -52,12 +73,8 @@ serve(async (req) => {
     });
 
     // Check if this specific email already exists
-    const { data: existingAuthUsers } = await sb.auth.admin.listUsers();
-    const emailExists = existingAuthUsers?.users?.some(
-      (u: any) => u.email?.toLowerCase() === email.trim().toLowerCase()
-    );
-
-    if (emailExists) {
+    const existingUser = await findAuthUserByEmail(sb, email);
+    if (existingUser) {
       return new Response(
         JSON.stringify({ error: "User with this email already exists" }), 
         { status: 400 }
@@ -161,7 +178,8 @@ serve(async (req) => {
       }),
       { status: 200, headers: corsHeaders }
     );
-  } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message ?? "Unknown error" }), { status: 500, headers: corsHeaders });
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "Unknown error";
+    return new Response(JSON.stringify({ error: message }), { status: 500, headers: corsHeaders });
   }
 });

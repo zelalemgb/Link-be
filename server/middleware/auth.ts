@@ -1,7 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import { supabaseAdmin } from '../config/supabase';
 
-const { ADMIN_API_SECRET } = process.env;
+const { ADMIN_API_SECRET, AUTH_DEBUG } = process.env;
+const isAuthDebug = AUTH_DEBUG === 'true';
 
 export type Role =
     | 'admin'
@@ -42,12 +43,16 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
     try {
         const { data, error } = await supabaseAdmin.auth.getUser(token);
         if (error || !data?.user) {
-            console.error('[AUTH DEBUG] getUser error:', error?.message || 'No user data');
+            if (isAuthDebug) {
+                console.error('[AUTH DEBUG] getUser error:', error?.message || 'No user data');
+            }
             return res.status(401).json({ error: 'Invalid token' });
         }
 
         const authUserId = data.user.id;
-        console.log('[AUTH DEBUG] authUserId:', authUserId);
+        if (isAuthDebug) {
+            console.log('[AUTH DEBUG] authUserId:', authUserId);
+        }
 
         // Fetch user profile to get role and facility context
         const { data: profile, error: profileErr } = await supabaseAdmin
@@ -57,14 +62,15 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
             .limit(1)
             .maybeSingle();
 
-        if (profileErr) {
-            console.error('[AUTH DEBUG] Profile fetch error:', profileErr.message);
-        }
-
-        if (!profile) {
-            console.warn('[AUTH DEBUG] No profile found for authUserId:', authUserId);
-        } else {
-            console.log('[AUTH DEBUG] Profile found:', profile.id, 'Role:', profile.user_role);
+        if (isAuthDebug) {
+            if (profileErr) {
+                console.error('[AUTH DEBUG] Profile fetch error:', profileErr.message);
+            }
+            if (!profile) {
+                console.warn('[AUTH DEBUG] No profile found for authUserId:', authUserId);
+            } else {
+                console.log('[AUTH DEBUG] Profile found:', profile.id, 'Role:', profile.user_role);
+            }
         }
 
         req.user = {

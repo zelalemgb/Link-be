@@ -14,6 +14,27 @@ const isAuthorized = (req: Request) => {
   return ADMIN_SECRET && headerSecret === ADMIN_SECRET;
 };
 
+type AuthUser = {
+  id?: string;
+  email?: string | null;
+};
+
+const findAuthUserByEmail = async (client: ReturnType<typeof createClient>, email: string) => {
+  const normalized = email.trim().toLowerCase();
+  const perPage = 200;
+
+  for (let page = 1; page <= 50; page += 1) {
+    const { data, error } = await client.auth.admin.listUsers({ page, perPage });
+    if (error) throw error;
+    const users = (data?.users ?? []) as AuthUser[];
+    const match = users.find((user) => user.email?.toLowerCase() === normalized);
+    if (match) return match;
+    if (users.length < perPage) break;
+  }
+
+  return null;
+};
+
 interface ClinicData {
   name: string;
   location: string;
@@ -136,15 +157,11 @@ serve(async (req) => {
       // If the email is already registered, attach existing user to this clinic
       const msg = adminErr.message?.toLowerCase?.() || "";
       if (msg.includes("already registered") || msg.includes("duplicate") || msg.includes("user exists")) {
-        const { data: listRes, error: listErr } = await sb.auth.admin.listUsers({
-          page: 1,
-          perPage: 1,
-          email: admin.email.trim().toLowerCase(),
-        } as any);
-        if (listErr || !listRes?.users?.length) {
+        const existingUser = await findAuthUserByEmail(sb, admin.email);
+        if (!existingUser?.id) {
           return new Response(JSON.stringify({ error: adminErr.message }), { status: 500 });
         }
-        authUserId = listRes.users[0].id as string;
+        authUserId = existingUser.id as string;
 
         // Ensure public.users row exists and is associated
         const { data: existingUserRow } = await sb
@@ -237,7 +254,8 @@ serve(async (req) => {
       }),
       { status: 200, headers: corsHeaders }
     );
-  } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message ?? "Unknown error" }), { status: 500, headers: corsHeaders });
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "Unknown error";
+    return new Response(JSON.stringify({ error: message }), { status: 500, headers: corsHeaders });
   }
 });
