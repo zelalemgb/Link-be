@@ -24,6 +24,30 @@ const jsonResponse = (body: unknown, init: ResponseInit = {}) =>
     ...init,
   });
 
+type AuthUser = {
+  id?: string;
+  email?: string | null;
+};
+
+const findAuthUserByEmail = async (email: string) => {
+  const normalized = email.trim().toLowerCase();
+  const perPage = 200;
+
+  for (let page = 1; page <= 50; page += 1) {
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage });
+    if (error) {
+      console.error('Error listing auth users:', error);
+      throw new Error(error.message);
+    }
+    const users = (data?.users ?? []) as AuthUser[];
+    const match = users.find((user) => user.email?.toLowerCase() === normalized);
+    if (match) return match;
+    if (users.length < perPage) break;
+  }
+
+  return null;
+};
+
 const getAuthClient = (req: Request) => {
   const authHeader = req.headers.get('Authorization') ?? '';
   return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
@@ -172,6 +196,93 @@ const sendApprovalEmail = async (
   }
 };
 
+const resolveAdminContact = async (facilityId: string, fallback?: { admin_name?: string; admin_email?: string }) => {
+  let adminEmail = fallback?.admin_email?.trim() ?? '';
+  const hasExplicitName = Boolean(fallback?.admin_name?.trim());
+  let adminName = fallback?.admin_name?.trim() || 'Administrator';
+  const maybeUpdateName = (candidate?: string | null) => {
+    if (!hasExplicitName && candidate) {
+      adminName = candidate;
+    }
+  };
+
+  if (!adminEmail) {
+    const { data: adminUser, error: adminUserError } = await supabaseAdmin
+      .from('users')
+      .select('auth_user_id, email, name, full_name')
+      .eq('facility_id', facilityId)
+      .eq('user_role', 'admin')
+      .maybeSingle();
+
+    if (adminUserError) {
+      console.log('Error querying users table for admin:', adminUserError.message);
+    }
+
+    if (adminUser?.email) {
+      adminEmail = adminUser.email;
+      maybeUpdateName(adminUser.full_name || adminUser.name);
+    } else if (adminUser?.auth_user_id) {
+      const { data: authData, error: authError } = await supabaseAdmin.auth.admin.getUserById(adminUser.auth_user_id);
+      if (authError) {
+        console.log('Error fetching auth user for admin:', authError.message);
+      }
+      if (authData?.user?.email) {
+        adminEmail = authData.user.email;
+        maybeUpdateName(adminUser.full_name || adminUser.name);
+      }
+    }
+  }
+
+  if (!adminEmail) {
+    const { data: registration, error: registrationError } = await supabaseAdmin
+      .from('clinic_registrations')
+      .select('admin_email, admin_name')
+      .eq('facility_id', facilityId)
+      .maybeSingle();
+
+    if (registrationError) {
+      console.log('Error querying clinic_registrations for admin:', registrationError.message);
+    }
+
+    if (registration?.admin_email) {
+      adminEmail = registration.admin_email;
+      maybeUpdateName(registration.admin_name);
+    }
+  }
+
+  if (!adminEmail) {
+    const { data: facility, error: facilityError } = await supabaseAdmin
+      .from('facilities')
+      .select('email, notes')
+      .eq('id', facilityId)
+      .maybeSingle();
+
+    if (facilityError) {
+      console.log('Error querying facilities for admin:', facilityError.message);
+    }
+
+    if (facility?.email) {
+      adminEmail = facility.email;
+    } else if (facility?.notes) {
+      try {
+        const parsed = typeof facility.notes === 'string' ? JSON.parse(facility.notes) : facility.notes;
+        if (parsed?.admin_email) {
+          adminEmail = parsed.admin_email;
+          maybeUpdateName(parsed.admin_name);
+        }
+      } catch (parseError) {
+        console.error('Failed to parse facilities.notes:', parseError);
+      }
+    }
+  }
+
+  if (!adminEmail) {
+    return null;
+  }
+
+  return { adminEmail, adminName };
+};
+
 interface ReviewPayload {
   registrationId?: string;
   action?: 'approve' | 'reject';
@@ -312,7 +423,7 @@ Deno.serve(async (req) => {
     let adminInfo = { admin_name: 'Administrator', admin_email: '', admin_phone: '' };
     try {
       if (facility.notes) {
-        const parsed = JSON.parse(facility.notes);
+        const parsed = typeof facility.notes === 'string' ? JSON.parse(facility.notes) : facility.notes;
         adminInfo = {
           admin_name: parsed.admin_name || 'Administrator',
           admin_email: parsed.admin_email || '',
@@ -342,9 +453,10 @@ Deno.serve(async (req) => {
 
     // Approve facility from facilities table
     try {
-      if (!adminInfo.admin_email) {
-        console.error('Admin email not found in facility notes for facility:', registrationId);
-        return jsonResponse({ error: 'Admin email not found in facility notes' }, { status: 400 });
+      const resolvedAdmin = await resolveAdminContact(facility.id, adminInfo);
+      if (!resolvedAdmin?.adminEmail) {
+        console.error('Admin email not found for facility:', registrationId);
+        return jsonResponse({ error: 'Admin email not found for facility' }, { status: 400 });
       }
 
       // Update facility to approved with activation status
@@ -365,8 +477,8 @@ Deno.serve(async (req) => {
 
       // Send approval email with onboarding link
       const emailResult = await sendApprovalEmail(
-        adminInfo.admin_email,
-        adminInfo.admin_name,
+        resolvedAdmin.adminEmail,
+        resolvedAdmin.adminName,
         facility.name,
         facility.clinic_code,
         facility.id,
@@ -419,6 +531,36 @@ Deno.serve(async (req) => {
   try {
     console.log(`Creating auth user for ${registration.admin_email}`);
     
+    let authUserId: string | null = null;
+    const normalizedAdminPhone =
+      registration.admin_phone?.toString().replace(/\s+/g, '') ||
+      registration.phone_number?.toString().replace(/\s+/g, '') ||
+      null;
+
+    if (!normalizedAdminPhone) {
+      return jsonResponse(
+        { error: 'Admin phone is required to create the administrator account' },
+        { status: 400 }
+      );
+    }
+    
+    const { data: existingPhoneUser, error: existingPhoneError } = await supabaseAdmin
+      .from('users')
+      .select('id')
+      .eq('phone_number', normalizedAdminPhone)
+      .maybeSingle();
+
+    if (existingPhoneError) {
+      console.error('Failed to check admin phone uniqueness:', existingPhoneError);
+    }
+
+    if (existingPhoneUser) {
+      return jsonResponse(
+        { error: 'Admin phone number is already in use. Please use a different phone number.' },
+        { status: 400 }
+      );
+    }
+
     const invite = await supabaseAdmin.auth.admin.inviteUserByEmail(registration.admin_email, {
       redirectTo: `${FRONTEND_URL}/auth?tab=signin`,
       data: {
@@ -426,14 +568,28 @@ Deno.serve(async (req) => {
         full_name: registration.admin_name,
         user_role: 'admin',
         role: 'admin',
+        phone: normalizedAdminPhone,
       },
     });
 
     if (invite.error) {
-      throw new Error(invite.error.message);
+      const errorMessage = invite.error.message?.toLowerCase?.() || '';
+      if (
+        errorMessage.includes('already registered') ||
+        errorMessage.includes('user exists') ||
+        errorMessage.includes('duplicate')
+      ) {
+        const existingUser = await findAuthUserByEmail(registration.admin_email);
+        authUserId = existingUser?.id ?? null;
+        if (!authUserId) {
+          throw new Error('Administrator account already exists but could not be resolved');
+        }
+      } else {
+        throw new Error(invite.error.message);
+      }
+    } else {
+      authUserId = invite.data.user?.id ?? null;
     }
-
-    const authUserId = invite.data.user?.id;
 
     if (!authUserId) {
       throw new Error('Failed to create administrator account');

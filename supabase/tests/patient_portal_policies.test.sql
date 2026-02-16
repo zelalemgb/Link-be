@@ -91,7 +91,7 @@ ALTER TABLE public.patient_symptom_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.patient_appointment_requests ENABLE ROW LEVEL SECURITY;
 
 -- Apply patient portal policy migration
-\i supabase/migrations/20251201120000_patient_portal_security_enhancements.sql
+\ir ../migrations/20260215102000_patient_portal_security_hardening.sql
 
 -- Helper procedure to assert that a command fails due to policy or constraint enforcement
 CREATE OR REPLACE PROCEDURE public.assert_policy_denied(command TEXT)
@@ -105,7 +105,7 @@ BEGIN
 EXCEPTION
   WHEN others THEN
     GET STACKED DIAGNOSTICS err_code = RETURNED_SQLSTATE;
-    IF err_code NOT IN ('42501', '23514', 'P0001') THEN
+    IF err_code NOT IN ('42501', '23514', '23503', '23505', 'P0001') THEN
       RAISE;
     END IF;
 END;
@@ -139,6 +139,22 @@ INSERT INTO public.patient_portal_phone_verifications (tenant_id, phone_number, 
 VALUES
   (:'tenant_one_id'::uuid, :'patient_one_phone', true, now()),
   (:'tenant_two_id'::uuid, :'patient_two_phone', true, now());
+
+-- Consent/verification state must be internally consistent.
+CALL public.assert_policy_denied(
+  format(
+    $$INSERT INTO public.patient_portal_phone_verifications (tenant_id, phone_number, is_verified, verified_at)
+      VALUES (%L::uuid, %L, true, NULL)$$,
+    :'tenant_one_id', '+15550009991'
+  )
+);
+CALL public.assert_policy_denied(
+  format(
+    $$INSERT INTO public.patient_portal_phone_verifications (tenant_id, phone_number, is_verified, verified_at)
+      VALUES (%L::uuid, %L, false, now())$$,
+    :'tenant_one_id', '+15550009992'
+  )
+);
 
 -- Prepare JWT claim payloads
 SELECT jsonb_build_object('tenant_id', :'tenant_one_id'::uuid, 'phone', :'patient_one_phone')::text AS claims_patient_one \gset
@@ -229,6 +245,24 @@ CALL public.assert_policy_denied(
     $$INSERT INTO public.patient_appointment_requests (tenant_id, patient_account_id, facility_id, requested_date)
       VALUES (%L::uuid, %L::uuid, %L::uuid, current_date)$$,
     :'tenant_two_id', :'patient_one_account_id', :'facility_two_id'
+  )
+);
+
+-- Tenant consistency constraints must reject cross-tenant child inserts even in service context.
+RESET ROLE;
+SET row_security = off;
+CALL public.assert_policy_denied(
+  format(
+    $$INSERT INTO public.patient_documents (tenant_id, patient_account_id, document_type, file_url, document_date)
+      VALUES (%L::uuid, %L::uuid, 'lab', 'https://example.com/tenant-mismatch.pdf', current_date)$$,
+    :'tenant_two_id', :'patient_one_account_id'
+  )
+);
+CALL public.assert_policy_denied(
+  format(
+    $$INSERT INTO public.patient_appointment_requests (tenant_id, patient_account_id, facility_id, requested_date)
+      VALUES (%L::uuid, %L::uuid, %L::uuid, current_date)$$,
+    :'tenant_one_id', :'patient_one_account_id', :'facility_two_id'
   )
 );
 

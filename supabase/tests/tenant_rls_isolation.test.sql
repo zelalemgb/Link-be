@@ -20,7 +20,7 @@ RETURNS uuid
 LANGUAGE sql
 STABLE
 AS $$
-  SELECT COALESCE((current_setting('request.jwt.claims', true)::json ->> 'sub')::uuid, gen_random_uuid());
+  SELECT COALESCE((NULLIF(current_setting('request.jwt.claims', true), '')::json ->> 'sub')::uuid, gen_random_uuid());
 $$;
 
 CREATE TABLE public.tenants (
@@ -173,20 +173,20 @@ INSERT INTO public.users (auth_user_id, tenant_id, facility_id, user_role) VALUE
   ('dddddddd-0000-0000-0000-dddddddddddd', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', NULL, 'patient');
 
 INSERT INTO public.inventory_items (id, facility_id, tenant_id, created_by) VALUES
-  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaitem0001', 'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', (SELECT id FROM public.users WHERE auth_user_id = 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa')),
-  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbitm00002', 'bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', (SELECT id FROM public.users WHERE auth_user_id = 'bbbbbbbb-0000-0000-0000-bbbbbbbbbbbb'));
+  ('aaaaaaaa-aaaa-aaaa-aaaa-000000000001', 'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', (SELECT id FROM public.users WHERE auth_user_id = 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa')),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-000000000002', 'bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', (SELECT id FROM public.users WHERE auth_user_id = 'bbbbbbbb-0000-0000-0000-bbbbbbbbbbbb'));
 
 INSERT INTO public.stock_movements (id, inventory_item_id, facility_id, tenant_id, created_by, movement_type, quantity) VALUES
-  ('aaaaaaaa-aaaa-aaaa-aaaa-stockmove001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaitem0001', 'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', (SELECT id FROM public.users WHERE auth_user_id = 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa'), 'receipt', 10),
-  ('bbbbbbbb-bbbb-bbbb-bbbb-stockmove002', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbitm00002', 'bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', (SELECT id FROM public.users WHERE auth_user_id = 'bbbbbbbb-0000-0000-0000-bbbbbbbbbbbb'), 'receipt', 5);
+  ('aaaaaaaa-aaaa-aaaa-aaaa-000000000011', 'aaaaaaaa-aaaa-aaaa-aaaa-000000000001', 'aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', (SELECT id FROM public.users WHERE auth_user_id = 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa'), 'receipt', 10),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-000000000022', 'bbbbbbbb-bbbb-bbbb-bbbb-000000000002', 'bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', (SELECT id FROM public.users WHERE auth_user_id = 'bbbbbbbb-0000-0000-0000-bbbbbbbbbbbb'), 'receipt', 5);
 
 INSERT INTO public.patient_accounts (id, phone_number, tenant_id) VALUES
-  ('aaaaaaaa-aaaa-aaaa-aaaa-pacct000001', '+11111111111', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'),
-  ('bbbbbbbb-bbbb-bbbb-bbbb-pacct000002', '+22222222222', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
+  ('aaaaaaaa-aaaa-aaaa-aaaa-000000000101', '+11111111111', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-000000000202', '+22222222222', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
 
 INSERT INTO public.patient_documents (id, patient_account_id, tenant_id, file_url) VALUES
-  ('aaaaaaaa-aaaa-aaaa-aaaa-pdoc0000001', 'aaaaaaaa-aaaa-aaaa-aaaa-pacct000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'https://tenant-a/doc1.pdf'),
-  ('bbbbbbbb-bbbb-bbbb-bbbb-pdoc0000002', 'bbbbbbbb-bbbb-bbbb-bbbb-pacct000002', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'https://tenant-b/doc2.pdf');
+  ('aaaaaaaa-aaaa-aaaa-aaaa-000000001001', 'aaaaaaaa-aaaa-aaaa-aaaa-000000000101', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'https://tenant-a/doc1.pdf'),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-000000002002', 'bbbbbbbb-bbbb-bbbb-bbbb-000000000202', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'https://tenant-b/doc2.pdf');
 
 -- Prepare authenticated role
 DO $$
@@ -197,17 +197,22 @@ BEGIN
 END
 $$;
 
+GRANT USAGE ON SCHEMA auth TO authenticated;
+GRANT EXECUTE ON FUNCTION auth.uid() TO authenticated;
+GRANT USAGE ON SCHEMA public TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
+
 SET ROLE authenticated;
 
 -- Staff access within tenant should succeed
-SELECT set_config('request.jwt.claims', json_build_object('sub', 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa')::text, true);
+SELECT set_config('request.jwt.claims', json_build_object('sub', 'aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa')::text, false);
 
 DO $$
 DECLARE
   accessible boolean;
 BEGIN
   SELECT EXISTS(
-    SELECT 1 FROM public.stock_movements WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-stockmove001'
+    SELECT 1 FROM public.stock_movements WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-000000000011'
   ) INTO accessible;
   IF NOT accessible THEN
     RAISE EXCEPTION 'Expected tenant-scoped staff to access their stock movement';
@@ -216,14 +221,14 @@ END
 $$;
 
 -- Cross-tenant staff access must be denied
-SELECT set_config('request.jwt.claims', json_build_object('sub', 'bbbbbbbb-0000-0000-0000-bbbbbbbbbbbb')::text, true);
+SELECT set_config('request.jwt.claims', json_build_object('sub', 'bbbbbbbb-0000-0000-0000-bbbbbbbbbbbb')::text, false);
 
 DO $$
 DECLARE
   accessible boolean;
 BEGIN
   SELECT EXISTS(
-    SELECT 1 FROM public.stock_movements WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-stockmove001'
+    SELECT 1 FROM public.stock_movements WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-000000000011'
   ) INTO accessible;
   IF accessible THEN
     RAISE EXCEPTION 'Cross-tenant staff access to stock_movements should be blocked';
@@ -232,14 +237,14 @@ END
 $$;
 
 -- Patient access within tenant
-SELECT set_config('request.jwt.claims', json_build_object('sub', 'cccccccc-0000-0000-0000-cccccccccccc', 'phone', '+11111111111')::text, true);
+SELECT set_config('request.jwt.claims', json_build_object('sub', 'cccccccc-0000-0000-0000-cccccccccccc', 'phone', '+11111111111')::text, false);
 
 DO $$
 DECLARE
   accessible boolean;
 BEGIN
   SELECT EXISTS(
-    SELECT 1 FROM public.patient_documents WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-pdoc0000001'
+    SELECT 1 FROM public.patient_documents WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-000000001001'
   ) INTO accessible;
   IF NOT accessible THEN
     RAISE EXCEPTION 'Expected patient to access their own document';
@@ -248,14 +253,14 @@ END
 $$;
 
 -- Patient cross-tenant access denied
-SELECT set_config('request.jwt.claims', json_build_object('sub', 'dddddddd-0000-0000-0000-dddddddddddd', 'phone', '+22222222222')::text, true);
+SELECT set_config('request.jwt.claims', json_build_object('sub', 'dddddddd-0000-0000-0000-dddddddddddd', 'phone', '+22222222222')::text, false);
 
 DO $$
 DECLARE
   accessible boolean;
 BEGIN
   SELECT EXISTS(
-    SELECT 1 FROM public.patient_documents WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-pdoc0000001'
+    SELECT 1 FROM public.patient_documents WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-000000001001'
   ) INTO accessible;
   IF accessible THEN
     RAISE EXCEPTION 'Cross-tenant patient access to documents should be blocked';

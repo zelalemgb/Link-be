@@ -8,7 +8,7 @@
    - Click here: https://supabase.com/dashboard/project/qxihedrgltophafkuasa/sql/new
    
 2. **Copy the SQL:**
-   - Open file: `supabase/migrations/APPLY_THIS_consolidated_migrations.sql`
+   - Open file: `link-be/supabase/migrations/APPLY_THIS_consolidated_migrations.sql` (from repo root)
    - Copy ALL contents (Cmd+A, Cmd+C)
 
 3. **Paste and Run:**

@@ -1,11 +1,32 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
-import { requireUser } from '../middleware/auth';
+import { requireUser, requireScopedUser } from '../middleware/auth';
+import { ensurePatientAccountLink } from '../services/patientAccountLinking';
+import { recordAuditEvent } from '../services/audit-log';
+import { JOURNEY_STAGES } from '../../shared/contracts/journey';
+import {
+    updateVisitStatusMutation,
+    visitStatusMutationSchema,
+} from '../services/patientVisitStatusService';
+import {
+    maybeAssertProviderPhiConsentForPatient,
+} from '../services/providerPhiConsentGuard';
 
 const router = Router();
-router.use(requireUser);
+router.use(requireUser, requireScopedUser);
 
+const PHI_PORTAL_CONSENT_TYPE = 'records_access';
+
+const journeyStageSchema = z.enum(JOURNEY_STAGES);
+const appendStageSchema = z.object({
+    stage: journeyStageSchema,
+});
+const orderHistoryQuerySchema = z.object({
+    type: z.enum(['lab', 'imaging', 'medications']),
+    excludeVisitId: z.string().uuid().optional(),
+    limit: z.coerce.number().min(1).max(20).optional(),
+});
 // Schema for creating a visit
 const createVisitSchema = z.object({
     visitDate: z.string(),
@@ -16,12 +37,17 @@ const createVisitSchema = z.object({
     consultationServiceId: z.string().optional(),
 });
 
+const CONSENT_BLOCKING_CODES = new Set([
+    'PERM_PHI_CONSENT_REQUIRED',
+    'CONFLICT_CONSENT_ACCESS_REVOKED',
+]);
+
 /**
  * GET /api/patients/search
  * Query params: q (search term)
  */
 router.get('/search', async (req, res) => {
-    const { facilityId } = req.user!;
+    const { facilityId, tenantId, profileId, role } = req.user!;
     const q = req.query.q as string;
 
     if (!q || q.length < 2) {
@@ -55,7 +81,54 @@ router.get('/search', async (req, res) => {
             .limit(20);
 
         if (error) throw error;
-        res.json(data);
+
+        const searchedPatients = Array.isArray(data) ? data : [];
+        let consentScopedPatients = searchedPatients;
+
+        if (tenantId && facilityId && searchedPatients.length > 0) {
+            const permittedPatients: any[] = [];
+            for (const patient of searchedPatients) {
+                const consentCheck = await maybeAssertProviderPhiConsentForPatient({
+                    tenantId,
+                    facilityId,
+                    patientId: patient.id,
+                    consentType: PHI_PORTAL_CONSENT_TYPE,
+                });
+                if (consentCheck.ok === false) {
+                    if (CONSENT_BLOCKING_CODES.has(consentCheck.code)) {
+                        continue;
+                    }
+                    return res.status(consentCheck.status).json({
+                        code: consentCheck.code,
+                        message: consentCheck.message,
+                    });
+                }
+                permittedPatients.push(patient);
+            }
+            consentScopedPatients = permittedPatients;
+        }
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'search',
+                eventType: 'read',
+                entityType: 'patient',
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                metadata: {
+                    result_count: consentScopedPatients.length,
+                    filtered_out_count: searchedPatients.length - consentScopedPatients.length,
+                },
+                requestId: req.requestId || null,
+            });
+        }
+        res.json(consentScopedPatients);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
     }
@@ -65,9 +138,22 @@ router.get('/search', async (req, res) => {
  * GET /api/patients/:id/visits/history
  */
 router.get('/:id/visits/history', async (req, res) => {
-    const { facilityId, tenantId } = req.user!;
+    const { facilityId, tenantId, profileId, role } = req.user!;
     const limit = parseInt(req.query.limit as string) || 5;
     try {
+        const consentCheck = await maybeAssertProviderPhiConsentForPatient({
+            tenantId,
+            facilityId,
+            patientId: req.params.id,
+            consentType: PHI_PORTAL_CONSENT_TYPE,
+        });
+        if (consentCheck.ok === false) {
+            return res.status(consentCheck.status).json({
+                code: consentCheck.code,
+                message: consentCheck.message,
+            });
+        }
+
         let query = supabaseAdmin
             .from('visits')
             .select('id, visit_date, reason, status, provider, visit_notes, clinical_notes, fee_paid, temperature, weight, blood_pressure, heart_rate, respiratory_rate, oxygen_saturation, pain_score')
@@ -85,9 +171,496 @@ router.get('/:id/visits/history', async (req, res) => {
         const { data, error } = await query;
 
         if (error) throw error;
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'view_visit_history',
+                eventType: 'read',
+                entityType: 'patient',
+                entityId: req.params.id,
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+            });
+        }
+
         res.json(data);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
+    }
+});
+
+/**
+ * GET /api/patients/visits/:id/orders
+ * Fetch lab, imaging, medication, and procedure orders for a visit
+ */
+router.get('/visits/:id/orders', async (req, res) => {
+    const { facilityId, tenantId, profileId, role } = req.user!;
+    const visitId = req.params.id;
+
+    try {
+        const { data: visitRow, error: visitError } = await supabaseAdmin
+            .from('visits')
+            .select('id, facility_id, tenant_id, patient_id')
+            .eq('id', visitId)
+            .maybeSingle();
+
+        if (visitError) throw visitError;
+        if (!visitRow) return res.status(404).json({ error: 'Visit not found' });
+
+        if (facilityId && visitRow.facility_id !== facilityId) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+        if (tenantId && visitRow.tenant_id !== tenantId) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        const consentCheck = await maybeAssertProviderPhiConsentForPatient({
+            tenantId,
+            facilityId,
+            patientId: visitRow.patient_id,
+            consentType: PHI_PORTAL_CONSENT_TYPE,
+        });
+        if (consentCheck.ok === false) {
+            return res.status(consentCheck.status).json({
+                code: consentCheck.code,
+                message: consentCheck.message,
+            });
+        }
+
+        const [labOrdersResult, imagingOrdersResult, medicationOrdersResult, billingItemsResult] = await Promise.all([
+            supabaseAdmin
+                .from('lab_orders')
+                .select('id, test_name, test_code, urgency, status, result, result_value, reference_range, ordered_at, collected_at, completed_at, payment_status, payment_mode, amount, paid_at, notes, sent_outside')
+                .eq('visit_id', visitId),
+            supabaseAdmin
+                .from('imaging_orders')
+                .select('id, study_name, study_code, body_part, urgency, status, result, findings, impression, ordered_at, scheduled_at, completed_at, payment_status, payment_mode, amount, paid_at, notes, sent_outside')
+                .eq('visit_id', visitId),
+            supabaseAdmin
+                .from('medication_orders')
+                .select('id, medication_name, generic_name, dosage, frequency, route, duration, quantity, refills, status, notes, ordered_at, dispensed_at, payment_status, payment_mode, amount, paid_at, sent_outside')
+                .eq('visit_id', visitId),
+            supabaseAdmin
+                .from('billing_items')
+                .select('id, payment_status, medical_services (name, category)')
+                .eq('visit_id', visitId),
+        ]);
+
+        if (labOrdersResult.error) throw labOrdersResult.error;
+        if (imagingOrdersResult.error) throw imagingOrdersResult.error;
+        if (medicationOrdersResult.error) throw medicationOrdersResult.error;
+        if (billingItemsResult.error) throw billingItemsResult.error;
+
+        const labOrders = (labOrdersResult.data || []).map((order: any) => ({
+            id: order.id,
+            test_name: order.test_name,
+            test_code: order.test_code || '',
+            urgency: order.urgency,
+            notes: order.notes || '',
+            status: order.status,
+            result: order.result_value || order.result || '',
+            result_value: order.result_value || null,
+            reference_range: order.reference_range || null,
+            payment_status: order.payment_status,
+            paid_at: order.paid_at,
+            sent_outside: order.sent_outside || false,
+            savedFromRecord: true
+        }));
+
+        const imagingOrders = (imagingOrdersResult.data || []).map((order: any) => ({
+            id: order.id,
+            study_name: order.study_name,
+            study_code: order.study_code || '',
+            body_part: order.body_part || '',
+            urgency: order.urgency,
+            notes: order.notes || '',
+            status: order.status,
+            findings: order.findings || '',
+            impression: order.impression || '',
+            result: order.result || '',
+            image_url: order.image_url || order.dicom_url || order.file_url || null,
+            dicom_url: order.dicom_url || null,
+            storage_path: order.storage_path || order.image_path || order.dicom_path || null,
+            image_path: order.image_path || null,
+            dicom_path: order.dicom_path || null,
+            file_url: order.file_url || null,
+            payment_status: order.payment_status,
+            paid_at: order.paid_at,
+            sent_outside: order.sent_outside || false,
+            savedFromRecord: true
+        }));
+
+        const medicationOrders = (medicationOrdersResult.data || []).map((order: any) => ({
+            id: order.id,
+            medication_name: order.medication_name,
+            generic_name: order.generic_name || '',
+            dosage: order.dosage,
+            frequency: order.frequency,
+            route: order.route,
+            duration: order.duration || '',
+            quantity: order.quantity || 0,
+            refills: order.refills || 0,
+            notes: order.notes || '',
+            status: order.status,
+            payment_status: order.payment_status,
+            paid_at: order.paid_at,
+            dispensed_at: order.dispensed_at,
+            sent_outside: order.sent_outside || false,
+            savedFromRecord: true
+        }));
+
+        const procedureOrders = (billingItemsResult.data || [])
+            .filter((item: any) => item.medical_services?.category === 'Procedures')
+            .map((item: any) => ({
+                id: item.id,
+                procedure_name: item.medical_services?.name || 'Unknown Procedure',
+                notes: '',
+                status: item.payment_status === 'paid' ? 'completed' : 'pending',
+                savedFromRecord: true
+            }));
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'view_orders',
+                eventType: 'read',
+                entityType: 'visit',
+                entityId: visitId,
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+            });
+        }
+
+        return res.json({ labOrders, imagingOrders, medicationOrders, procedureOrders });
+    } catch (error: any) {
+        return res.status(500).json({ error: error.message || 'Failed to fetch patient orders' });
+    }
+});
+
+/**
+ * PATCH /api/patients/visits/:id/status
+ * Update visit status and notes.
+ */
+router.patch('/visits/:id/status', async (req, res) => {
+    const visitId = req.params.id;
+    const parsed = visitStatusMutationSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res
+            .status(400)
+            .json({
+                code: 'VALIDATION_INVALID_VISIT_STATUS_PAYLOAD',
+                message: parsed.error.issues[0]?.message || 'Invalid payload',
+            });
+    }
+
+    try {
+        const result = await updateVisitStatusMutation({
+            actor: {
+                authUserId: req.user?.authUserId,
+                profileId: req.user?.profileId,
+                tenantId: req.user?.tenantId,
+                facilityId: req.user?.facilityId,
+                role: req.user?.role,
+                requestId: req.requestId,
+                ipAddress: req.ip,
+                userAgent: req.get('user-agent') || null,
+            },
+            visitId,
+            payload: parsed.data,
+        });
+
+        if (result.ok === false) {
+            return res.status(result.status).json({
+                code: result.code,
+                message: result.message,
+            });
+        }
+
+        return res.json(result.data);
+    } catch (error: any) {
+        return res.status(500).json({
+            code: 'CONFLICT_VISIT_STATUS_UPDATE_FAILED',
+            message: error.message || 'Failed to update visit status',
+        });
+    }
+});
+
+/**
+ * GET /api/patients/:id/orders/history
+ * Query params: type=lab|imaging|medications, excludeVisitId (optional), limit (optional)
+ */
+router.get('/:id/orders/history', async (req, res) => {
+    const { facilityId, tenantId, profileId, role } = req.user!;
+    const parsed = orderHistoryQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+        return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid query' });
+    }
+
+    const { type, excludeVisitId, limit = 5 } = parsed.data;
+
+    try {
+        const consentCheck = await maybeAssertProviderPhiConsentForPatient({
+            tenantId,
+            facilityId,
+            patientId: req.params.id,
+            consentType: PHI_PORTAL_CONSENT_TYPE,
+        });
+        if (consentCheck.ok === false) {
+            return res.status(consentCheck.status).json({
+                code: consentCheck.code,
+                message: consentCheck.message,
+            });
+        }
+
+        let table = '';
+        let select = '';
+        if (type === 'lab') {
+            table = 'lab_orders';
+            select = 'id, visit_id, test_name, test_code, urgency, status, result_value, reference_range, ordered_at, visits!inner(visit_date)';
+        } else if (type === 'imaging') {
+            table = 'imaging_orders';
+            select = 'id, visit_id, study_name, urgency, status, findings, ordered_at, visits!inner(visit_date)';
+        } else {
+            table = 'medication_orders';
+            select = 'id, visit_id, medication_name, dosage, frequency, status, ordered_at, visits!inner(visit_date)';
+        }
+
+        let query = supabaseAdmin
+            .from(table)
+            .select(select)
+            .eq('patient_id', req.params.id)
+            .order('ordered_at', { ascending: false })
+            .limit(limit);
+
+        if (excludeVisitId) {
+            query = query.neq('visit_id', excludeVisitId);
+        }
+        if (facilityId) {
+            query = query.eq('facility_id', facilityId);
+        }
+        if (tenantId) {
+            query = query.eq('tenant_id', tenantId);
+        }
+
+        const { data, error } = await query;
+        if (error) throw error;
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'view_order_history',
+                eventType: 'read',
+                entityType: table,
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+                metadata: { type, result_count: (data || []).length },
+            });
+        }
+
+        return res.json({ items: data || [] });
+    } catch (error: any) {
+        return res.status(500).json({ error: error.message || 'Failed to fetch order history' });
+    }
+});
+
+/**
+ * GET /api/patients/visits/:id/detail
+ * Fetch patient detail bundle for a visit (visit, orders, payments, history, alerts)
+ */
+router.get('/visits/:id/detail', async (req, res) => {
+    const { facilityId, tenantId, profileId, role } = req.user!;
+    const visitId = req.params.id;
+
+    try {
+        const { data: visit, error: visitError } = await supabaseAdmin
+            .from('visits')
+            .select(`
+	              *,
+	              patients (*)
+	            `)
+            .eq('id', visitId)
+            .maybeSingle();
+
+        if (visitError) throw visitError;
+        if (!visit) return res.status(404).json({ error: 'Visit not found' });
+
+        if (facilityId && visit.facility_id !== facilityId) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+        if (tenantId && visit.tenant_id !== tenantId) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        const consentCheck = await maybeAssertProviderPhiConsentForPatient({
+            tenantId,
+            facilityId,
+            patientId: visit.patient_id,
+            consentType: PHI_PORTAL_CONSENT_TYPE,
+        });
+        if (consentCheck.ok === false) {
+            return res.status(consentCheck.status).json({
+                code: consentCheck.code,
+                message: consentCheck.message,
+            });
+        }
+
+        const vitals = visit.temperature || visit.blood_pressure || visit.heart_rate
+            ? [{
+                temperature: visit.temperature,
+                blood_pressure: visit.blood_pressure,
+                heart_rate: visit.heart_rate,
+                respiratory_rate: visit.respiratory_rate,
+                oxygen_saturation: visit.oxygen_saturation,
+                recorded_at: visit.created_at,
+            }]
+            : [];
+
+        const [labOrders, imagingOrders, medicationOrders] = await Promise.all([
+            supabaseAdmin.from('lab_orders').select('*').eq('visit_id', visitId),
+            supabaseAdmin.from('imaging_orders').select('*').eq('visit_id', visitId),
+            supabaseAdmin.from('medication_orders').select('*').eq('visit_id', visitId),
+        ]);
+
+        if (labOrders.error) throw labOrders.error;
+        if (imagingOrders.error) throw imagingOrders.error;
+        if (medicationOrders.error) throw medicationOrders.error;
+
+        const [billingItems, consultationFee] = await Promise.all([
+            supabaseAdmin.from('billing_items').select('*').eq('visit_id', visitId),
+            supabaseAdmin.from('visits').select('fee_paid, consultation_payment_type').eq('id', visitId).single(),
+        ]);
+
+        if (billingItems.error) throw billingItems.error;
+        if (consultationFee.error) throw consultationFee.error;
+
+        const paymentType = (visit as any).consultation_payment_type || 'paying';
+        const isNonPayingPatient = ['free', 'credit', 'insured'].includes(paymentType);
+
+        const totalLabDue = labOrders.data?.filter((o: any) => o.payment_status === 'unpaid')
+            .reduce((sum: number, o: any) => sum + (o.amount || 0), 0) || 0;
+        const totalImagingDue = imagingOrders.data?.filter((o: any) => o.payment_status === 'unpaid')
+            .reduce((sum: number, o: any) => sum + (o.amount || 0), 0) || 0;
+        const totalMedicationDue = medicationOrders.data?.filter((o: any) => o.payment_status === 'unpaid')
+            .reduce((sum: number, o: any) => sum + (o.amount || 0), 0) || 0;
+
+        const totalBillingDue = isNonPayingPatient ? 0 : (
+            billingItems.data?.filter((b: any) => b.payment_status === 'unpaid')
+                .reduce((sum: number, b: any) => sum + (b.total_amount || 0), 0) || 0
+        );
+
+        const payments = {
+            totalDue: totalLabDue + totalImagingDue + totalMedicationDue + totalBillingDue,
+            consultationPaid: isNonPayingPatient || (consultationFee.data as any)?.fee_paid > 0,
+            consultationFee: (consultationFee.data as any)?.fee_paid || 0,
+            consultationPaymentType: paymentType,
+            labOrders: labOrders.data || [],
+            imagingOrders: imagingOrders.data || [],
+            medications: medicationOrders.data || [],
+            billingItems: billingItems.data || [],
+        };
+
+        const { data: recentVisits } = await supabaseAdmin
+            .from('visits')
+            .select('*')
+            .eq('patient_id', visit.patient_id)
+            .neq('id', visitId)
+            .order('visit_date', { ascending: false })
+            .limit(5);
+
+        const alerts: any[] = [];
+        const latestVitals = vitals?.[0];
+        if (latestVitals) {
+            if (latestVitals.temperature && latestVitals.temperature > 38.5) {
+                alerts.push({
+                    id: 'high-temp',
+                    severity: 'critical',
+                    category: 'vitals',
+                    message: `High temperature: ${latestVitals.temperature} C`,
+                });
+            }
+            if (latestVitals.oxygen_saturation && latestVitals.oxygen_saturation < 95) {
+                alerts.push({
+                    id: 'low-o2',
+                    severity: 'critical',
+                    category: 'vitals',
+                    message: `Low oxygen saturation: ${latestVitals.oxygen_saturation}%`,
+                });
+            }
+        }
+
+        if (payments.totalDue > 0) {
+            alerts.push({
+                id: 'unpaid',
+                severity: 'warning',
+                category: 'payment',
+                message: `Outstanding balance: ${payments.totalDue} ETB`,
+            });
+        }
+
+        if ((visit as any).triage_urgency === 'RED') {
+            alerts.push({
+                id: 'red-triage',
+                severity: 'critical',
+                category: 'triage',
+                message: 'Emergency triage - requires immediate attention',
+            });
+        }
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'view_visit_detail',
+                eventType: 'read',
+                entityType: 'visit',
+                entityId: visitId,
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+            });
+        }
+
+        return res.json({
+            patient: (visit as any).patients,
+            currentVisit: visit,
+            vitalSigns: vitals || [],
+            orders: {
+                lab: labOrders.data || [],
+                imaging: imagingOrders.data || [],
+                medication: medicationOrders.data || [],
+            },
+            payments,
+            history: {
+                recentVisits: recentVisits || [],
+                medicalHistory: null,
+            },
+            alerts,
+        });
+    } catch (error: any) {
+        return res.status(500).json({ error: error.message || 'Failed to fetch patient detail' });
     }
 });
 
@@ -96,7 +669,7 @@ router.get('/:id/visits/history', async (req, res) => {
  * Create a new visit
  */
 router.post('/:id/visits', async (req, res) => {
-    const { tenantId, facilityId, profileId: userId } = req.user!;
+    const { tenantId, facilityId, profileId: userId, role } = req.user!;
     const patientId = req.params.id;
 
     try {
@@ -134,6 +707,8 @@ router.post('/:id/visits', async (req, res) => {
                 error: 'Patient has an active visit in progress. Please complete or cancel the existing visit before creating a new one.'
             });
         }
+
+        await ensurePatientAccountLink({ patientId, tenantId });
 
         // 1. Insert Visit
         const { data: visit, error: visitError } = await supabaseAdmin
@@ -227,9 +802,27 @@ router.post('/:id/visits', async (req, res) => {
                     tenant_id: tenantId
                 });
             }
-        } catch (billingErr) {
-            console.error('Billing creation failed', billingErr);
+        } catch (billingErr: any) {
+            console.error('Billing creation failed', billingErr?.message || billingErr);
             // non-blocking
+        }
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'create_visit',
+                eventType: 'create',
+                entityType: 'visit',
+                entityId: visit.id,
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: userId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+            });
         }
 
         res.json(visit);
@@ -291,7 +884,7 @@ const routeVisitSchema = z.object({
  * Registers a new patient with visit and billing
  */
 router.post('/register-intake', async (req, res) => {
-    const { tenantId, facilityId, profileId: userId } = req.user!;
+    const { tenantId, facilityId, profileId: userId, role } = req.user!;
 
     try {
         const payload = registerIntakeSchema.parse(req.body);
@@ -354,6 +947,19 @@ router.post('/register-intake', async (req, res) => {
         if (rpcError) throw rpcError;
 
         const visitId = (result as { visit_id?: string } | null)?.visit_id;
+        const patientId = (result as { patient_id?: string } | null)?.patient_id;
+
+        if (patientId) {
+            const fullName = [payload.firstName, payload.middleName, payload.lastName].filter(Boolean).join(' ').trim();
+            await ensurePatientAccountLink({
+                patientId,
+                tenantId,
+                phoneNumber: payload.phone,
+                fullName: fullName || (result as { full_name?: string } | null)?.full_name || undefined,
+                dateOfBirth: payload.dateOfBirth || null,
+                gender: payload.sex === 'M' ? 'male' : 'female'
+            });
+        }
 
         // 3. Cleanup unexpected dressing charges (legacy data/trigger safety)
         if (visitId) {
@@ -397,6 +1003,25 @@ router.post('/register-intake', async (req, res) => {
                 .eq('id', visitId);
         }
 
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'register_intake',
+                eventType: 'create',
+                entityType: 'patient',
+                entityId: patientId || null,
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: userId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+                metadata: { visit_id: visitId || null },
+            });
+        }
+
         res.json(result);
 
     } catch (error: any) {
@@ -410,7 +1035,7 @@ router.post('/register-intake', async (req, res) => {
  * Route a visit to the next journey stage.
  */
 router.post('/visits/:id/route', async (req, res) => {
-    const { facilityId, profileId, role } = req.user!;
+    const { facilityId, profileId, role, tenantId } = req.user!;
     const visitId = req.params.id;
 
     try {
@@ -436,6 +1061,25 @@ router.post('/visits/:id/route', async (req, res) => {
         });
 
         if (!advanceError) {
+            if (tenantId) {
+                await recordAuditEvent({
+                    action: 'route_visit',
+                    eventType: 'update',
+                    entityType: 'visit',
+                    entityId: visitId,
+                    tenantId,
+                    facilityId: facilityId || null,
+                    actorUserId: profileId || null,
+                    actorRole: role || null,
+                    actorIpAddress: req.ip,
+                    actorUserAgent: req.get('user-agent') || null,
+                    complianceTags: ['hipaa'],
+                    sensitivityLevel: 'phi',
+                    requestId: req.requestId || null,
+                    metadata: { destination_stage: destinationStage, forced: false },
+                });
+            }
+
             return res.json({ success: true });
         }
 
@@ -457,10 +1101,89 @@ router.post('/visits/:id/route', async (req, res) => {
 
         if (updateError) throw updateError;
 
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'route_visit',
+                eventType: 'update',
+                entityType: 'visit',
+                entityId: visitId,
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+                metadata: { destination_stage: destinationStage, forced: true },
+            });
+        }
+
         return res.json({ success: true, forced: true });
     } catch (error: any) {
         if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues });
         res.status(500).json({ error: error.message || 'Routing failed' });
+    }
+});
+
+/**
+ * POST /api/patients/visits/:id/stage
+ * Append a journey stage without routing validation (audit logged).
+ */
+router.post('/visits/:id/stage', async (req, res) => {
+    const { facilityId, profileId, role, tenantId } = req.user!;
+    const visitId = req.params.id;
+
+    try {
+        const { stage } = appendStageSchema.parse(req.body);
+
+        const { data: visitRow, error: visitError } = await supabaseAdmin
+            .from('visits')
+            .select('id, facility_id')
+            .eq('id', visitId)
+            .maybeSingle();
+
+        if (visitError) throw visitError;
+        if (!visitRow) return res.status(404).json({ error: 'Visit not found' });
+
+        if (facilityId && visitRow.facility_id !== facilityId) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+
+        const { error: appendError } = await supabaseAdmin.rpc('append_journey_stage', {
+            p_visit_id: visitId,
+            p_stage: stage,
+            p_user_id: profileId || null,
+        });
+
+        if (appendError) {
+            return res.status(400).json({ error: appendError.message || 'Failed to append stage' });
+        }
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'append_journey_stage',
+                eventType: 'update',
+                entityType: 'visit',
+                entityId: visitId,
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+                metadata: { stage },
+            });
+        }
+
+        return res.json({ success: true });
+    } catch (error: any) {
+        if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues });
+        return res.status(500).json({ error: error.message || 'Failed to append stage' });
     }
 });
 

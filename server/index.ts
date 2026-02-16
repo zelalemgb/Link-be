@@ -5,10 +5,12 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
+import cookieParser from 'cookie-parser';
+import crypto from 'crypto';
 
 // Config & Middleware
 import { supabaseAdmin } from './config/supabase';
-import { requireUser, adminKeyGuard } from './middleware/auth';
+import { requireUser, superAdminGuard } from './middleware/auth';
 
 // Routes
 import authRouter from './routes/auth';
@@ -20,27 +22,78 @@ import inventoryRouter from './routes/inventory';
 import aiRouter from './routes/ai';
 import receptionRouter from './routes/reception';
 import ordersRouter from './routes/orders';
+import patientAuthRouter from './routes/patient-auth';
+import patientPortalRouter from './routes/patient-portal';
+import facilitiesRouter from './routes/facilities';
+import staffInvitationsRouter from './routes/staff-invitations';
+import adminDataRouter from './routes/admin-data';
+import doctorRouter from './routes/doctor';
+import mobileRouter from './routes/mobile';
+import monitoringRouter from './routes/monitoring';
+import inpatientRouter from './routes/inpatient';
+import nursingRouter from './routes/nursing';
+import pharmacyRouter from './routes/pharmacy';
+import { recordResponseStatus } from './services/monitoring';
 
-const app = express();
+export const app = express();
 const port = process.env.PORT || 4000;
 
+const isProduction = process.env.NODE_ENV === 'production';
+const corsOriginsRaw = process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || '';
+const allowedOrigins = corsOriginsRaw
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const safePath = (url: string | undefined) => (url || '').split('?')[0];
+
+app.set('trust proxy', 1);
 app.use(helmet());
 app.use(express.json());
+app.use(cookieParser());
 app.use((req, res, next) => {
-  console.log(`[Incoming Request] ${req.method} ${req.url} from ${req.headers.origin}`);
+  const headerRequestId = req.header('x-request-id');
+  const requestId = headerRequestId?.trim() || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
   next();
 });
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow any origin for now to rule out CORS issues
-      callback(null, true);
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (!isProduction && (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1'))) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.length === 0) {
+        if (!isProduction) {
+          return callback(null, true);
+        }
+        return callback(new Error('CORS not configured'));
+      }
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error('Origin not allowed by CORS'));
     },
     credentials: true
   })
 );
-app.use(morgan('combined'));
+morgan.token('safe-url', (req) => safePath((req as express.Request).originalUrl));
+app.use(morgan(':res[x-request-id] :method :safe-url :status :res[content-length] - :response-time ms'));
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    recordResponseStatus(res.statusCode, req.requestId);
+  });
+  next();
+});
 
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -65,7 +118,21 @@ const findAuthUserByEmail = async (email: string) => {
   return null;
 };
 
+const clinicAdminOverviewRoles = new Set([
+  'clinic_admin',
+  'admin',
+  'super_admin',
+  'hospital_ceo',
+  'medical_director',
+  'nursing_head',
+]);
+
 app.get('/health', (_req, res) => {
+  res.json({ ok: true, timestamp: new Date().toISOString() });
+});
+
+// Keep a health alias under /api so staging probes can use a single API base URL.
+app.get('/api/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
@@ -79,6 +146,18 @@ app.use('/api/inventory', inventoryRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/reception', receptionRouter);
 app.use('/api/orders', ordersRouter);
+app.use('/api/patient-auth', patientAuthRouter);
+app.use('/api/patient-portal', patientPortalRouter);
+app.use('/api/monitoring', monitoringRouter);
+app.use('/api/facilities', facilitiesRouter);
+app.use('/api/staff-invitations', staffInvitationsRouter);
+app.use('/api/admin-data', adminDataRouter);
+app.use('/api/doctor', doctorRouter);
+app.use('/api/mobile', mobileRouter);
+app.use('/api/inpatient', inpatientRouter);
+app.use('/api/nursing', nursingRouter);
+app.use('/api/pharmacy', pharmacyRouter);
+
 
 const clinicRegistrationSchema = z.object({
   clinic: z.object({
@@ -158,7 +237,7 @@ const betaRegistrationSchema = z.object({
   status: z.string().optional(),
 });
 
-app.post('/api/admin/super-admin', adminKeyGuard, async (req, res) => {
+app.post('/api/admin/super-admin', requireUser, superAdminGuard, async (req, res) => {
   const parsed = superAdminSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
@@ -363,6 +442,7 @@ app.post('/api/feature-requests', requireUser, async (req, res) => {
       .from('feature_requests')
       .insert({
         ...body,
+        status: 'submitted',
         user_id: profileId,
         facility_id: facilityId,
       })
@@ -384,9 +464,9 @@ app.get('/api/feature-requests/me', requireUser, async (req, res) => {
   try {
     let query = supabaseAdmin
       .from('feature_requests')
-      .select('*, users(name, user_role), facilities(name)')
+      .select('*, users:users!feature_requests_user_id_fkey(name, user_role), facilities(name)')
       .eq('user_id', profileId)
-      .neq('status', 'deleted')
+      .or('status.is.null,status.neq.deleted')
       .order('created_at', { ascending: false });
 
     if (role !== 'super_admin' && facilityId) {
@@ -409,7 +489,7 @@ app.get('/api/feature-requests', requireUser, async (req, res) => {
   try {
     let query = supabaseAdmin
       .from('feature_requests')
-      .select('*, users(name, user_role), facilities(name)')
+      .select('*, users:users!feature_requests_user_id_fkey(name, user_role), facilities(name)')
       .order('created_at', { ascending: false });
 
     query = applyFeatureRequestScope(query, scope);
@@ -429,8 +509,8 @@ app.get('/api/feature-requests/community', requireUser, async (req, res) => {
   try {
     let query = supabaseAdmin
       .from('feature_requests')
-      .select('*, users(name, user_role), facilities(name)')
-      .neq('status', 'deleted')
+      .select('*, users:users!feature_requests_user_id_fkey(name, user_role), facilities(name)')
+      .or('status.is.null,status.neq.deleted')
       .order('created_at', { ascending: false });
 
     query = applyFeatureRequestScope(query, scope);
@@ -654,17 +734,43 @@ app.delete('/api/feature-requests/:id', requireUser, async (req, res) => {
 
 // Clinic Admin overview (BFF for dashboard)
 app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
-  const { facilityId: userFacilityId } = req.user!;
+  const { authUserId, facilityId: userFacilityId, tenantId: userTenantId, role } = req.user!;
+  if (!clinicAdminOverviewRoles.has(role)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
   const facilityId = (req.query.facilityId as string | undefined) || userFacilityId;
 
   if (!facilityId) return res.status(400).json({ error: 'Missing facilityId' });
 
   try {
-    const { data: facility, error: facilityErr } = await supabaseAdmin
+    if (role !== 'super_admin' && facilityId !== userFacilityId) {
+      const { data: membership, error: membershipError } = await supabaseAdmin
+        .from('users')
+        .select('id, tenant_id')
+        .eq('auth_user_id', authUserId)
+        .eq('facility_id', facilityId)
+        .maybeSingle();
+
+      if (membershipError || !membership) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+
+      if (userTenantId && membership.tenant_id && membership.tenant_id !== userTenantId) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+
+    let facilityQuery = supabaseAdmin
       .from('facilities')
       .select('*')
-      .eq('id', facilityId)
-      .single();
+      .eq('id', facilityId);
+
+    if (role !== 'super_admin' && userTenantId) {
+      facilityQuery = facilityQuery.eq('tenant_id', userTenantId);
+    }
+
+    const { data: facility, error: facilityErr } = await facilityQuery.single();
 
     if (facilityErr || !facility) {
       return res.status(404).json({ error: 'Facility not found' });
@@ -672,6 +778,7 @@ app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
 
     const today = new Date().toISOString().split('T')[0];
 
+    const nowIso = new Date().toISOString();
     const [
       staffCount,
       pendingRequestsCount,
@@ -716,7 +823,9 @@ app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
       supabaseAdmin
         .from('staff_invitations')
         .select('*', { count: 'exact', head: true })
-        .match({ facility_id: facilityId, status: 'pending' }),
+        .eq('facility_id', facilityId)
+        .eq('accepted', false)
+        .gte('expires_at', nowIso),
     ]);
 
     const hasDepartment = (departmentsCount.count ?? 0) > 0;
@@ -845,6 +954,8 @@ app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-app.listen(port, () => {
-  console.log(`API server listening on :${port}`);
-});
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log(`API server listening on :${port}`);
+  });
+}

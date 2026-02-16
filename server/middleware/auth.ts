@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { supabaseAdmin } from '../config/supabase';
+import { recordAuthFailure } from '../services/monitoring';
 
 const { ADMIN_API_SECRET, AUTH_DEBUG } = process.env;
 const isAuthDebug = AUTH_DEBUG === 'true';
@@ -26,6 +27,7 @@ declare global {
     namespace Express {
         interface Request {
             user?: AuthUser;
+            requestId?: string;
         }
     }
 }
@@ -37,6 +39,7 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
         : undefined;
 
     if (!token) {
+        recordAuthFailure(req.requestId);
         return res.status(401).json({ error: 'Missing bearer token' });
     }
 
@@ -46,6 +49,7 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
             if (isAuthDebug) {
                 console.error('[AUTH DEBUG] getUser error:', error?.message || 'No user data');
             }
+            recordAuthFailure(req.requestId);
             return res.status(401).json({ error: 'Invalid token' });
         }
 
@@ -82,10 +86,26 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
         };
 
         next();
-    } catch (err) {
-        console.error('Auth middleware error:', err);
+    } catch (err: any) {
+        console.error('Auth middleware error:', err?.message || err);
         return res.status(500).json({ error: 'Internal auth error' });
     }
+};
+
+export const requireScopedUser = (req: Request, res: Response, next: NextFunction) => {
+    if (!req.user) {
+        return res.status(401).json({ error: 'Missing user context' });
+    }
+
+    if (req.user.role === 'super_admin') {
+        return next();
+    }
+
+    if (!req.user.tenantId || !req.user.facilityId) {
+        return res.status(403).json({ error: 'Missing tenant or facility context' });
+    }
+
+    return next();
 };
 
 export const superAdminGuard = (req: Request, res: Response, next: NextFunction) => {

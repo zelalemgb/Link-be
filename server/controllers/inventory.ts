@@ -3,6 +3,8 @@ import { Request, Response } from 'express';
 import { supabaseAdmin } from '../config/supabase.js';
 import { z } from 'zod';
 
+const isInventoryDebug = process.env.INVENTORY_DEBUG === 'true';
+
 // --- Schemas ---
 const createItemSchema = z.object({
     name: z.string().min(2),
@@ -32,7 +34,9 @@ export const getInventoryItems = async (req: Request, res: Response) => {
     const { facilityId } = req.user!;
     const q = (req.query.q as string)?.toLowerCase();
 
-    console.log(`Fetching items for facility: ${facilityId}, search: ${q || 'none'}`);
+    if (isInventoryDebug) {
+        console.log(`Fetching items for facility: ${facilityId}, search: ${q || 'none'}`);
+    }
     try {
         // 1. Fetch base inventory items
         let query = supabaseAdmin
@@ -48,7 +52,9 @@ export const getInventoryItems = async (req: Request, res: Response) => {
         const { data: items, error: itemsError } = await query;
         if (itemsError) throw itemsError;
 
-        console.log(`Found ${items?.length || 0} inventory items`);
+        if (isInventoryDebug) {
+            console.log(`Found ${items?.length || 0} inventory items`);
+        }
 
         // Step 2: Fetch current stock from the view
         const { data: stockData, error: stockError } = await supabaseAdmin
@@ -74,8 +80,8 @@ export const getInventoryItems = async (req: Request, res: Response) => {
         });
 
         return res.json(formatted);
-    } catch (err) {
-        console.error('getInventoryItems error:', err);
+    } catch (err: any) {
+        console.error('getInventoryItems error:', err?.message || err);
         return res.status(500).json({ error: 'Internal server error' });
     }
 };
@@ -103,8 +109,8 @@ export const createInventoryItem = async (req: Request, res: Response) => {
         if (error) return res.status(500).json({ error: error.message });
 
         return res.status(201).json(data);
-    } catch (err) {
-        console.error('createInventoryItem error:', err);
+    } catch (err: any) {
+        console.error('createInventoryItem error:', err?.message || err);
         return res.status(500).json({ error: 'Internal server error' });
     }
 };
@@ -127,15 +133,43 @@ export const getInventoryStats = async (req: Request, res: Response) => {
         // Count items with expired stock? (Needs batch level data, current_stock view might not have it)
         // For now, simple stats.
 
+        let stockValue = 0;
+        const inventoryIds = stockData.map(item => item.inventory_item_id).filter(Boolean);
+        if (inventoryIds.length > 0) {
+            const { data: costRows, error: costError } = await supabaseAdmin
+                .from('inventory_items')
+                .select('id, unit_cost')
+                .eq('facility_id', facilityId)
+                .in('id', inventoryIds);
+
+            if (costError) throw costError;
+
+            const costById = new Map<string, number>();
+            (costRows || []).forEach(row => {
+                const unitCost = row.unit_cost !== null && row.unit_cost !== undefined
+                    ? Number(row.unit_cost)
+                    : 0;
+                if (Number.isFinite(unitCost)) {
+                    costById.set(row.id, unitCost);
+                }
+            });
+
+            stockValue = stockData.reduce((sum, item) => {
+                const quantity = Number(item.current_quantity || 0);
+                const unitCost = costById.get(item.inventory_item_id) || 0;
+                return sum + (quantity * unitCost);
+            }, 0);
+        }
+
         return res.json({
             facilityId,
             totalItems,
             lowStock,
             outOfStock,
-            stockValue: 0 // TODO: Calculate value
+            stockValue
         });
-    } catch (err) {
-        console.error('getInventoryStats error:', err);
+    } catch (err: any) {
+        console.error('getInventoryStats error:', err?.message || err);
         return res.status(500).json({ error: 'Internal server error' });
     }
 }
@@ -225,8 +259,8 @@ export const processStockMovement = async (req: Request, res: Response) => {
 
         return res.status(201).json(data);
 
-    } catch (err) {
-        console.error('processStockMovement error:', err);
+    } catch (err: any) {
+        console.error('processStockMovement error:', err?.message || err);
         return res.status(500).json({ error: 'Internal server error' });
     }
 };
@@ -253,8 +287,8 @@ export const getStockMovements = async (req: Request, res: Response) => {
         if (error) throw error;
 
         return res.json(data);
-    } catch (err) {
-        console.error('getStockMovements error:', err);
+    } catch (err: any) {
+        console.error('getStockMovements error:', err?.message || err);
         return res.status(500).json({ error: 'Internal server error' });
     }
 }
