@@ -33,6 +33,7 @@ import monitoringRouter from './routes/monitoring';
 import inpatientRouter from './routes/inpatient';
 import nursingRouter from './routes/nursing';
 import pharmacyRouter from './routes/pharmacy';
+import syncRouter from './routes/sync';
 import { recordResponseStatus } from './services/monitoring';
 
 export const app = express();
@@ -157,6 +158,7 @@ app.use('/api/mobile', mobileRouter);
 app.use('/api/inpatient', inpatientRouter);
 app.use('/api/nursing', nursingRouter);
 app.use('/api/pharmacy', pharmacyRouter);
+app.use('/api/sync', syncRouter);
 
 
 const clinicRegistrationSchema = z.object({
@@ -405,6 +407,34 @@ type FeatureRequestScopedQuery<T> = {
   eq: (column: string, value: string) => T;
 };
 
+const getAuthUserProfileIds = async (authUserId: string) => {
+  const { data, error } = await supabaseAdmin
+    .from('users')
+    .select('id')
+    .eq('auth_user_id', authUserId);
+
+  if (error) throw error;
+  return (data || []).map((row) => row.id).filter(Boolean) as string[];
+};
+
+// Backward compatible ownership resolution:
+// - modern rows use users.id (profile id)
+// - some legacy rows used auth.users id directly in feature_requests.user_id
+const getFeatureRequestActorIds = async (authUserId: string, profileId?: string) => {
+  const ids = new Set<string>();
+  ids.add(authUserId);
+  if (profileId) ids.add(profileId);
+
+  try {
+    const profileIds = await getAuthUserProfileIds(authUserId);
+    for (const id of profileIds) ids.add(id);
+  } catch (error) {
+    console.warn('feature request actor id expansion failed', error);
+  }
+
+  return Array.from(ids);
+};
+
 const applyFeatureRequestScope = <T extends FeatureRequestScopedQuery<T>>(
   query: T,
   scope: { facilityId?: string; role: string }
@@ -423,6 +453,83 @@ const getScopedFeatureRequest = async (id: string, scope: { facilityId?: string;
 
   query = applyFeatureRequestScope(query, scope);
   return query.maybeSingle();
+};
+
+type FeatureRequestRow = {
+  id: string;
+  user_id?: string | null;
+  facility_id?: string | null;
+  [key: string]: unknown;
+};
+
+type FeatureRequestUserRow = {
+  id: string;
+  name?: string | null;
+  full_name?: string | null;
+  user_role?: string | null;
+};
+
+type FeatureRequestFacilityRow = {
+  id: string;
+  name?: string | null;
+};
+
+// Avoid brittle PostgREST relation-select syntax in list endpoints; enrich related
+// display metadata explicitly so feedback tabs keep loading even if FK names drift.
+const enrichFeatureRequestRows = async (rows: FeatureRequestRow[]) => {
+  if (!rows.length) return rows;
+
+  const userIds = Array.from(new Set(rows.map((row) => row.user_id).filter(Boolean))) as string[];
+  const facilityIds = Array.from(new Set(rows.map((row) => row.facility_id).filter(Boolean))) as string[];
+
+  const [usersResult, facilitiesResult] = await Promise.all([
+    userIds.length
+      ? supabaseAdmin
+          .from('users')
+          .select('*')
+          .in('id', userIds)
+      : Promise.resolve({ data: [] as FeatureRequestUserRow[], error: null }),
+    facilityIds.length
+      ? supabaseAdmin
+          .from('facilities')
+          .select('*')
+          .in('id', facilityIds)
+      : Promise.resolve({ data: [] as FeatureRequestFacilityRow[], error: null }),
+  ]);
+
+  if (usersResult.error || facilitiesResult.error) {
+    console.warn('feature request enrichment fallback used', {
+      usersError: usersResult.error?.message,
+      facilitiesError: facilitiesResult.error?.message,
+    });
+
+    return rows.map((row) => ({
+      ...row,
+      users: null,
+      facilities: null,
+    }));
+  }
+
+  const userMap = new Map<string, { name: string; user_role: string }>();
+  for (const user of (usersResult.data || []) as FeatureRequestUserRow[]) {
+    userMap.set(user.id, {
+      name: user.name || user.full_name || 'Unknown user',
+      user_role: user.user_role || 'staff',
+    });
+  }
+
+  const facilityMap = new Map<string, { name: string }>();
+  for (const facility of (facilitiesResult.data || []) as FeatureRequestFacilityRow[]) {
+    facilityMap.set(facility.id, {
+      name: facility.name || 'Unknown facility',
+    });
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    users: row.user_id ? userMap.get(row.user_id) || null : null,
+    facilities: row.facility_id ? facilityMap.get(row.facility_id) || null : null,
+  }));
 };
 
 app.post('/api/feature-requests', requireUser, async (req, res) => {
@@ -458,25 +565,23 @@ app.post('/api/feature-requests', requireUser, async (req, res) => {
 });
 
 app.get('/api/feature-requests/me', requireUser, async (req, res) => {
-  const scope = getFeatureRequestScope(req, res);
-  if (!scope) return;
-  const { profileId, facilityId, role } = scope;
+  const authUserId = req.user?.authUserId;
+  if (!authUserId) return res.status(401).json({ error: 'Missing user context' });
   try {
+    const actorIds = await getFeatureRequestActorIds(authUserId, req.user?.profileId);
+
     let query = supabaseAdmin
       .from('feature_requests')
-      .select('*, users:users!feature_requests_user_id_fkey(name, user_role), facilities(name)')
-      .eq('user_id', profileId)
+      .select('*')
+      .in('user_id', actorIds)
       .or('status.is.null,status.neq.deleted')
       .order('created_at', { ascending: false });
-
-    if (role !== 'super_admin' && facilityId) {
-      query = query.eq('facility_id', facilityId);
-    }
 
     const { data, error } = await query;
 
     if (error) return res.status(500).json({ error: error.message });
-    return res.json(data || []);
+    const enriched = await enrichFeatureRequestRows((data || []) as FeatureRequestRow[]);
+    return res.json(enriched);
   } catch (err) {
     console.error('list my feature requests failed', err);
     return res.status(500).json({ error: 'Unexpected error' });
@@ -489,14 +594,15 @@ app.get('/api/feature-requests', requireUser, async (req, res) => {
   try {
     let query = supabaseAdmin
       .from('feature_requests')
-      .select('*, users:users!feature_requests_user_id_fkey(name, user_role), facilities(name)')
+      .select('*')
       .order('created_at', { ascending: false });
 
     query = applyFeatureRequestScope(query, scope);
     const { data, error } = await query;
 
     if (error) return res.status(500).json({ error: error.message });
-    return res.json(data || []);
+    const enriched = await enrichFeatureRequestRows((data || []) as FeatureRequestRow[]);
+    return res.json(enriched);
   } catch (err) {
     console.error('list all feature requests failed', err);
     return res.status(500).json({ error: 'Unexpected error' });
@@ -509,7 +615,7 @@ app.get('/api/feature-requests/community', requireUser, async (req, res) => {
   try {
     let query = supabaseAdmin
       .from('feature_requests')
-      .select('*, users:users!feature_requests_user_id_fkey(name, user_role), facilities(name)')
+      .select('*')
       .or('status.is.null,status.neq.deleted')
       .order('created_at', { ascending: false });
 
@@ -517,7 +623,8 @@ app.get('/api/feature-requests/community', requireUser, async (req, res) => {
     const { data, error } = await query;
 
     if (error) return res.status(500).json({ error: error.message });
-    return res.json(data || []);
+    const enriched = await enrichFeatureRequestRows((data || []) as FeatureRequestRow[]);
+    return res.json(enriched);
   } catch (err) {
     console.error('community feature requests failed', err);
     return res.status(500).json({ error: 'Unexpected error' });
@@ -560,15 +667,32 @@ app.patch('/api/feature-requests/:id', requireUser, async (req, res) => {
   if (Object.keys(updates).length === 0) {
     return res.status(400).json({ error: 'No valid fields to update' });
   }
-  const scope = getFeatureRequestScope(req, res);
-  if (!scope) return;
-
   try {
-    const { data: requestRow, error: requestErr } = await getScopedFeatureRequest(req.params.id, scope);
-    if (requestErr) return res.status(500).json({ error: requestErr.message });
-    if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
-    if (scope.role !== 'admin' && scope.role !== 'super_admin' && requestRow.user_id !== scope.profileId) {
-      return res.status(403).json({ error: 'Forbidden' });
+    const authUserId = req.user?.authUserId;
+    const role = req.user?.role;
+    if (!authUserId || !role) return res.status(401).json({ error: 'Missing user context' });
+
+    if (role === 'admin' || role === 'super_admin') {
+      const scope = getFeatureRequestScope(req, res);
+      if (!scope) return;
+
+      const { data: requestRow, error: requestErr } = await getScopedFeatureRequest(req.params.id, scope);
+      if (requestErr) return res.status(500).json({ error: requestErr.message });
+      if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
+    } else {
+      const { data: requestRow, error: requestErr } = await supabaseAdmin
+        .from('feature_requests')
+        .select('id, user_id')
+        .eq('id', req.params.id)
+        .maybeSingle();
+
+      if (requestErr) return res.status(500).json({ error: requestErr.message });
+      if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
+
+      const actorIds = await getFeatureRequestActorIds(authUserId, req.user?.profileId);
+      if (!actorIds.includes(requestRow.user_id)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
     }
 
     const { data, error } = await supabaseAdmin
@@ -706,14 +830,32 @@ app.post('/api/feature-requests/:id/vote', requireUser, async (req, res) => {
 });
 
 app.delete('/api/feature-requests/:id', requireUser, async (req, res) => {
-  const scope = getFeatureRequestScope(req, res);
-  if (!scope) return;
   try {
-    const { data: requestRow, error: requestErr } = await getScopedFeatureRequest(req.params.id, scope);
-    if (requestErr) return res.status(500).json({ error: requestErr.message });
-    if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
-    if (scope.role !== 'admin' && scope.role !== 'super_admin' && requestRow.user_id !== scope.profileId) {
-      return res.status(403).json({ error: 'Forbidden' });
+    const authUserId = req.user?.authUserId;
+    const role = req.user?.role;
+    if (!authUserId || !role) return res.status(401).json({ error: 'Missing user context' });
+
+    if (role === 'admin' || role === 'super_admin') {
+      const scope = getFeatureRequestScope(req, res);
+      if (!scope) return;
+
+      const { data: requestRow, error: requestErr } = await getScopedFeatureRequest(req.params.id, scope);
+      if (requestErr) return res.status(500).json({ error: requestErr.message });
+      if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
+    } else {
+      const { data: requestRow, error: requestErr } = await supabaseAdmin
+        .from('feature_requests')
+        .select('id, user_id')
+        .eq('id', req.params.id)
+        .maybeSingle();
+
+      if (requestErr) return res.status(500).json({ error: requestErr.message });
+      if (!requestRow) return res.status(404).json({ error: 'Feature request not found' });
+
+      const actorIds = await getFeatureRequestActorIds(authUserId, req.user?.profileId);
+      if (!actorIds.includes(requestRow.user_id)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
     }
 
     const { error } = await supabaseAdmin.from('feature_requests').delete().eq('id', req.params.id);
