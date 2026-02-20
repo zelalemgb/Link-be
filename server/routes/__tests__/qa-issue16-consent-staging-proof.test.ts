@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import https from 'node:https';
 import test from 'node:test';
-import { createClient } from '@supabase/supabase-js';
+import { Resolver } from 'node:dns/promises';
 
 type JsonBody = Record<string, unknown> | null;
 
@@ -46,6 +47,86 @@ const extractCookieValue = (cookies: string[], cookieName: string) => {
     }
   }
   return '';
+};
+
+const resolvePublicIpv4 = async (hostname: string) => {
+  const configured = requireEnv('STAGING_DNS_SERVERS');
+  const servers = configured
+    ? configured
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean)
+    : ['1.1.1.1', '8.8.8.8'];
+
+  const resolver = new Resolver();
+  resolver.setServers(servers);
+  const addresses = await resolver.resolve4(hostname);
+  const address = addresses.find((value) => typeof value === 'string' && value.trim().length > 0) || '';
+  assert.ok(address, `Failed to resolve ${hostname} via STAGING_DNS_SERVERS=${servers.join(',')}`);
+  return address;
+};
+
+const requestJsonOverHttps = async ({
+  hostname,
+  path,
+  method,
+  headers,
+  body,
+}: {
+  hostname: string;
+  path: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+}): Promise<{ status: number; json: Record<string, unknown> | null; raw: string }> => {
+  const resolvedIp = await resolvePublicIpv4(hostname);
+
+  return await new Promise((resolve, reject) => {
+    const hasBody = typeof body === 'string' && body.length > 0;
+    const req = https.request(
+      {
+        protocol: 'https:',
+        hostname,
+        method,
+        path,
+        headers: hasBody
+          ? {
+              ...headers,
+              'content-length': String(Buffer.byteLength(body)),
+            }
+          : headers,
+        // Force public DNS resolution to avoid broken/poisoned local resolvers.
+        lookup: (_hostname, opts: any, cb: any) => {
+          // Node may request `all: true` for Happy Eyeballs; match the expected callback signature.
+          if (opts && typeof opts === 'object' && opts.all === true) {
+            return cb(null, [{ address: resolvedIp, family: 4 }]);
+          }
+          return cb(null, resolvedIp, 4);
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          if (!raw) {
+            return resolve({ status: res.statusCode || 0, json: null, raw: '' });
+          }
+          try {
+            return resolve({ status: res.statusCode || 0, json: JSON.parse(raw), raw });
+          } catch {
+            return resolve({ status: res.statusCode || 0, json: null, raw });
+          }
+        });
+      }
+    );
+
+    req.on('error', reject);
+    if (hasBody) {
+      req.write(body);
+    }
+    req.end();
+  });
 };
 
 const resolvePatientAuth = async (apiBaseUrl: string): Promise<PatientAuthContext> => {
@@ -105,19 +186,28 @@ const resolveProviderToken = async () => {
     ].join(' ')
   );
 
-  const client = createClient(supabaseUrl, supabaseAnonKey, {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-      detectSessionInUrl: false,
+  const parsedUrl = new URL(supabaseUrl);
+  const hostname = parsedUrl.hostname;
+  const path = '/auth/v1/token?grant_type=password';
+
+  const response = await requestJsonOverHttps({
+    hostname,
+    path,
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      apikey: supabaseAnonKey,
+      authorization: `Bearer ${supabaseAnonKey}`,
     },
+    body: JSON.stringify({ email: providerEmail, password: providerPassword }),
   });
-  const { data, error } = await client.auth.signInWithPassword({
-    email: providerEmail,
-    password: providerPassword,
-  });
-  assert.ok(!error, `Failed provider sign-in for staging proof: ${error?.message || 'unknown error'}`);
-  const token = data.session?.access_token || '';
+
+  assert.ok(
+    response.status >= 200 && response.status < 300,
+    `Failed provider sign-in for staging proof: HTTP ${response.status} body=${response.raw || '<empty>'}`
+  );
+
+  const token = String((response.json || {}).access_token || '');
   assert.ok(token, 'Missing provider access token after sign-in');
   return token;
 };
@@ -148,12 +238,51 @@ proofTest(
     const apiBaseRaw = requireEnv('STAGING_API_BASE_URL');
     const facilityId = requireEnv('STAGING_FACILITY_ID');
     const patientId = requireEnv('STAGING_PATIENT_ID');
+    const supabaseUrlRaw = requireEnv('STAGING_SUPABASE_URL');
+    const supabaseAnonKey = requireEnv('STAGING_SUPABASE_ANON_KEY');
 
     assert.ok(apiBaseRaw, 'Missing STAGING_API_BASE_URL');
     assert.ok(facilityId, 'Missing STAGING_FACILITY_ID');
     assert.ok(patientId, 'Missing STAGING_PATIENT_ID');
 
     const apiBaseUrl = normalizeApiBaseUrl(apiBaseRaw);
+
+    if (supabaseUrlRaw && supabaseAnonKey) {
+      const parsed = new URL(supabaseUrlRaw);
+      const hostname = parsed.hostname;
+      const requiredTables = [
+        'patient_portal_consents',
+        'patient_portal_consent_history',
+        'patient_data_consents',
+        'patient_data_consent_history',
+      ];
+
+      for (const table of requiredTables) {
+        const response = await requestJsonOverHttps({
+          hostname,
+          path: `/rest/v1/${table}?select=id&limit=1`,
+          method: 'GET',
+          headers: {
+            accept: 'application/json',
+            apikey: supabaseAnonKey,
+            authorization: `Bearer ${supabaseAnonKey}`,
+          },
+        });
+
+        const errorCode = String((response.json || {}).code || '');
+        if (response.status === 404 && errorCode === '42P01') {
+          assert.fail(
+            [
+              `Staging Supabase is missing required Issue 16 consent table '${table}'.`,
+              `Apply consent migrations to Supabase project '${hostname.split('.', 1)[0] || hostname}'.`,
+              'Recommended SQL bundle:',
+              'link-be/supabase/migrations/APPLY_THIS_issue16_consent_migrations_20260217.sql',
+            ].join(' ')
+          );
+        }
+      }
+    }
+
     const providerToken = await resolveProviderToken();
     const patientAuth = await resolvePatientAuth(apiBaseUrl);
     const runId = `stg-consent-${Date.now()}`;
@@ -203,13 +332,27 @@ proofTest(
       consentType: CONSENT_TYPE,
       purpose: 'QA staging proof',
       comprehensionText:
-        'I understand this grants the selected care team access to my records for treatment, care coordination, and continuity.',
+        'I understand this lets the care team access my records for treatment.',
       comprehensionLanguage: 'en-US',
       comprehensionRecordedAt: new Date().toISOString(),
       uiLanguage: 'en-US',
       comprehensionConfirmed: true,
       highRiskOverride: true,
       overrideReason: 'Provider read staging proof requires explicit controlled override.',
+      overrideDocumentation: {
+        lowComprehensionRemediation:
+          'I re-read the statement, asked staff to explain the impact, and confirmed which records will be shared.',
+        languageSupport: {
+          method: 'professional_interpreter',
+          details: 'Interpreter helped explain the consent and patient repeated back key points.',
+        },
+        guardian: {
+          fullName: 'Test Guardian',
+          relationship: 'Parent/guardian',
+          phoneNumber: '0912345678',
+          confirmed: true,
+        },
+      },
       metadata: { runId, stage: 'grant' },
     });
 

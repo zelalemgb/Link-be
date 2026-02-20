@@ -33,6 +33,15 @@ const CONSENT_COMPREHENSION_MIN_CHARS = 20;
 // A "safe" comprehension length threshold used to trigger high-risk warnings even if min length is met.
 const CONSENT_COMPREHENSION_SAFE_CHARS = 80;
 const CONSENT_OVERRIDE_REASON_MIN_CHARS = 10;
+const CONSENT_OVERRIDE_DETAILS_MIN_CHARS = 10;
+
+// CONSENT-R1: Explicitly allowlist consent scopes to prevent scope escalation.
+// Start with the scope enforced on provider PHI read routes.
+const ALLOWED_CONSENT_TYPES = ['records_access'] as const;
+type AllowedConsentType = (typeof ALLOWED_CONSENT_TYPES)[number];
+
+const isAllowedConsentType = (value: string): value is AllowedConsentType =>
+  (ALLOWED_CONSENT_TYPES as readonly string[]).includes(value);
 
 const languageTagSchema = z
   .string()
@@ -41,6 +50,47 @@ const languageTagSchema = z
   .max(32)
   // BCP-47-ish (kept permissive for now): "en", "en-US", "pt-BR", "zh-Hant"
   .regex(/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/, 'Invalid language tag');
+
+const languageSupportMethodSchema = z.enum([
+  'self_bilingual',
+  'professional_interpreter',
+  // Keep backward-compatible aliases (UI uses "family_friend"; early drafts used "family_or_friend").
+  'family_friend',
+  'family_or_friend',
+  'facility_staff',
+  'other',
+]);
+
+const consentOverrideDocumentationSchema = z
+  .object({
+    lowComprehensionRemediation: z
+      .string()
+      .trim()
+      .min(CONSENT_OVERRIDE_DETAILS_MIN_CHARS)
+      .max(2000)
+      .optional()
+      .nullable(),
+    languageSupport: z
+      .object({
+        method: languageSupportMethodSchema,
+        details: z.string().trim().min(CONSENT_OVERRIDE_DETAILS_MIN_CHARS).max(2000),
+      })
+      .strict()
+      .optional()
+      .nullable(),
+    guardian: z
+      .object({
+        fullName: z.string().trim().min(2).max(200),
+        relationship: z.string().trim().min(2).max(200),
+        // Require a reachable guardian contact when guardian override applies (Ethiopia: allow local or E.164 formats).
+        phoneNumber: z.string().trim().min(7).max(32).optional().nullable(),
+        confirmed: z.literal(true),
+      })
+      .strict()
+      .optional()
+      .nullable(),
+  })
+  .strict();
 
 const consentGrantSchema = z
   .object({
@@ -67,6 +117,9 @@ const consentGrantSchema = z
     purpose: z.string().trim().max(500).optional().nullable(),
     highRiskOverride: z.boolean().optional().default(false),
     overrideReason: z.string().trim().max(500).optional().nullable(),
+    // Structured documentation that must be provided when high-risk warnings are triggered.
+    overrideDocumentation: consentOverrideDocumentationSchema.optional().nullable(),
+    // Non-safety-critical client metadata (e.g., provider target selection for UX).
     metadata: z.record(z.any()).optional().nullable(),
   })
   .strict()
@@ -140,6 +193,72 @@ const contractError = (
 
 const normalizeRole = (role?: string | null) => (role || '').trim().toLowerCase();
 const normalizeConsentType = (value: string) => value.trim().toLowerCase();
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+// Backward-compatible bridge: older clients may send structured override docs inside metadata.structuredOverride.
+// Prefer the explicit overrideDocumentation contract when provided.
+const extractOverrideDocumentationFromClientMetadata = (
+  metadata: Record<string, unknown> | null
+): z.infer<typeof consentOverrideDocumentationSchema> | null => {
+  const structuredOverride = metadata && isRecord(metadata) ? metadata.structuredOverride : null;
+  if (!isRecord(structuredOverride)) return null;
+
+  const output: Record<string, unknown> = {};
+
+  const low = structuredOverride.lowComprehension;
+  if (isRecord(low) && typeof low.remediationNote === 'string') {
+    output.lowComprehensionRemediation = low.remediationNote;
+  }
+
+  const languageMismatch = structuredOverride.languageMismatch;
+  if (isRecord(languageMismatch)) {
+    const rawMethod = typeof languageMismatch.supportMethod === 'string' ? languageMismatch.supportMethod.trim() : '';
+    const method = rawMethod;
+    const details = typeof languageMismatch.supportDetails === 'string' ? languageMismatch.supportDetails : '';
+    if (method || details) {
+      output.languageSupport = { method, details };
+    }
+  }
+
+  const minor = structuredOverride.minor;
+  if (isRecord(minor)) {
+    const fullName = typeof minor.guardianName === 'string' ? minor.guardianName : '';
+    const relationship = typeof minor.guardianRelationship === 'string' ? minor.guardianRelationship : '';
+    const phoneNumber =
+      minor.guardianPhone === null
+        ? null
+        : typeof minor.guardianPhone === 'string'
+          ? minor.guardianPhone
+          : null;
+    const confirmed = minor.guardianConfirmed === true;
+    if (fullName || relationship || phoneNumber || confirmed) {
+      output.guardian = {
+        fullName,
+        relationship,
+        phoneNumber,
+        confirmed: confirmed ? true : false,
+      };
+    }
+  }
+
+  const parsed = consentOverrideDocumentationSchema.safeParse(output);
+  return parsed.success ? parsed.data : null;
+};
+
+const ensureAllowedConsentType = (
+  value: string
+): { ok: true; data: { consentType: AllowedConsentType } } | ConsentFailure => {
+  if (!isAllowedConsentType(value)) {
+    return contractError(
+      400,
+      'VALIDATION_UNSUPPORTED_CONSENT_TYPE',
+      `Unsupported consentType: ${value}. Supported consentType: ${ALLOWED_CONSENT_TYPES.join(', ')}`
+    );
+  }
+  return { ok: true, data: { consentType: value } };
+};
 
 const computeAgeYears = (dateOfBirth?: string | null) => {
   if (!dateOfBirth) return null;
@@ -265,12 +384,22 @@ export const grantPatientPortalConsent = async ({
       );
     }
 
-    const consentType = normalizeConsentType(parsed.data.consentType);
+    const consentTypeNormalized = normalizeConsentType(parsed.data.consentType);
+    const consentTypeResult = ensureAllowedConsentType(consentTypeNormalized);
+    if (consentTypeResult.ok === false) return consentTypeResult;
+    const consentType = consentTypeResult.data.consentType;
     const facilityScope = await ensureFacilityInTenant({
       facilityId: parsed.data.facilityId,
       tenantId: scopedActor.tenantId,
     });
     if (facilityScope.ok === false) return facilityScope;
+
+    const clientMetadata = (parsed.data.metadata as Record<string, unknown> | undefined) || null;
+    const legacyOverrideDocumentation = extractOverrideDocumentationFromClientMetadata(clientMetadata);
+    const overrideDocumentation =
+      parsed.data.overrideDocumentation === undefined || parsed.data.overrideDocumentation === null
+        ? legacyOverrideDocumentation
+        : parsed.data.overrideDocumentation;
 
     const { data: existingConsent, error: lookupError } = await supabaseAdmin
       .from('patient_portal_consents')
@@ -285,7 +414,13 @@ export const grantPatientPortalConsent = async ({
     }
 
     const now = new Date().toISOString();
-    const metadata = (parsed.data.metadata as Record<string, unknown> | undefined) || null;
+    const consentRowMetadata = (() => {
+      const output: Record<string, unknown> = { ...(clientMetadata || {}) };
+      if (overrideDocumentation) {
+        output.overrideDocumentation = overrideDocumentation;
+      }
+      return Object.keys(output).length > 0 ? output : null;
+    })();
     const purpose = parsed.data.purpose || null;
     const comprehensionText = parsed.data.comprehensionText;
     const comprehensionLanguage = parsed.data.comprehensionLanguage;
@@ -325,6 +460,78 @@ export const grantPatientPortalConsent = async ({
       );
     }
 
+    const missingOverrideFields: string[] = [];
+    if (highRiskWarnings.includes('low_comprehension_length')) {
+      const remediation = (overrideDocumentation?.lowComprehensionRemediation || '').trim();
+      if (remediation.length < CONSENT_OVERRIDE_DETAILS_MIN_CHARS) {
+        missingOverrideFields.push('overrideDocumentation.lowComprehensionRemediation');
+      }
+    }
+    if (highRiskWarnings.includes('language_mismatch')) {
+      const method = overrideDocumentation?.languageSupport?.method;
+      const details = (overrideDocumentation?.languageSupport?.details || '').trim();
+      if (!method) missingOverrideFields.push('overrideDocumentation.languageSupport.method');
+      if (details.length < CONSENT_OVERRIDE_DETAILS_MIN_CHARS) {
+        missingOverrideFields.push('overrideDocumentation.languageSupport.details');
+      }
+    }
+    if (highRiskWarnings.includes('patient_is_minor')) {
+      const guardian = overrideDocumentation?.guardian;
+      const fullName = (guardian?.fullName || '').trim();
+      const relationship = (guardian?.relationship || '').trim();
+      const phoneNumber = (guardian?.phoneNumber || '').trim();
+      const confirmed = guardian?.confirmed === true;
+      if (fullName.length < 2) missingOverrideFields.push('overrideDocumentation.guardian.fullName');
+      if (relationship.length < 2) missingOverrideFields.push('overrideDocumentation.guardian.relationship');
+      if (phoneNumber.length < 7) missingOverrideFields.push('overrideDocumentation.guardian.phoneNumber');
+      if (!confirmed) missingOverrideFields.push('overrideDocumentation.guardian.confirmed');
+    }
+
+    if (missingOverrideFields.length > 0) {
+      return contractError(
+        400,
+        'VALIDATION_OVERRIDE_DOCUMENTATION_REQUIRED',
+        `Override documentation is required. Missing: ${missingOverrideFields.join(
+          ', '
+        )}. high-risk warnings are present: ${highRiskWarnings.join(', ')}`
+      );
+    }
+
+    const overrideEvidenceMetadata = (() => {
+      if (!overrideDocumentation) return {};
+
+      const output: Record<string, unknown> = {};
+
+      if (highRiskWarnings.includes('low_comprehension_length')) {
+        const remediation = (overrideDocumentation.lowComprehensionRemediation || '').trim();
+        if (remediation) {
+          output.lowComprehensionRemediation = remediation;
+        }
+      }
+
+      if (highRiskWarnings.includes('language_mismatch')) {
+        const method = (overrideDocumentation.languageSupport?.method || '').toString().trim();
+        const details = (overrideDocumentation.languageSupport?.details || '').trim();
+        if (method || details) {
+          // DB enforcement accepts either interpreter identity OR language-support notes.
+          // Today we persist method+details as notes, keeping the contract stable while still being queryable.
+          output.interpreterUsed = false;
+          output.languageSupportNotes = `${method}: ${details}`.trim();
+        }
+      }
+
+      if (highRiskWarnings.includes('patient_is_minor')) {
+        const fullName = (overrideDocumentation.guardian?.fullName || '').trim();
+        const relationship = (overrideDocumentation.guardian?.relationship || '').trim();
+        const phoneNumber = (overrideDocumentation.guardian?.phoneNumber || '').trim();
+        if (fullName) output.guardianName = fullName;
+        if (relationship) output.guardianRelationship = relationship;
+        if (phoneNumber) output.guardianPhone = phoneNumber;
+      }
+
+      return output;
+    })();
+
     let consentId = existingConsent?.id as string | undefined;
     let created = false;
     if (consentId) {
@@ -335,7 +542,7 @@ export const grantPatientPortalConsent = async ({
           granted_at: now,
           revoked_at: null,
           revoked_reason: null,
-          metadata,
+          metadata: consentRowMetadata,
           purpose,
           updated_at: now,
         })
@@ -362,7 +569,7 @@ export const grantPatientPortalConsent = async ({
           is_active: true,
           granted_at: now,
           purpose,
-          metadata,
+          metadata: consentRowMetadata,
         })
         .select('id')
         .single();
@@ -390,7 +597,12 @@ export const grantPatientPortalConsent = async ({
         ...(highRiskWarnings.length > 0 ? { highRiskWarnings } : {}),
         highRiskOverride,
         overrideReason,
-        ...(metadata ? { clientMetadata: metadata } : {}),
+        ...overrideEvidenceMetadata,
+        ...(overrideDocumentation ? { overrideDocumentation } : {}),
+        ...(clientMetadata && isRecord(clientMetadata.providerTarget)
+          ? { providerTarget: clientMetadata.providerTarget }
+          : {}),
+        ...(clientMetadata ? { clientMetadata } : {}),
       },
     });
 
@@ -420,6 +632,10 @@ export const grantPatientPortalConsent = async ({
         highRiskWarnings,
         highRiskOverride,
         overrideReason,
+        ...(overrideDocumentation ? { overrideDocumentation } : {}),
+        ...(clientMetadata && isRecord(clientMetadata.providerTarget)
+          ? { providerTarget: clientMetadata.providerTarget }
+          : {}),
         created,
       },
     }, {
@@ -471,7 +687,10 @@ export const revokePatientPortalConsent = async ({
       );
     }
 
-    const consentType = normalizeConsentType(parsed.data.consentType);
+    const consentTypeNormalized = normalizeConsentType(parsed.data.consentType);
+    const consentTypeResult = ensureAllowedConsentType(consentTypeNormalized);
+    if (consentTypeResult.ok === false) return consentTypeResult;
+    const consentType = consentTypeResult.data.consentType;
     const facilityScope = await ensureFacilityInTenant({
       facilityId: parsed.data.facilityId,
       tenantId: scopedActor.tenantId,
@@ -526,7 +745,8 @@ export const revokePatientPortalConsent = async ({
       reason,
       metadata: {
         acknowledged: true,
-        ...(metadata ? { metadata } : {}),
+        ...(metadata && isRecord(metadata.providerTarget) ? { providerTarget: metadata.providerTarget } : {}),
+        ...(metadata ? { clientMetadata: metadata } : {}),
       },
     });
 
@@ -610,6 +830,14 @@ export const listPatientPortalConsentHistory = async ({
       );
     }
 
+    const consentTypeFilter = parsed.data.consentType
+      ? normalizeConsentType(parsed.data.consentType)
+      : null;
+    if (consentTypeFilter) {
+      const allowed = ensureAllowedConsentType(consentTypeFilter);
+      if (allowed.ok === false) return allowed;
+    }
+
     if (parsed.data.facilityId) {
       const facilityScope = await ensureFacilityInTenant({
         facilityId: parsed.data.facilityId,
@@ -627,8 +855,8 @@ export const listPatientPortalConsentHistory = async ({
     if (parsed.data.facilityId) {
       historyQuery = historyQuery.eq('facility_id', parsed.data.facilityId);
     }
-    if (parsed.data.consentType) {
-      historyQuery = historyQuery.eq('consent_type', normalizeConsentType(parsed.data.consentType));
+    if (consentTypeFilter) {
+      historyQuery = historyQuery.eq('consent_type', consentTypeFilter);
     }
 
     const { data, error } = await historyQuery
@@ -652,9 +880,7 @@ export const listPatientPortalConsentHistory = async ({
       sensitivityLevel: 'phi',
       requestId: scopedActor.requestId || null,
       metadata: {
-        consentType: parsed.data.consentType
-          ? normalizeConsentType(parsed.data.consentType)
-          : null,
+        consentType: consentTypeFilter,
         resultCount: (data || []).length,
       },
     }, {
@@ -709,13 +935,15 @@ export const assertPatientPortalConsentActive = async ({
     if (facilityScope.ok === false) return facilityScope;
 
     const normalizedConsentType = normalizeConsentType(consentType);
+    const consentTypeResult = ensureAllowedConsentType(normalizedConsentType);
+    if (consentTypeResult.ok === false) return consentTypeResult;
     const { data: consent, error } = await supabaseAdmin
       .from('patient_portal_consents')
       .select('id, is_active')
       .eq('patient_account_id', scopedActor.patientAccountId)
       .eq('tenant_id', scopedActor.tenantId)
       .eq('facility_id', facilityId)
-      .eq('consent_type', normalizedConsentType)
+      .eq('consent_type', consentTypeResult.data.consentType)
       .maybeSingle();
     if (error) {
       throw new Error(error.message);
@@ -760,13 +988,15 @@ export const assertPatientPortalConsentActiveForProviderRead = async ({
     if (facilityScope.ok === false) return facilityScope;
 
     const normalizedConsentType = normalizeConsentType(consentType);
+    const consentTypeResult = ensureAllowedConsentType(normalizedConsentType);
+    if (consentTypeResult.ok === false) return consentTypeResult;
     const { data: consent, error } = await supabaseAdmin
       .from('patient_portal_consents')
       .select('id, is_active')
       .eq('patient_account_id', patientAccountId)
       .eq('tenant_id', tenantId)
       .eq('facility_id', facilityId)
-      .eq('consent_type', normalizedConsentType)
+      .eq('consent_type', consentTypeResult.data.consentType)
       .maybeSingle();
     if (error) {
       throw new Error(error.message);

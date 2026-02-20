@@ -162,6 +162,68 @@ test('patient portal consent grant succeeds and validation failures return stabl
   }
 });
 
+test('patient portal consent enforces consentType allowlist for grant/revoke/history', { concurrency: false }, async () => {
+  const { consentService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+  let fromCalls = 0;
+
+  try {
+    (supabaseAdmin as any).from = () => {
+      fromCalls += 1;
+      throw new Error('DB should not be touched for allowlist validation');
+    };
+
+    const grant = await consentService.grantPatientPortalConsent({
+      actor: { patientAccountId: 'patient-1', tenantId: 'tenant-1', role: 'patient' },
+      payload: {
+        facilityId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        consentType: 'root_access',
+        comprehensionText:
+          'I understand that by granting consent, this facility and its care team may view my health records to provide care.',
+        comprehensionLanguage: 'en',
+        comprehensionRecordedAt: new Date().toISOString(),
+        comprehensionConfirmed: true,
+      },
+    });
+    assert.equal(grant.ok, false);
+    if (!grant.ok) {
+      assert.equal(grant.status, 400);
+      assert.equal(grant.code, 'VALIDATION_UNSUPPORTED_CONSENT_TYPE');
+    }
+
+    const revoke = await consentService.revokePatientPortalConsent({
+      actor: { patientAccountId: 'patient-1', tenantId: 'tenant-1', role: 'patient' },
+      payload: {
+        facilityId: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+        consentType: 'root_access',
+        acknowledged: true,
+        reason: 'Stop',
+      },
+    });
+    assert.equal(revoke.ok, false);
+    if (!revoke.ok) {
+      assert.equal(revoke.status, 400);
+      assert.equal(revoke.code, 'VALIDATION_UNSUPPORTED_CONSENT_TYPE');
+    }
+
+    const history = await consentService.listPatientPortalConsentHistory({
+      actor: { patientAccountId: 'patient-1', tenantId: 'tenant-1', role: 'patient' },
+      query: {
+        consentType: 'root_access',
+      },
+    });
+    assert.equal(history.ok, false);
+    if (!history.ok) {
+      assert.equal(history.status, 400);
+      assert.equal(history.code, 'VALIDATION_UNSUPPORTED_CONSENT_TYPE');
+    }
+
+    assert.equal(fromCalls, 0);
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
 test('patient portal consent grant requires comprehension fields and enforces high-risk override reason', { concurrency: false }, async () => {
   const { consentService, supabaseAdmin } = await loadModules();
   const originalFrom = (supabaseAdmin as any).from;
@@ -220,6 +282,241 @@ test('patient portal consent grant requires comprehension fields and enforces hi
       assert.equal(mismatchWithoutOverride.status, 400);
       assert.equal(mismatchWithoutOverride.code, 'VALIDATION_INVALID_CONSENT_PAYLOAD');
     }
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('QA-P0-CONSENT-010 grant rejects missing warning-specific override documentation', { concurrency: false }, async () => {
+  const { consentService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  const facilityId = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+
+  try {
+    (supabaseAdmin as any).from = createFromStub({
+      facilities: {
+        maybeSingle: () => ({ data: { id: facilityId, tenant_id: 'tenant-1' }, error: null }),
+      },
+      patient_portal_consents: {
+        maybeSingle: () => ({ data: null, error: null }),
+        single: () => {
+          assert.fail('Consent insert should not occur when override docs are missing');
+        },
+      },
+      patient_portal_consent_history: {
+        execute: () => {
+          assert.fail('History insert should not occur when override docs are missing');
+        },
+      },
+    });
+
+    const result = await consentService.grantPatientPortalConsent({
+      actor: { patientAccountId: 'patient-1', tenantId: 'tenant-1', role: 'patient' },
+      payload: {
+        facilityId,
+        consentType: 'records_access',
+        comprehensionText: 'I understand this shares my records for care.', // < 80 chars triggers warning
+        comprehensionLanguage: 'en',
+        comprehensionRecordedAt: new Date().toISOString(),
+        comprehensionConfirmed: true,
+        highRiskOverride: true,
+        overrideReason: 'I reviewed the warning and still want to proceed.',
+      },
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.status, 400);
+      assert.equal(result.code, 'VALIDATION_OVERRIDE_DOCUMENTATION_REQUIRED');
+    }
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('QA-P0-CONSENT-011 low-comprehension override docs are persisted in queryable history metadata keys', { concurrency: false }, async () => {
+  const { consentService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  const facilityId = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
+  const historyWrites: any[] = [];
+  let storedConsentId: string | null = null;
+
+  try {
+    (supabaseAdmin as any).from = createFromStub({
+      facilities: {
+        maybeSingle: () => ({ data: { id: facilityId, tenant_id: 'tenant-1' }, error: null }),
+      },
+      patient_accounts: {
+        maybeSingle: () => ({ data: { id: 'patient-1', tenant_id: 'tenant-1', date_of_birth: '1990-01-01' }, error: null }),
+      },
+      patient_portal_consents: {
+        maybeSingle: () => ({ data: null, error: null }),
+        single: (state) => {
+          assert.equal(state.operation, 'insert');
+          storedConsentId = 'consent-override-1';
+          assert.equal(state.payload.consent_type, 'records_access');
+          assert.ok(state.payload.metadata?.overrideDocumentation);
+          return { data: { id: storedConsentId }, error: null };
+        },
+      },
+      patient_portal_consent_history: {
+        execute: (state) => {
+          assert.equal(state.operation, 'insert');
+          historyWrites.push(state.payload);
+          return { data: [state.payload], error: null };
+        },
+      },
+    });
+
+    const result = await consentService.grantPatientPortalConsent({
+      actor: { patientAccountId: 'patient-1', tenantId: 'tenant-1', role: 'patient' },
+      payload: {
+        facilityId,
+        consentType: 'records_access',
+        comprehensionText: 'I understand this shares my records for care.', // < 80 chars triggers warning
+        comprehensionLanguage: 'en',
+        comprehensionRecordedAt: new Date().toISOString(),
+        comprehensionConfirmed: true,
+        highRiskOverride: true,
+        overrideReason: 'I reviewed the warning and still want to proceed.',
+        overrideDocumentation: {
+          lowComprehensionRemediation: 'I re-read it and asked a caregiver to explain the impact.',
+        },
+      },
+    });
+
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.data.consent.id, storedConsentId);
+    }
+    assert.equal(historyWrites.length, 1);
+    assert.ok(historyWrites[0].metadata?.overrideDocumentation);
+    assert.equal(
+      historyWrites[0].metadata?.lowComprehensionRemediation,
+      'I re-read it and asked a caregiver to explain the impact.'
+    );
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('QA-P0-CONSENT-012 language mismatch override docs are persisted in queryable history metadata keys', { concurrency: false }, async () => {
+  const { consentService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  const facilityId = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+  const historyWrites: any[] = [];
+
+  try {
+    (supabaseAdmin as any).from = createFromStub({
+      facilities: {
+        maybeSingle: () => ({ data: { id: facilityId, tenant_id: 'tenant-1' }, error: null }),
+      },
+      patient_accounts: {
+        maybeSingle: () => ({ data: { id: 'patient-1', tenant_id: 'tenant-1', date_of_birth: '1990-01-01' }, error: null }),
+      },
+      patient_portal_consents: {
+        maybeSingle: () => ({ data: null, error: null }),
+        single: () => ({ data: { id: 'consent-lang-1' }, error: null }),
+      },
+      patient_portal_consent_history: {
+        execute: (state) => {
+          historyWrites.push(state.payload);
+          return { data: [state.payload], error: null };
+        },
+      },
+    });
+
+    const result = await consentService.grantPatientPortalConsent({
+      actor: { patientAccountId: 'patient-1', tenantId: 'tenant-1', role: 'patient' },
+      payload: {
+        facilityId,
+        consentType: 'records_access',
+        comprehensionText: 'I understand this shares my records and I can revoke anytime. ' + 'A'.repeat(100),
+        comprehensionLanguage: 'am',
+        uiLanguage: 'en',
+        comprehensionRecordedAt: new Date().toISOString(),
+        comprehensionConfirmed: true,
+        highRiskOverride: true,
+        overrideReason: 'Language mismatch documented.',
+        overrideDocumentation: {
+          languageSupport: {
+            method: 'family_friend',
+            details: 'Family member translated; patient repeated key points back in Amharic.',
+          },
+        },
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(historyWrites.length, 1);
+    assert.equal(historyWrites[0].metadata?.interpreterUsed, false);
+    assert.match(
+      String(historyWrites[0].metadata?.languageSupportNotes || ''),
+      /family_friend: Family member translated/
+    );
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('QA-P0-CONSENT-013 minor guardian override docs are persisted in queryable history metadata keys', { concurrency: false }, async () => {
+  const { consentService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  const facilityId = '12121212-1212-1212-1212-121212121212';
+  const historyWrites: any[] = [];
+
+  try {
+    (supabaseAdmin as any).from = createFromStub({
+      facilities: {
+        maybeSingle: () => ({ data: { id: facilityId, tenant_id: 'tenant-1' }, error: null }),
+      },
+      patient_accounts: {
+        maybeSingle: () => ({ data: { id: 'patient-1', tenant_id: 'tenant-1', date_of_birth: '2010-01-01' }, error: null }),
+      },
+      patient_portal_consents: {
+        maybeSingle: () => ({ data: null, error: null }),
+        single: () => ({ data: { id: 'consent-minor-1' }, error: null }),
+      },
+      patient_portal_consent_history: {
+        execute: (state) => {
+          historyWrites.push(state.payload);
+          return { data: [state.payload], error: null };
+        },
+      },
+    });
+
+    const result = await consentService.grantPatientPortalConsent({
+      actor: { patientAccountId: 'patient-1', tenantId: 'tenant-1', role: 'patient' },
+      payload: {
+        facilityId,
+        consentType: 'records_access',
+        comprehensionText: 'I understand this shares my records and I can revoke anytime. ' + 'B'.repeat(100),
+        comprehensionLanguage: 'en',
+        uiLanguage: 'en',
+        comprehensionRecordedAt: new Date().toISOString(),
+        comprehensionConfirmed: true,
+        highRiskOverride: true,
+        overrideReason: 'Guardian confirmed.',
+        overrideDocumentation: {
+          guardian: {
+            fullName: 'Parent One',
+            relationship: 'Parent',
+            phoneNumber: '0912345678',
+            confirmed: true,
+          },
+        },
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(historyWrites.length, 1);
+    assert.equal(historyWrites[0].metadata?.guardianName, 'Parent One');
+    assert.equal(historyWrites[0].metadata?.guardianRelationship, 'Parent');
+    assert.equal(historyWrites[0].metadata?.guardianPhone, '0912345678');
   } finally {
     (supabaseAdmin as any).from = originalFrom;
   }

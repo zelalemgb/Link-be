@@ -9,6 +9,15 @@ const RESEND_API_KEY = Deno.env.get('RESEND_API_KEY');
 const supabaseAdmin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
+const normalizeFrontendOrigin = (value: string) => value.replace(/#.*$/, '').replace(/\/+$/, '');
+
+const buildClinicOnboardingUrl = (facilityId: string, adminEmail: string) => {
+  // The web app uses HashRouter in production (/#/...), so keep hash routes to avoid
+  // depending on server-side rewrites for deep links.
+  const origin = normalizeFrontendOrigin(FRONTEND_URL);
+  return `${origin}/#/auth/clinic-onboarding?facility=${facilityId}&email=${encodeURIComponent(adminEmail)}`;
+};
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -171,7 +180,7 @@ Deno.serve(async (req) => {
 
     console.log(`Sending ${activationStatus} approval email to ${adminEmail} for clinic ${clinicName}`);
 
-    const onboardingUrl = `${FRONTEND_URL}/auth/clinic-onboarding?facility=${facilityId}&email=${encodeURIComponent(adminEmail)}`;
+    const onboardingUrl = buildClinicOnboardingUrl(facilityId, adminEmail);
 
     const emailResponse = await resend.emails.send({
       from: 'Link Health <noreply@admin.linkhc.org>',

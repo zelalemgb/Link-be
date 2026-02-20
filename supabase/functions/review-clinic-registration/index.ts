@@ -10,6 +10,15 @@ const RESEND_API_KEY = Deno.env.get('RESEND_API_KEY');
 const supabaseAdmin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
+const normalizeFrontendOrigin = (value: string) => value.replace(/#.*$/, '').replace(/\/+$/, '');
+
+const buildClinicOnboardingUrl = (facilityId: string, adminEmail: string) => {
+  // The web app uses HashRouter in production (/#/...), so keep hash routes to avoid
+  // depending on server-side rewrites for deep links.
+  const origin = normalizeFrontendOrigin(FRONTEND_URL);
+  return `${origin}/#/auth/clinic-onboarding?facility=${facilityId}&email=${encodeURIComponent(adminEmail)}`;
+};
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -23,6 +32,12 @@ const jsonResponse = (body: unknown, init: ResponseInit = {}) =>
     },
     ...init,
   });
+
+// NOTE: The frontend's Supabase invoke wrapper surfaces very little detail on non-2xx responses.
+// For this internal admin workflow, we return 200 with { success:false, error } so UI can
+// display actionable messages instead of a generic "non-2xx" toast.
+const ok = (body: unknown) => jsonResponse(body, { status: 200 });
+const fail = (message: string) => ok({ success: false, error: message });
 
 type AuthUser = {
   id?: string;
@@ -69,7 +84,7 @@ const sendApprovalEmail = async (
   }
 
   try {
-    const onboardingUrl = `${FRONTEND_URL}/auth/clinic-onboarding?facility=${facilityId}&email=${encodeURIComponent(adminEmail)}`;
+    const onboardingUrl = buildClinicOnboardingUrl(facilityId, adminEmail);
     
     const isFullActivation = activationStatus === 'active';
     const emailSubject = isFullActivation 
@@ -298,7 +313,7 @@ Deno.serve(async (req) => {
   }
 
   if (req.method !== 'POST') {
-    return jsonResponse({ error: 'Method not allowed' }, { status: 405 });
+    return fail('Method not allowed');
   }
 
   const authClient = getAuthClient(req);
@@ -306,7 +321,7 @@ Deno.serve(async (req) => {
 
   if (!authResult?.user) {
     console.log('Unauthorized: No user found');
-    return jsonResponse({ error: 'Unauthorized' }, { status: 401 });
+    return fail('Unauthorized');
   }
 
   // Use limit(1) to handle multi-facility users who have multiple user records
@@ -318,7 +333,7 @@ Deno.serve(async (req) => {
 
   if (reviewerError) {
     console.error('Error fetching reviewer profile:', reviewerError);
-    return jsonResponse({ error: reviewerError.message }, { status: 500 });
+    return fail(reviewerError.message);
   }
 
   const reviewerProfile = reviewerProfiles?.[0];
@@ -363,7 +378,7 @@ Deno.serve(async (req) => {
 
   if (!isSuperAdmin) {
     console.log('Forbidden: User is not super_admin (checked users table, RBAC, and auth metadata)');
-    return jsonResponse({ error: 'Forbidden' }, { status: 403 });
+    return fail('Forbidden');
   }
   
   console.log('Super admin verified:', { reviewer_user_id: reviewerUserId, auth_user_id: authResult.user.id });
@@ -374,13 +389,13 @@ Deno.serve(async (req) => {
     payload = await req.json();
     console.log('Received payload:', JSON.stringify(payload));
   } catch {
-    return jsonResponse({ error: 'Invalid JSON payload' }, { status: 400 });
+    return fail('Invalid JSON payload');
   }
 
   const { registrationId, action, rejectionReason, activationType = 'testing' } = payload;
 
   if (!registrationId || !action) {
-    return jsonResponse({ error: 'registrationId and action are required' }, { status: 400 });
+    return fail('registrationId and action are required');
   }
 
   console.log(`Processing ${action} for registration ${registrationId} with activationType: ${activationType}`);
@@ -408,15 +423,15 @@ Deno.serve(async (req) => {
 
     if (facilityError) {
       console.error('Error fetching facility:', facilityError);
-      return jsonResponse({ error: facilityError.message }, { status: 500 });
+      return fail(facilityError.message);
     }
 
     if (!facility) {
-      return jsonResponse({ error: 'Registration not found in either table' }, { status: 404 });
+      return fail('Registration not found in either table');
     }
 
     if (facility.verification_status !== 'pending') {
-      return jsonResponse({ error: 'Facility already reviewed' }, { status: 400 });
+      return fail('Facility already reviewed');
     }
 
     // Parse admin info from notes
@@ -444,11 +459,11 @@ Deno.serve(async (req) => {
         .eq('id', registrationId);
 
       if (updateError) {
-        return jsonResponse({ error: updateError.message }, { status: 500 });
+        return fail(updateError.message);
       }
 
       console.log(`Facility ${registrationId} rejected successfully`);
-      return jsonResponse({ success: true });
+      return ok({ success: true });
     }
 
     // Approve facility from facilities table
@@ -456,7 +471,7 @@ Deno.serve(async (req) => {
       const resolvedAdmin = await resolveAdminContact(facility.id, adminInfo);
       if (!resolvedAdmin?.adminEmail) {
         console.error('Admin email not found for facility:', registrationId);
-        return jsonResponse({ error: 'Admin email not found for facility' }, { status: 400 });
+        return fail('Admin email not found for facility');
       }
 
       // Update facility to approved with activation status
@@ -496,16 +511,13 @@ Deno.serve(async (req) => {
       });
     } catch (error) {
       console.error('Facility approval error:', error);
-      return jsonResponse(
-        { error: error instanceof Error ? error.message : 'Failed to approve facility' },
-        { status: 500 }
-      );
+      return fail(error instanceof Error ? error.message : 'Failed to approve facility');
     }
   }
 
   // Handle clinic_registrations table (legacy flow)
   if (registration.status !== 'pending') {
-    return jsonResponse({ error: 'Registration already reviewed' }, { status: 400 });
+    return fail('Registration already reviewed');
   }
 
   if (action === 'reject') {
@@ -520,130 +532,117 @@ Deno.serve(async (req) => {
       .eq('id', registrationId);
 
     if (updateError) {
-      return jsonResponse({ error: updateError.message }, { status: 500 });
+      return fail(updateError.message);
     }
 
     console.log(`Registration ${registrationId} rejected successfully`);
-    return jsonResponse({ success: true });
+    return ok({ success: true });
   }
 
   // Approve flow for clinic_registrations
   try {
-    console.log(`Creating auth user for ${registration.admin_email}`);
-    
-    let authUserId: string | null = null;
-    const normalizedAdminPhone =
-      registration.admin_phone?.toString().replace(/\s+/g, '') ||
-      registration.phone_number?.toString().replace(/\s+/g, '') ||
-      null;
+    console.log(`Approving legacy clinic registration ${registrationId} (${registration.clinic_name})`);
 
-    if (!normalizedAdminPhone) {
-      return jsonResponse(
-        { error: 'Admin phone is required to create the administrator account' },
-        { status: 400 }
-      );
-    }
-    
-    const { data: existingPhoneUser, error: existingPhoneError } = await supabaseAdmin
-      .from('users')
-      .select('id')
-      .eq('phone_number', normalizedAdminPhone)
-      .maybeSingle();
+    const nowIso = new Date().toISOString();
+    const normalizedClinicName = (registration.clinic_name ?? '').trim();
+    const normalizedClinicEmail = registration.email ? registration.email.trim().toLowerCase() : null;
+    const normalizedClinicPhone = registration.phone_number
+      ? registration.phone_number.toString().replace(/\s+/g, '')
+      : null;
+    const normalizedAdminEmail = registration.admin_email.trim().toLowerCase();
+    const normalizedAdminName = registration.admin_name.trim();
+    const normalizedAdminPhone = registration.admin_phone
+      ? registration.admin_phone.toString().replace(/\s+/g, '')
+      : null;
 
-    if (existingPhoneError) {
-      console.error('Failed to check admin phone uniqueness:', existingPhoneError);
+    if (!normalizedClinicName) {
+      return fail('Clinic name is required');
     }
 
-    if (existingPhoneUser) {
-      return jsonResponse(
-        { error: 'Admin phone number is already in use. Please use a different phone number.' },
-        { status: 400 }
-      );
-    }
+    let facilityId: string | null = registration.facility_id ?? null;
+    let tenantId: string | null = registration.tenant_id ?? null;
+    let clinicCode: string | null = null;
 
-    const invite = await supabaseAdmin.auth.admin.inviteUserByEmail(registration.admin_email, {
-      redirectTo: `${FRONTEND_URL}/auth?tab=signin`,
-      data: {
-        name: registration.admin_name,
-        full_name: registration.admin_name,
-        user_role: 'admin',
-        role: 'admin',
-        phone: normalizedAdminPhone,
-      },
-    });
-
-    if (invite.error) {
-      const errorMessage = invite.error.message?.toLowerCase?.() || '';
-      if (
-        errorMessage.includes('already registered') ||
-        errorMessage.includes('user exists') ||
-        errorMessage.includes('duplicate')
-      ) {
-        const existingUser = await findAuthUserByEmail(registration.admin_email);
-        authUserId = existingUser?.id ?? null;
-        if (!authUserId) {
-          throw new Error('Administrator account already exists but could not be resolved');
-        }
-      } else {
-        throw new Error(invite.error.message);
-      }
-    } else {
-      authUserId = invite.data.user?.id ?? null;
-    }
-
-    if (!authUserId) {
-      throw new Error('Failed to create administrator account');
-    }
-
-    console.log(`Auth user created: ${authUserId}`);
-
-    // Wait for profile to be created by trigger
-    let adminUserId: string | null = null;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const { data } = await supabaseAdmin
-        .from('users')
+    // Create facility + tenant for legacy registrations on approval.
+    // This avoids depending on Supabase invite emails and keeps onboarding self-service.
+    if (!facilityId || !tenantId) {
+      const { data: tenantInsert, error: tenantErr } = await supabaseAdmin
+        .from('tenants')
+        .insert({ name: normalizedClinicName, is_active: true })
         .select('id')
-        .eq('auth_user_id', authUserId)
+        .single();
+
+      if (tenantErr || !tenantInsert?.id) {
+        throw new Error(tenantErr?.message || 'Failed to create tenant');
+      }
+
+      tenantId = tenantInsert.id as string;
+
+      const { data: codeData, error: codeErr } = await supabaseAdmin.rpc('generate_clinic_code', {
+        clinic_name_input: normalizedClinicName,
+      });
+
+      if (codeErr) {
+        throw new Error(codeErr.message);
+      }
+
+      clinicCode = (codeData as string) || null;
+
+      const { data: facilityInsert, error: facilityErr } = await supabaseAdmin
+        .from('facilities')
+        .insert({
+          tenant_id: tenantId,
+          name: normalizedClinicName,
+          facility_type: 'clinic',
+          location: registration.location?.trim() ?? null,
+          address: registration.address?.trim() ?? null,
+          phone_number: normalizedClinicPhone,
+          email: normalizedClinicEmail,
+          clinic_code: clinicCode,
+          verification_status: 'approved',
+          verified: true,
+          activation_status: activationType,
+          is_tester: activationType === 'testing',
+          notes: JSON.stringify({
+            admin_name: normalizedAdminName,
+            admin_email: normalizedAdminEmail,
+            admin_phone: normalizedAdminPhone,
+          }),
+        })
+        .select('id, clinic_code')
+        .single();
+
+      if (facilityErr || !facilityInsert?.id) {
+        throw new Error(facilityErr?.message || 'Failed to create facility');
+      }
+
+      facilityId = facilityInsert.id as string;
+      clinicCode = (facilityInsert.clinic_code as string | null) ?? clinicCode;
+    } else {
+      // Legacy registration already has facility/tenant; ensure it's approved/active.
+      const { data: facility, error: facilityErr } = await supabaseAdmin
+        .from('facilities')
+        .select('id, clinic_code')
+        .eq('id', facilityId)
         .maybeSingle();
 
-      if (data?.id) {
-        adminUserId = data.id as string;
-        break;
+      if (facilityErr) {
+        throw new Error(facilityErr.message);
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
-    }
+      clinicCode = (facility?.clinic_code as string | null) ?? null;
 
-    console.log(`Calling register_clinic RPC for ${registration.clinic_name}`);
-
-    const { data: registerResult, error: registerError } = await supabaseAdmin.rpc('register_clinic', {
-      p_auth_user_id: authUserId,
-      p_clinic_name: registration.clinic_name,
-      p_location: registration.location,
-      p_address: registration.address,
-      p_phone: registration.phone_number,
-      p_email: registration.email,
-      p_admin_name: registration.admin_name,
-    });
-
-    if (registerError) {
-      throw new Error(registerError.message);
-    }
-
-    const resultItem = Array.isArray(registerResult) ? registerResult[0] : registerResult;
-    console.log('Register clinic result:', resultItem);
-
-    // Update facility activation_status based on activationType
-    if (resultItem?.facility_id) {
-      const { error: activationError } = await supabaseAdmin
+      const { error: approveErr } = await supabaseAdmin
         .from('facilities')
-        .update({ activation_status: activationType })
-        .eq('id', resultItem.facility_id);
+        .update({
+          verification_status: 'approved',
+          verified: true,
+          activation_status: activationType,
+        })
+        .eq('id', facilityId);
 
-      if (activationError) {
-        console.error('Failed to set activation_status:', activationError);
-      } else {
-        console.log(`Facility ${resultItem.facility_id} activation_status set to: ${activationType}`);
+      if (approveErr) {
+        throw new Error(approveErr.message);
       }
     }
 
@@ -652,13 +651,14 @@ Deno.serve(async (req) => {
       .update({
         status: 'approved',
         reviewer_user_id: reviewerUserId,
-        reviewed_at: new Date().toISOString(),
-        admin_invite_sent_at: new Date().toISOString(),
-        admin_auth_user_id: authUserId,
-        admin_user_id: adminUserId,
-        facility_id: resultItem?.facility_id ?? null,
-        tenant_id: resultItem?.tenant_id ?? null,
+        reviewed_at: nowIso,
+        admin_invite_sent_at: nowIso, // "admin contact notified" timestamp (approval email)
+        facility_id: facilityId,
+        tenant_id: tenantId,
         rejection_reason: null,
+        // Admin account is created via the onboarding link (self-service).
+        admin_auth_user_id: null,
+        admin_user_id: null,
       })
       .eq('id', registrationId);
 
@@ -668,28 +668,25 @@ Deno.serve(async (req) => {
 
     // Send approval/onboarding email
     const emailResult = await sendApprovalEmail(
-      registration.admin_email,
-      registration.admin_name,
-      registration.clinic_name,
-      resultItem?.clinic_code ?? null,
-      resultItem?.facility_id ?? registrationId,
+      normalizedAdminEmail,
+      normalizedAdminName,
+      normalizedClinicName,
+      clinicCode,
+      facilityId,
       activationType
     );
 
     console.log('Email result:', emailResult);
 
-    return jsonResponse({
+    return ok({
       success: true,
-      facilityId: resultItem?.facility_id ?? null,
-      clinicCode: resultItem?.clinic_code ?? null,
+      facilityId,
+      clinicCode,
       activationType,
       emailSent: emailResult.success,
     });
   } catch (error) {
     console.error('Approval error:', error);
-    return jsonResponse(
-      { error: error instanceof Error ? error.message : 'Failed to approve registration' },
-      { status: 500 }
-    );
+    return fail(error instanceof Error ? error.message : 'Failed to approve registration');
   }
 });
