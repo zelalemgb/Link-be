@@ -196,11 +196,6 @@ router.post('/verify-otp', otpLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Invalid OTP' });
     }
 
-    await supabaseAdmin
-      .from('patient_auth_otps')
-      .delete()
-      .eq('phone_number', phoneNumber);
-
     const { data: patient, error: patientError } = await supabaseAdmin
       .from('patient_accounts')
       .select('id, tenant_id, phone_number, name, date_of_birth, gender, emergency_contact_name, emergency_contact_phone, profile_photo_url')
@@ -219,9 +214,16 @@ router.post('/verify-otp', otpLimiter, async (req, res) => {
     await markPhoneVerified({ tenantId: tenantIdForVerification, phoneNumber });
 
     if (!patient) {
-      // Preserve existing frontend contract: this drives the "new_account" registration flow.
+      // New patient: leave OTP in DB so /register can independently verify it.
+      // Phone is now marked verified; /register will consume and delete the OTP.
       return res.status(404).json({ error: 'patient_not_found' });
     }
+
+    // Only consume the OTP when establishing a session for an existing patient.
+    await supabaseAdmin
+      .from('patient_auth_otps')
+      .delete()
+      .eq('phone_number', phoneNumber);
 
     try {
       await linkPatientsToAccountByPhone({

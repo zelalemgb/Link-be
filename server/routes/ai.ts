@@ -7,10 +7,26 @@ import { requireUser, requireScopedUser } from '../middleware/auth';
 import { recordAuditEvent } from '../services/audit-log';
 
 const router = express.Router();
+const ALLOWED_IMAGE_MIMETYPES = new Set([
+    'image/jpeg',
+    'image/png',
+    'image/webp',
+    'image/gif',
+    'application/dicom',
+    'image/dicom',
+]);
+
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
         fileSize: Number(process.env.AI_IMAGE_MAX_BYTES || 5_000_000),
+    },
+    fileFilter: (_req, file, cb) => {
+        if (ALLOWED_IMAGE_MIMETYPES.has(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error(`Unsupported file type: ${file.mimetype}`));
+        }
     },
 });
 const medGemmaServiceUrl = process.env.MEDGEMMA_SERVICE_URL || 'http://127.0.0.1:8000/predict';
