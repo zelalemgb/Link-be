@@ -1,10 +1,124 @@
 import { Router } from 'express';
+import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
 import { requireUser, requireScopedUser } from '../middleware/auth';
 import { recordAuditEvent } from '../services/audit-log';
+import {
+  doctorVisitHistorySaveSchema,
+  saveDoctorVisitHistory,
+} from '../services/doctorVisitHistoryService';
 
 const router = Router();
 router.use(requireUser, requireScopedUser);
+
+const visitIdParamSchema = z.string().uuid();
+const sendContractError = (res: any, status: number, code: string, message: string) =>
+  res.status(status).json({ code, message });
+
+const historyValidationOutcomeMap = {
+  HS_001: {
+    code: 'VALIDATION_DH_HS_001_MISSING_CHIEF_COMPLAINT',
+    message: 'Chief complaint is required before you can continue.',
+  },
+  HS_002: {
+    code: 'VALIDATION_DH_HS_002_MISSING_HPI_DURATION',
+    message: 'History duration is required before you can continue.',
+  },
+  HS_003: {
+    code: 'VALIDATION_DH_HS_003_MISSING_ASSOCIATED_SYMPTOM',
+    message: 'At least one associated symptom is required.',
+  },
+  HS_004: {
+    code: 'VALIDATION_DH_HS_004_MISSING_ALLERGY_STATUS',
+    message: "Allergy status is required. Enter known allergies or 'None/NKDA'.",
+  },
+  HS_005: {
+    code: 'VALIDATION_DH_HS_005_MISSING_MEDICATION_HISTORY',
+    message: "Current medication history is required. Enter active medications or 'None'.",
+  },
+} as const;
+
+const mapDoctorHistoryPayloadIssue = (issue: z.ZodIssue) => {
+  const path = issue.path.map((segment) => String(segment)).join('.');
+
+  if (
+    path === 'chiefComplaints' ||
+    path.endsWith('.chiefComplaints') ||
+    path.endsWith('.complaint') ||
+    path === 'chiefComplaints.0'
+  ) {
+    return historyValidationOutcomeMap.HS_001;
+  }
+
+  if (path.endsWith('.hpi.duration') || path === 'chiefComplaints.0.hpi') {
+    return historyValidationOutcomeMap.HS_002;
+  }
+
+  if (path.includes('associatedSymptoms')) {
+    return historyValidationOutcomeMap.HS_003;
+  }
+
+  if (path.endsWith('medicalHistory.allergies')) {
+    return historyValidationOutcomeMap.HS_004;
+  }
+
+  if (path.endsWith('medicalHistory.medications')) {
+    return historyValidationOutcomeMap.HS_005;
+  }
+
+  return null;
+};
+
+router.post('/visits/:id/history', async (req, res) => {
+  const visitIdResult = visitIdParamSchema.safeParse(req.params.id);
+  if (!visitIdResult.success) {
+    return sendContractError(res, 400, 'VALIDATION_INVALID_VISIT_ID', 'Visit id must be a valid UUID');
+  }
+
+  const payloadResult = doctorVisitHistorySaveSchema.safeParse(req.body);
+  if (!payloadResult.success) {
+    const mappedIssue = mapDoctorHistoryPayloadIssue(payloadResult.error.issues[0]);
+    if (mappedIssue) {
+      return sendContractError(res, 400, mappedIssue.code, mappedIssue.message);
+    }
+    return sendContractError(
+      res,
+      400,
+      'VALIDATION_INVALID_DOCTOR_HISTORY_PAYLOAD',
+      payloadResult.error.issues[0]?.message || 'Invalid doctor history payload'
+    );
+  }
+
+  try {
+    const result = await saveDoctorVisitHistory({
+      actor: {
+        authUserId: req.user?.authUserId,
+        profileId: req.user?.profileId,
+        tenantId: req.user?.tenantId,
+        facilityId: req.user?.facilityId,
+        role: req.user?.role,
+        requestId: req.requestId,
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent') || null,
+      },
+      visitId: visitIdResult.data,
+      payload: payloadResult.data,
+    });
+
+    if (result.ok === false) {
+      return sendContractError(res, result.status, result.code, result.message);
+    }
+
+    return res.json(result.data);
+  } catch (error: any) {
+    return sendContractError(
+      res,
+      500,
+      'CONFLICT_DOCTOR_HISTORY_SAVE_FAILED',
+      error?.message || 'Failed to save doctor visit history'
+    );
+  }
+});
 
 const getPatientVisitCounts = async (facilityId: string, patientIds: string[]) => {
   if (patientIds.length === 0) return {};

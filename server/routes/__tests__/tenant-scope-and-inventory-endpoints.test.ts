@@ -5,6 +5,8 @@ import path from 'node:path';
 
 const patientPortalPath = path.resolve(__dirname, '../patient-portal.ts');
 const inventoryPath = path.resolve(__dirname, '../inventory.ts');
+const inventoryControllerPath = path.resolve(__dirname, '../../controllers/inventory.ts');
+const inventoryMutationServicePath = path.resolve(__dirname, '../../services/inventoryMutationService.ts');
 const receivingManagementPath = path.resolve(__dirname, '../../../../src/components/inventory/ReceivingManagement.tsx');
 
 const read = (filePath: string) => fs.readFileSync(filePath, 'utf8');
@@ -62,4 +64,33 @@ test('receiving management frontend writes are routed through backend inventory 
   assert.doesNotMatch(source, /\.from\('receiving_invoice_items'\)\s*\.upsert/);
   assert.doesNotMatch(source, /\.from\('receiving_invoice_items'\)\s*\.delete/);
   assert.doesNotMatch(source, /\.from\('request_for_resupply'\)\s*\.update/);
+});
+
+test('inventory draft and receiving/stock writes enforce strict audit durability', () => {
+  const routeSource = read(inventoryPath);
+  const controllerSource = read(inventoryControllerPath);
+  const serviceSource = read(inventoryMutationServicePath);
+
+  assert.match(routeSource, /const recordInventoryStrictAudit[\s\S]*strict:\s*true/);
+  assert.match(routeSource, /action:\s*'submit_resupply_request'/);
+  assert.match(routeSource, /action:\s*'create_receiving_from_resupply_request'/);
+  assert.match(routeSource, /action:\s*'create_receiving_invoice'/);
+  assert.match(routeSource, /action:\s*'update_receiving_invoice'/);
+  assert.match(routeSource, /action:\s*'create_receiving_invoice_item'/);
+  assert.match(routeSource, /action:\s*'update_receiving_invoice_item'/);
+  assert.match(routeSource, /action:\s*'delete_receiving_invoice_item'/);
+  assert.match(routeSource, /action:\s*'finalize_receiving_invoice'/);
+  assert.match(routeSource, /CONFLICT_AUDIT_DURABILITY_FAILURE/);
+
+  assert.match(controllerSource, /action:\s*'create_inventory_item'/);
+  assert.match(controllerSource, /action:\s*'create_stock_movement'/);
+  assert.match(controllerSource, /CONFLICT_AUDIT_DURABILITY_FAILURE/);
+  assert.match(controllerSource, /strict:\s*true/);
+
+  assert.match(serviceSource, /action:\s*'create_issue_order'[\s\S]*strict:\s*true/);
+  assert.match(serviceSource, /action:\s*'update_issue_order'[\s\S]*strict:\s*true/);
+  assert.match(serviceSource, /action:\s*'add_issue_order_item'[\s\S]*strict:\s*true/);
+  assert.match(serviceSource, /action:\s*'delete_issue_order_item'[\s\S]*strict:\s*true/);
+  assert.match(serviceSource, /action:\s*'create_loss_adjustment'[\s\S]*strict:\s*true/);
+  assert.match(serviceSource, /action:\s*'update_loss_adjustment'[\s\S]*strict:\s*true/);
 });

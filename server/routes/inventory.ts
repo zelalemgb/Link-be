@@ -16,6 +16,7 @@ import {
   type IssueOrderItemMutationPayload,
   type LossAdjustmentMutationPayload,
 } from '../services/inventoryMutationService';
+import { isAuditDurabilityError, recordAuditEvent } from '../services/audit-log.js';
 
 const router = Router();
 
@@ -186,6 +187,67 @@ const mapRpcErrorStatus = (message: string) => {
 
 const sendContractError = (res: any, status: number, code: string, message: string) =>
   res.status(status).json({ code, message });
+
+const buildAuditActorContext = (req: any, actorProfileId?: string | null) => ({
+  actorUserId: actorProfileId || req.user?.profileId || null,
+  actorRole: req.user?.role || null,
+  actorIpAddress: req.ip || req.socket?.remoteAddress || null,
+  actorUserAgent: req.get?.('user-agent') || null,
+  requestId: req.requestId || null,
+});
+
+const recordInventoryStrictAudit = async ({
+  req,
+  tenantId,
+  facilityId,
+  actorProfileId,
+  action,
+  eventType,
+  entityType,
+  entityId,
+  metadata,
+  outboxEventType,
+  outboxAggregateType,
+  outboxAggregateId,
+}: {
+  req: any;
+  tenantId: string;
+  facilityId: string;
+  actorProfileId?: string | null;
+  action: string;
+  eventType: 'create' | 'update' | 'delete';
+  entityType: string;
+  entityId?: string | null;
+  metadata?: Record<string, unknown>;
+  outboxEventType: string;
+  outboxAggregateType: string;
+  outboxAggregateId?: string | null;
+}) => {
+  const actorCtx = buildAuditActorContext(req, actorProfileId);
+  await recordAuditEvent(
+    {
+      action,
+      eventType,
+      entityType,
+      tenantId,
+      facilityId,
+      actorUserId: actorCtx.actorUserId,
+      actorRole: actorCtx.actorRole,
+      actorIpAddress: actorCtx.actorIpAddress,
+      actorUserAgent: actorCtx.actorUserAgent,
+      entityId: entityId || null,
+      actionCategory: 'inventory',
+      metadata: metadata || null,
+      requestId: actorCtx.requestId,
+    },
+    {
+      strict: true,
+      outboxEventType,
+      outboxAggregateType,
+      outboxAggregateId: outboxAggregateId || entityId || null,
+    }
+  );
+};
 
 const uuidParamSchema = z.string().uuid();
 const resolveRequiredUuidParam = ({
@@ -564,12 +626,35 @@ router.post('/requests/submit', async (req, res) => {
       return res.status(mapRpcErrorStatus(submitError.message)).json({ error: submitError.message });
     }
 
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'submit_resupply_request',
+      eventType: 'create',
+      entityType: 'resupply_request',
+      entityId: effectiveRequestId || null,
+      metadata: {
+        requestType: requestDetails.request_type,
+        reportingPeriod: requestDetails.reporting_period,
+        lineCount: lines.length,
+        transactionalPath: 'backend_submit_resupply_request',
+      },
+      outboxEventType: 'audit.inventory.resupply_request.submit.write_failed',
+      outboxAggregateType: 'resupply_request',
+      outboxAggregateId: effectiveRequestId || null,
+    });
+
     return res.json({
       success: true,
       requestId: effectiveRequestId,
     });
   } catch (error: any) {
     console.error('Submit resupply request error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -610,6 +695,26 @@ router.post('/receiving/from-request', async (req, res) => {
       repopulated?: boolean;
     };
 
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'create_receiving_from_resupply_request',
+      eventType: 'create',
+      entityType: 'receiving_invoice',
+      entityId: result.invoice_id || null,
+      metadata: {
+        requestId,
+        created: Boolean(result.created),
+        repopulated: Boolean(result.repopulated),
+        transactionalPath: 'backend_create_receiving_from_request',
+      },
+      outboxEventType: 'audit.inventory.receiving.from_request.write_failed',
+      outboxAggregateType: 'receiving_invoice',
+      outboxAggregateId: result.invoice_id || requestId,
+    });
+
     return res.json({
       success: true,
       invoiceId: result.invoice_id,
@@ -618,6 +723,9 @@ router.post('/receiving/from-request', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Create receiving invoice from request error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return res.status(500).json({ error: error.message || 'Internal server error' });
   }
 });
@@ -654,9 +762,30 @@ router.post('/receiving/invoices', async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'create_receiving_invoice',
+      eventType: 'create',
+      entityType: 'receiving_invoice',
+      entityId: data?.id || null,
+      metadata: {
+        invoiceNo: data?.invoice_no || payload.invoice_no,
+        receiveType: payload.receive_type,
+      },
+      outboxEventType: 'audit.inventory.receiving_invoice.create.write_failed',
+      outboxAggregateType: 'receiving_invoice',
+      outboxAggregateId: data?.id || null,
+    });
+
     return res.status(201).json({ invoice: data });
   } catch (error: any) {
     console.error('Create receiving invoice error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -668,7 +797,7 @@ router.put('/receiving/invoices/:invoiceId', async (req, res) => {
   }
 
   try {
-    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
     if (!actorFacilityId || !actorTenantId) {
       return res.status(403).json({ error: 'Missing facility or tenant context' });
     }
@@ -705,9 +834,30 @@ router.put('/receiving/invoices/:invoiceId', async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'update_receiving_invoice',
+      eventType: 'update',
+      entityType: 'receiving_invoice',
+      entityId: data?.id || invoiceId,
+      metadata: {
+        invoiceNo: data?.invoice_no || invoice.invoice_no,
+        receiveType: payload.receive_type,
+      },
+      outboxEventType: 'audit.inventory.receiving_invoice.update.write_failed',
+      outboxAggregateType: 'receiving_invoice',
+      outboxAggregateId: data?.id || invoiceId,
+    });
+
     return res.json({ invoice: data });
   } catch (error: any) {
     console.error('Update receiving invoice error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -719,7 +869,7 @@ router.post('/receiving/invoices/:invoiceId/items', async (req, res) => {
   }
 
   try {
-    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
     if (!actorFacilityId || !actorTenantId) {
       return res.status(403).json({ error: 'Missing facility or tenant context' });
     }
@@ -760,9 +910,31 @@ router.post('/receiving/invoices/:invoiceId/items', async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'create_receiving_invoice_item',
+      eventType: 'create',
+      entityType: 'receiving_invoice_item',
+      entityId: data?.id || null,
+      metadata: {
+        invoiceId,
+        inventoryItemId: parsed.data.inventory_item_id,
+        quantity: parsed.data.quantity,
+      },
+      outboxEventType: 'audit.inventory.receiving_invoice_item.create.write_failed',
+      outboxAggregateType: 'receiving_invoice_item',
+      outboxAggregateId: data?.id || null,
+    });
+
     return res.status(201).json({ item: data });
   } catch (error: any) {
     console.error('Add receiving invoice item error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -774,7 +946,7 @@ router.patch('/receiving/items/:itemId', async (req, res) => {
   }
 
   try {
-    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
     if (!actorFacilityId || !actorTenantId) {
       return res.status(403).json({ error: 'Missing facility or tenant context' });
     }
@@ -818,16 +990,37 @@ router.patch('/receiving/items/:itemId', async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'update_receiving_invoice_item',
+      eventType: 'update',
+      entityType: 'receiving_invoice_item',
+      entityId: data?.id || itemId,
+      metadata: {
+        invoiceId: existingItem.invoice_id,
+        fieldsUpdated: Object.keys(parsed.data),
+      },
+      outboxEventType: 'audit.inventory.receiving_invoice_item.update.write_failed',
+      outboxAggregateType: 'receiving_invoice_item',
+      outboxAggregateId: data?.id || itemId,
+    });
+
     return res.json({ item: data });
   } catch (error: any) {
     console.error('Update receiving invoice item error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 router.delete('/receiving/items/:itemId', async (req, res) => {
   try {
-    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
     if (!actorFacilityId || !actorTenantId) {
       return res.status(403).json({ error: 'Missing facility or tenant context' });
     }
@@ -869,9 +1062,29 @@ router.delete('/receiving/items/:itemId', async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'delete_receiving_invoice_item',
+      eventType: 'delete',
+      entityType: 'receiving_invoice_item',
+      entityId: itemId,
+      metadata: {
+        invoiceId: existingItem.invoice_id,
+      },
+      outboxEventType: 'audit.inventory.receiving_invoice_item.delete.write_failed',
+      outboxAggregateType: 'receiving_invoice_item',
+      outboxAggregateId: itemId,
+    });
+
     return res.json({ success: true });
   } catch (error: any) {
     console.error('Delete receiving invoice item error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1021,9 +1234,34 @@ router.post('/receiving/invoices/:invoiceId/finalize', async (req, res) => {
       }
     }
 
+    const stockMovementCount = rows.filter((row) => Number(row.quantity || 0) > 0).length;
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'finalize_receiving_invoice',
+      eventType: 'update',
+      entityType: 'receiving_invoice',
+      entityId: invoiceId,
+      metadata: {
+        invoiceNo: invoice.invoice_no,
+        requestId: invoice.request_id || null,
+        itemCount: rows.length,
+        stockMovementCount,
+        requestClosed,
+      },
+      outboxEventType: 'audit.inventory.receiving_invoice.finalize.write_failed',
+      outboxAggregateType: 'receiving_invoice',
+      outboxAggregateId: invoiceId,
+    });
+
     return res.json({ success: true, requestClosed });
   } catch (error: any) {
     console.error('Finalize receiving invoice error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return res.status(500).json({ error: 'Internal server error' });
   }
 });

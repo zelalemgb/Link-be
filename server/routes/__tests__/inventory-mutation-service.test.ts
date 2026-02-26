@@ -432,6 +432,400 @@ test('inventory mutation addIssueOrderItem rejects negative ending balance', asy
   }
 });
 
+test('inventory mutation createIssueOrder fails closed on strict audit durability failure', async () => {
+  const { inventoryMutationService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    (supabaseAdmin as any).from = createFromStub({
+      issue_orders: {
+        maybeSingle: () => ({ data: null, error: null }),
+        single: () => ({ data: { id: 'issue-order-1' }, error: null }),
+      },
+      audit_log: {
+        single: () => ({ data: null, error: { message: 'audit write failed' } }),
+      },
+      outbox_events: {
+        single: () => ({ data: null, error: { message: 'outbox write failed' } }),
+      },
+    });
+
+    (supabaseAdmin as any).from = (table: string) => {
+      if (table === 'audit_log') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'audit write failed' } }),
+        };
+      }
+      if (table === 'outbox_events') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'outbox write failed' } }),
+        };
+      }
+      return createFromStub({
+        issue_orders: {
+          maybeSingle: () => ({ data: null, error: null }),
+          single: () => ({ data: { id: 'issue-order-1' }, error: null }),
+        },
+      })(table);
+    };
+
+    const result = await inventoryMutationService.createIssueOrder({
+      actor: {
+        authUserId: 'auth-user-1',
+        profileId: 'profile-1',
+        tenantId: 'tenant-1',
+        facilityId: 'facility-1',
+        role: 'pharmacist',
+      },
+      payload: {
+        period: '2026-W07',
+      },
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.status, 500);
+      assert.equal(result.code, 'CONFLICT_AUDIT_DURABILITY_FAILURE');
+      assert.equal(result.message, 'Audit durability requirement failed');
+    }
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('inventory mutation updateIssueOrder fails closed on strict audit durability failure', async () => {
+  const { inventoryMutationService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    (supabaseAdmin as any).from = (table: string) => {
+      if (table === 'audit_log') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'audit write failed' } }),
+        };
+      }
+      if (table === 'outbox_events') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'outbox write failed' } }),
+        };
+      }
+      return createFromStub({
+        issue_orders: {
+          maybeSingle: () => ({
+            data: {
+              id: 'issue-order-1',
+              tenant_id: 'tenant-1',
+              facility_id: 'facility-1',
+              status: 'draft',
+              voucher_no: null,
+            },
+            error: null,
+          }),
+          single: (state) => {
+            assert.equal(state.operation, 'update');
+            return { data: { id: 'issue-order-1' }, error: null };
+          },
+        },
+      })(table);
+    };
+
+    const result = await inventoryMutationService.updateIssueOrder({
+      actor: {
+        authUserId: 'auth-user-1',
+        profileId: 'profile-1',
+        tenantId: 'tenant-1',
+        facilityId: 'facility-1',
+        role: 'pharmacist',
+      },
+      orderId: 'issue-order-1',
+      payload: {
+        period: '2026-W08',
+      },
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.status, 500);
+      assert.equal(result.code, 'CONFLICT_AUDIT_DURABILITY_FAILURE');
+      assert.equal(result.message, 'Audit durability requirement failed');
+    }
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('inventory mutation addIssueOrderItem fails closed on strict audit durability failure', async () => {
+  const { inventoryMutationService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    (supabaseAdmin as any).from = (table: string) => {
+      if (table === 'audit_log') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'audit write failed' } }),
+        };
+      }
+      if (table === 'outbox_events') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'outbox write failed' } }),
+        };
+      }
+      return createFromStub({
+        issue_orders: {
+          maybeSingle: () => ({
+            data: {
+              id: 'issue-order-1',
+              tenant_id: 'tenant-1',
+              facility_id: 'facility-1',
+              status: 'draft',
+              voucher_no: null,
+            },
+            error: null,
+          }),
+        },
+        inventory_items: {
+          maybeSingle: () => ({
+            data: {
+              id: 'inventory-item-1',
+              tenant_id: 'tenant-1',
+              facility_id: 'facility-1',
+            },
+            error: null,
+          }),
+        },
+        issue_order_items: {
+          maybeSingle: () => ({ data: null, error: null }),
+          single: () => ({ data: { id: 'issue-item-1' }, error: null }),
+        },
+      })(table);
+    };
+
+    const result = await inventoryMutationService.addIssueOrderItem({
+      actor: {
+        authUserId: 'auth-user-1',
+        profileId: 'profile-1',
+        tenantId: 'tenant-1',
+        facilityId: 'facility-1',
+        role: 'pharmacist',
+      },
+      orderId: 'issue-order-1',
+      payload: {
+        inventory_item_id: 'inventory-item-1',
+        beginning_balance: 10,
+        qty_received: 3,
+        loss: 0,
+        adjustment: 0,
+        qty_requested: 5,
+        qty_issued: 5,
+      },
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.status, 500);
+      assert.equal(result.code, 'CONFLICT_AUDIT_DURABILITY_FAILURE');
+      assert.equal(result.message, 'Audit durability requirement failed');
+    }
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('inventory mutation deleteIssueOrderItem fails closed on strict audit durability failure', async () => {
+  const { inventoryMutationService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    (supabaseAdmin as any).from = (table: string) => {
+      if (table === 'audit_log') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'audit write failed' } }),
+        };
+      }
+      if (table === 'outbox_events') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'outbox write failed' } }),
+        };
+      }
+      return createFromStub({
+        issue_order_items: {
+          maybeSingle: () => ({
+            data: {
+              id: 'issue-item-1',
+              order_id: 'issue-order-1',
+            },
+            error: null,
+          }),
+        },
+        issue_orders: {
+          maybeSingle: () => ({
+            data: {
+              id: 'issue-order-1',
+              tenant_id: 'tenant-1',
+              facility_id: 'facility-1',
+              status: 'draft',
+              voucher_no: null,
+            },
+            error: null,
+          }),
+        },
+      })(table);
+    };
+
+    const result = await inventoryMutationService.deleteIssueOrderItem({
+      actor: {
+        authUserId: 'auth-user-1',
+        profileId: 'profile-1',
+        tenantId: 'tenant-1',
+        facilityId: 'facility-1',
+        role: 'pharmacist',
+      },
+      itemId: 'issue-item-1',
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.status, 500);
+      assert.equal(result.code, 'CONFLICT_AUDIT_DURABILITY_FAILURE');
+      assert.equal(result.message, 'Audit durability requirement failed');
+    }
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('inventory mutation createLossAdjustment fails closed on strict audit durability failure', async () => {
+  const { inventoryMutationService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    (supabaseAdmin as any).from = (table: string) => {
+      if (table === 'audit_log') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'audit write failed' } }),
+        };
+      }
+      if (table === 'outbox_events') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'outbox write failed' } }),
+        };
+      }
+      return createFromStub({
+        inventory_items: {
+          maybeSingle: () => ({
+            data: {
+              id: 'inventory-item-1',
+              tenant_id: 'tenant-1',
+              facility_id: 'facility-1',
+            },
+            error: null,
+          }),
+        },
+        loss_adjustments: {
+          maybeSingle: () => ({ data: null, error: null }),
+          single: () => ({ data: { id: 'adjustment-1' }, error: null }),
+        },
+      })(table);
+    };
+
+    const result = await inventoryMutationService.createLossAdjustment({
+      actor: {
+        authUserId: 'auth-user-1',
+        profileId: 'profile-1',
+        tenantId: 'tenant-1',
+        facilityId: 'facility-1',
+        role: 'pharmacist',
+      },
+      payload: {
+        inventory_item_id: 'inventory-item-1',
+        reason: 'expired',
+        quantity: 2,
+      },
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.status, 500);
+      assert.equal(result.code, 'CONFLICT_AUDIT_DURABILITY_FAILURE');
+      assert.equal(result.message, 'Audit durability requirement failed');
+    }
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('inventory mutation updateLossAdjustment fails closed on strict audit durability failure', async () => {
+  const { inventoryMutationService, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    (supabaseAdmin as any).from = (table: string) => {
+      if (table === 'audit_log') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'audit write failed' } }),
+        };
+      }
+      if (table === 'outbox_events') {
+        return {
+          insert: async () => ({ data: null, error: { message: 'outbox write failed' } }),
+        };
+      }
+      return createFromStub({
+        inventory_items: {
+          maybeSingle: () => ({
+            data: {
+              id: 'inventory-item-1',
+              tenant_id: 'tenant-1',
+              facility_id: 'facility-1',
+            },
+            error: null,
+          }),
+        },
+        loss_adjustments: {
+          maybeSingle: () => ({
+            data: {
+              id: 'adjustment-1',
+              tenant_id: 'tenant-1',
+              facility_id: 'facility-1',
+              status: 'draft',
+            },
+            error: null,
+          }),
+          single: (state) => {
+            assert.equal(state.operation, 'update');
+            return { data: { id: 'adjustment-1' }, error: null };
+          },
+        },
+      })(table);
+    };
+
+    const result = await inventoryMutationService.updateLossAdjustment({
+      actor: {
+        authUserId: 'auth-user-1',
+        profileId: 'profile-1',
+        tenantId: 'tenant-1',
+        facilityId: 'facility-1',
+        role: 'pharmacist',
+      },
+      adjustmentId: 'adjustment-1',
+      payload: {
+        inventory_item_id: 'inventory-item-1',
+        reason: 'expired',
+        quantity: 2,
+      },
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.status, 500);
+      assert.equal(result.code, 'CONFLICT_AUDIT_DURABILITY_FAILURE');
+      assert.equal(result.message, 'Audit durability requirement failed');
+    }
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
 test('inventory mutation dispatchIssueOrder is idempotent on transactional replay', async () => {
   const { inventoryMutationService, supabaseAdmin } = await loadModules();
   const originalRpc = (supabaseAdmin as any).rpc;

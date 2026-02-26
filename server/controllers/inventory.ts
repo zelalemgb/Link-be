@@ -2,8 +2,11 @@
 import { Request, Response } from 'express';
 import { supabaseAdmin } from '../config/supabase.js';
 import { z } from 'zod';
+import { isAuditDurabilityError, recordAuditEvent } from '../services/audit-log.js';
 
 const isInventoryDebug = process.env.INVENTORY_DEBUG === 'true';
+const sendContractError = (res: Response, status: number, code: string, message: string) =>
+    res.status(status).json({ code, message });
 
 // --- Schemas ---
 const createItemSchema = z.object({
@@ -108,9 +111,36 @@ export const createInventoryItem = async (req: Request, res: Response) => {
 
         if (error) return res.status(500).json({ error: error.message });
 
+        await recordAuditEvent({
+            action: 'create_inventory_item',
+            eventType: 'create',
+            entityType: 'inventory_item',
+            tenantId,
+            facilityId,
+            actorUserId: profileId,
+            actorRole: req.user?.role || null,
+            actorIpAddress: req.ip || req.socket?.remoteAddress || null,
+            actorUserAgent: req.get('user-agent') || null,
+            entityId: data?.id || null,
+            actionCategory: 'inventory',
+            metadata: {
+                itemName: data?.name || parsed.data.name,
+                category: data?.category || parsed.data.category || null,
+            },
+            requestId: req.requestId || null,
+        }, {
+            strict: true,
+            outboxEventType: 'audit.inventory.item.create.write_failed',
+            outboxAggregateType: 'inventory_item',
+            outboxAggregateId: data?.id || null,
+        });
+
         return res.status(201).json(data);
     } catch (err: any) {
         console.error('createInventoryItem error:', err?.message || err);
+        if (isAuditDurabilityError(err)) {
+            return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+        }
         return res.status(500).json({ error: 'Internal server error' });
     }
 };
@@ -257,10 +287,40 @@ export const processStockMovement = async (req: Request, res: Response) => {
 
         if (error) return res.status(500).json({ error: error.message });
 
+        await recordAuditEvent({
+            action: 'create_stock_movement',
+            eventType: 'create',
+            entityType: 'stock_movement',
+            tenantId,
+            facilityId,
+            actorUserId: profileId,
+            actorRole: req.user?.role || null,
+            actorIpAddress: req.ip || req.socket?.remoteAddress || null,
+            actorUserAgent: req.get('user-agent') || null,
+            entityId: data?.id || null,
+            actionCategory: 'inventory',
+            metadata: {
+                inventoryItemId: inventory_item_id,
+                movementType: movement_type,
+                quantity,
+                balanceAfter: newBalance,
+                referenceNumber: reference_number || null,
+            },
+            requestId: req.requestId || null,
+        }, {
+            strict: true,
+            outboxEventType: 'audit.inventory.stock_movement.create.write_failed',
+            outboxAggregateType: 'stock_movement',
+            outboxAggregateId: data?.id || null,
+        });
+
         return res.status(201).json(data);
 
     } catch (err: any) {
         console.error('processStockMovement error:', err?.message || err);
+        if (isAuditDurabilityError(err)) {
+            return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+        }
         return res.status(500).json({ error: 'Internal server error' });
     }
 };

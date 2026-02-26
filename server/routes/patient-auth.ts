@@ -128,7 +128,7 @@ router.post('/request-otp', otpLimiter, async (req, res) => {
   try {
     const { phoneNumber } = otpRequestSchema.parse(req.body);
     const normalizedPhone = normalizePhoneNumber(phoneNumber);
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const otp = String(crypto.randomInt(100000, 1000000));
     const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000).toISOString();
 
     await supabaseAdmin

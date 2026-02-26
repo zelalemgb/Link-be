@@ -38,7 +38,7 @@ const buildVerificationCodeExpiry = () => {
 };
 
 const generateVerificationCode = () =>
-    Math.floor(100000 + Math.random() * 900000).toString();
+    String(crypto.randomInt(100000, 1000000));
 
 const loadLatestPendingVerificationCode = async (email: string) => {
     const normalizedEmail = normalizeEmail(email);

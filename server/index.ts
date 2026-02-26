@@ -41,10 +41,48 @@ const port = process.env.PORT || 4000;
 
 const isProduction = process.env.NODE_ENV === 'production';
 const corsOriginsRaw = process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || '';
-const allowedOrigins = corsOriginsRaw
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const normalizeOrigin = (origin: string) => {
+  const trimmed = origin.trim();
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    return `${parsed.protocol}//${parsed.host}`.toLowerCase();
+  } catch {
+    return trimmed.replace(/\/+$/, '').toLowerCase();
+  }
+};
+
+const expandOriginVariants = (origin: string) => {
+  const normalized = normalizeOrigin(origin);
+  if (!normalized) return [];
+
+  const variants = new Set<string>([normalized]);
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'linkhc.org' || host === 'www.linkhc.org') {
+      const port = parsed.port ? `:${parsed.port}` : '';
+      variants.add(`${parsed.protocol}//linkhc.org${port}`);
+      variants.add(`${parsed.protocol}//www.linkhc.org${port}`);
+    }
+  } catch {
+    // Ignore non-URL values; normalized raw string variant is already included.
+  }
+
+  return Array.from(variants);
+};
+
+const allowedOriginSet = new Set<string>();
+for (const configuredOrigin of corsOriginsRaw.split(',').map((origin) => origin.trim()).filter(Boolean)) {
+  for (const variant of expandOriginVariants(configuredOrigin)) {
+    allowedOriginSet.add(variant);
+  }
+}
+for (const firstPartyOrigin of ['https://linkhc.org', 'https://www.linkhc.org']) {
+  for (const variant of expandOriginVariants(firstPartyOrigin)) {
+    allowedOriginSet.add(variant);
+  }
+}
 
 const safePath = (url: string | undefined) => (url || '').split('?')[0];
 
@@ -71,14 +109,15 @@ app.use(
         return callback(null, true);
       }
 
-      if (allowedOrigins.length === 0) {
+      if (allowedOriginSet.size === 0) {
         if (!isProduction) {
           return callback(null, true);
         }
         return callback(new Error('CORS not configured'));
       }
 
-      if (allowedOrigins.includes(origin)) {
+      const normalizedOrigin = normalizeOrigin(origin);
+      if (allowedOriginSet.has(normalizedOrigin)) {
         return callback(null, true);
       }
 
@@ -417,6 +456,51 @@ const getAuthUserProfileIds = async (authUserId: string) => {
   return (data || []).map((row) => row.id).filter(Boolean) as string[];
 };
 
+type FeatureRequestAuthorRow = {
+  id: string;
+  facility_id?: string | null;
+  user_role?: string | null;
+};
+
+// Resolve a stable author context for feature-request writes even when middleware
+// profile selection is ambiguous (multi-facility users).
+const resolveFeatureRequestAuthor = async (
+  req: express.Request
+): Promise<{ profileId: string; facilityId?: string; role: string } | null> => {
+  const authUserId = req.user?.authUserId;
+  if (!authUserId) return null;
+
+  const preferredFacilityId =
+    typeof req.body?.facility_id === 'string' && req.body.facility_id.trim().length > 0
+      ? req.body.facility_id.trim()
+      : req.user?.facilityId;
+
+  const { data, error } = await supabaseAdmin
+    .from('users')
+    .select('id, facility_id, user_role')
+    .eq('auth_user_id', authUserId)
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+  const profiles = (data || []) as FeatureRequestAuthorRow[];
+  if (!profiles.length) return null;
+
+  const byFacility = preferredFacilityId
+    ? profiles.find((profile) => profile.facility_id === preferredFacilityId)
+    : undefined;
+  const byMiddlewareProfile = req.user?.profileId
+    ? profiles.find((profile) => profile.id === req.user?.profileId)
+    : undefined;
+  const firstWithFacility = profiles.find((profile) => !!profile.facility_id);
+  const selected = byFacility || byMiddlewareProfile || firstWithFacility || profiles[0];
+
+  return {
+    profileId: selected.id,
+    facilityId: selected.facility_id || undefined,
+    role: (selected.user_role as string | null) || req.user?.role || 'staff',
+  };
+};
+
 // Backward compatible ownership resolution:
 // - modern rows use users.id (profile id)
 // - some legacy rows used auth.users id directly in feature_requests.user_id
@@ -538,20 +622,23 @@ app.post('/api/feature-requests', requireUser, async (req, res) => {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
   }
 
-  // Access user from request (populated by middleware)
-  const scope = getFeatureRequestScope(req, res);
-  if (!scope) return;
-  const { profileId, facilityId } = scope;
-  const body = parsed.data;
-
   try {
+    const author = await resolveFeatureRequestAuthor(req);
+    if (!author?.profileId) {
+      return res.status(403).json({ error: 'User profile required' });
+    }
+    if (author.role !== 'super_admin' && !author.facilityId) {
+      return res.status(403).json({ error: 'Facility context required' });
+    }
+
+    const body = parsed.data;
     const { data, error } = await supabaseAdmin
       .from('feature_requests')
       .insert({
         ...body,
         status: 'submitted',
-        user_id: profileId,
-        facility_id: facilityId,
+        user_id: author.profileId,
+        facility_id: author.facilityId || null,
       })
       .select()
       .single();

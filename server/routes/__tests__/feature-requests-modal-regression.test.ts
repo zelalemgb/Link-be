@@ -10,10 +10,14 @@ test('feature request list endpoints enrich related metadata without brittle FK-
   assert.match(source, /const enrichFeatureRequestRows = async/);
   assert.match(source, /const getAuthUserProfileIds = async \(authUserId: string\)/);
   assert.match(source, /const getFeatureRequestActorIds = async \(authUserId: string, profileId\?: string\)/);
+  assert.match(source, /const resolveFeatureRequestAuthor = async/);
   assert.match(source, /app\.get\('\/api\/feature-requests\/me', requireUser/);
   assert.match(source, /app\.get\('\/api\/feature-requests', requireUser/);
   assert.match(source, /app\.get\('\/api\/feature-requests\/community', requireUser/);
   assert.match(source, /const enriched = await enrichFeatureRequestRows\(\(data \|\| \[\]\) as FeatureRequestRow\[\]\);/);
+  assert.match(source, /app\.post\('\/api\/feature-requests', requireUser, async \(req, res\) => \{/);
+  assert.match(source, /const author = await resolveFeatureRequestAuthor\(req\);/);
+  assert.match(source, /if \(author\.role !== 'super_admin' && !author\.facilityId\)/);
   const mySuggestionsHandler = source.match(
     /app\.get\('\/api\/feature-requests\/me', requireUser, async \(req, res\) => \{[\s\S]*?\n\}\);\n\napp\.get\('\/api\/feature-requests', requireUser/
   )?.[0];

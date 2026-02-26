@@ -420,11 +420,19 @@ export const createIssueOrder = async ({
         dispensingUnitId: payload.dispensing_unit_id || null,
       },
       requestId: scopedActor.requestId || null,
+    }, {
+      strict: true,
+      outboxEventType: 'audit.inventory.issue_order.create.write_failed',
+      outboxAggregateType: 'issue_order',
+      outboxAggregateId: order.id,
     });
 
     return { ok: true, data: { order: { id: order.id } } };
   } catch (serviceError: any) {
     console.error('createIssueOrder service error:', serviceError?.message || serviceError);
+    if (isAuditDurabilityError(serviceError)) {
+      return error(500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return error(500, 'CONFLICT_ISSUE_ORDER_CREATE_FAILED', 'Failed to create issue order');
   }
 };
@@ -491,11 +499,19 @@ export const updateIssueOrder = async ({
         period: payload.period.trim(),
       },
       requestId: scopedActor.requestId || null,
+    }, {
+      strict: true,
+      outboxEventType: 'audit.inventory.issue_order.update.write_failed',
+      outboxAggregateType: 'issue_order',
+      outboxAggregateId: orderId,
     });
 
     return { ok: true, data: { order: { id: order.id } } };
   } catch (serviceError: any) {
     console.error('updateIssueOrder service error:', serviceError?.message || serviceError);
+    if (isAuditDurabilityError(serviceError)) {
+      return error(500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return error(500, 'CONFLICT_ISSUE_ORDER_UPDATE_FAILED', 'Failed to update issue order');
   }
 };
@@ -618,11 +634,19 @@ export const addIssueOrderItem = async ({
         qtyIssued: payload.qty_issued,
       },
       requestId: scopedActor.requestId || null,
+    }, {
+      strict: true,
+      outboxEventType: 'audit.inventory.issue_order_item.create.write_failed',
+      outboxAggregateType: 'issue_order_item',
+      outboxAggregateId: item.id,
     });
 
     return { ok: true, data: { item: { id: item.id } } };
   } catch (serviceError: any) {
     console.error('addIssueOrderItem service error:', serviceError?.message || serviceError);
+    if (isAuditDurabilityError(serviceError)) {
+      return error(500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return error(500, 'CONFLICT_ISSUE_ORDER_ITEM_CREATE_FAILED', 'Failed to add issue order item');
   }
 };
@@ -684,11 +708,19 @@ export const deleteIssueOrderItem = async ({
         orderId: itemRow.order_id,
       },
       requestId: scopedActor.requestId || null,
+    }, {
+      strict: true,
+      outboxEventType: 'audit.inventory.issue_order_item.delete.write_failed',
+      outboxAggregateType: 'issue_order_item',
+      outboxAggregateId: itemId,
     });
 
     return { ok: true, data: { success: true } };
   } catch (serviceError: any) {
     console.error('deleteIssueOrderItem service error:', serviceError?.message || serviceError);
+    if (isAuditDurabilityError(serviceError)) {
+      return error(500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return error(500, 'CONFLICT_ISSUE_ORDER_ITEM_DELETE_FAILED', 'Failed to delete issue order item');
   }
 };
@@ -870,11 +902,19 @@ export const createLossAdjustment = async ({
         quantity: payload.quantity,
       },
       requestId: scopedActor.requestId || null,
+    }, {
+      strict: true,
+      outboxEventType: 'audit.inventory.loss_adjustment.create.write_failed',
+      outboxAggregateType: 'loss_adjustment',
+      outboxAggregateId: adjustment.id,
     });
 
     return { ok: true, data: { adjustment: { id: adjustment.id } } };
   } catch (serviceError: any) {
     console.error('createLossAdjustment service error:', serviceError?.message || serviceError);
+    if (isAuditDurabilityError(serviceError)) {
+      return error(500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return error(500, 'CONFLICT_LOSS_ADJUSTMENT_CREATE_FAILED', 'Failed to create loss adjustment');
   }
 };
@@ -952,11 +992,19 @@ export const updateLossAdjustment = async ({
         quantity: payload.quantity,
       },
       requestId: scopedActor.requestId || null,
+    }, {
+      strict: true,
+      outboxEventType: 'audit.inventory.loss_adjustment.update.write_failed',
+      outboxAggregateType: 'loss_adjustment',
+      outboxAggregateId: adjustmentId,
     });
 
     return { ok: true, data: { adjustment: { id: updated.id } } };
   } catch (serviceError: any) {
     console.error('updateLossAdjustment service error:', serviceError?.message || serviceError);
+    if (isAuditDurabilityError(serviceError)) {
+      return error(500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
     return error(500, 'CONFLICT_LOSS_ADJUSTMENT_UPDATE_FAILED', 'Failed to update loss adjustment');
   }
 };
