@@ -87,7 +87,28 @@ for (const firstPartyOrigin of ['https://linkhc.org', 'https://www.linkhc.org'])
 const safePath = (url: string | undefined) => (url || '').split('?')[0];
 
 app.set('trust proxy', 1);
-app.use(helmet());
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+        // API responses are JSON; no scripts, styles, or media are served.
+      },
+    },
+    // Prevent this API server from being embedded in frames anywhere.
+    frameguard: { action: 'deny' },
+    // Enforce HTTPS in supported browsers for 1 year.
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+    // Disable MIME-type sniffing.
+    noSniff: true,
+    // Block cross-origin resource access from untrusted embedders.
+    crossOriginEmbedderPolicy: true,
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    crossOriginResourcePolicy: { policy: 'same-origin' },
+    referrerPolicy: { policy: 'no-referrer' },
+  })
+);
 app.use(express.json());
 app.use(cookieParser());
 app.use((req, res, next) => {

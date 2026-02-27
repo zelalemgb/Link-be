@@ -55,7 +55,8 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
 
         const authUserId = data.user.id;
         if (isAuthDebug) {
-            console.log('[AUTH DEBUG] authUserId:', authUserId);
+            // Log only a truncated prefix — never the full UUID or role.
+            console.log('[AUTH DEBUG] authUserId:', authUserId.slice(0, 8) + '…');
         }
 
         // Fetch user profile to get role and facility context
@@ -68,12 +69,11 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
 
         if (isAuthDebug) {
             if (profileErr) {
-                console.error('[AUTH DEBUG] Profile fetch error:', profileErr.message);
-            }
-            if (!profile) {
-                console.warn('[AUTH DEBUG] No profile found for authUserId:', authUserId);
+                console.error('[AUTH DEBUG] Profile fetch error: (redacted)');
+            } else if (!profile) {
+                console.warn('[AUTH DEBUG] No profile found');
             } else {
-                console.log('[AUTH DEBUG] Profile found:', profile.id, 'Role:', profile.user_role);
+                console.log('[AUTH DEBUG] Profile resolved:', profile.id.slice(0, 8) + '…');
             }
         }
 

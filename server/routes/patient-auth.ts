@@ -149,9 +149,8 @@ router.post('/request-otp', otpLimiter, async (req, res) => {
       return res.status(500).json({ error: 'Unable to send OTP' });
     }
 
-    if (otpDelivery === 'console' && process.env.NODE_ENV !== 'production') {
-      console.log(`[Patient OTP] ${normalizedPhone}: ${otp}`);
-    }
+    // OTP is never logged — use /dev-login for local testing.
+    void otpDelivery; // delivery channel handled by external SMS/email service
 
     return res.json({ success: true });
   } catch (error: any) {
@@ -367,7 +366,18 @@ router.post('/register', otpLimiter, async (req, res) => {
 
 router.post('/dev-login', otpLimiter, async (req, res) => {
   const devLoginEnabled = process.env.PATIENT_DEV_LOGIN_ENABLED === 'true';
-  if (process.env.NODE_ENV === 'production' || !devLoginEnabled) {
+  const devSecret = process.env.PATIENT_DEV_LOGIN_SECRET;
+
+  // Block unconditionally in production.
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ error: 'Dev login disabled' });
+  }
+  // Require both the feature flag and a configured secret so a misconfigured
+  // staging environment cannot be authenticated against without the secret.
+  if (!devLoginEnabled || !devSecret) {
+    return res.status(403).json({ error: 'Dev login disabled' });
+  }
+  if (req.header('x-dev-secret') !== devSecret) {
     return res.status(403).json({ error: 'Dev login disabled' });
   }
 
