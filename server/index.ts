@@ -34,6 +34,8 @@ import inpatientRouter from './routes/inpatient';
 import nursingRouter from './routes/nursing';
 import pharmacyRouter from './routes/pharmacy';
 import syncRouter from './routes/sync';
+import hewRouter from './routes/hew';
+import smsRouter from './routes/sms';
 import { recordResponseStatus } from './services/monitoring';
 
 export const app = express();
@@ -84,6 +86,18 @@ for (const firstPartyOrigin of ['https://linkhc.org', 'https://www.linkhc.org'])
   }
 }
 
+// LOW-4: Warn loudly at startup if CORS is misconfigured in production.
+// The runtime CORS handler already rejects requests when allowedOriginSet is empty,
+// but catching it here gives an actionable message in deployment logs.
+if (isProduction && allowedOriginSet.size === 0) {
+  console.error(
+    '[CORS] FATAL: No CORS origins configured for production. ' +
+    'Set the CORS_ORIGINS environment variable (comma-separated HTTPS origins) ' +
+    'before starting the server, otherwise all browser requests will be rejected.'
+  );
+  process.exit(1);
+}
+
 const safePath = (url: string | undefined) => (url || '').split('?')[0];
 
 app.set('trust proxy', 1);
@@ -109,7 +123,10 @@ app.use(
     referrerPolicy: { policy: 'no-referrer' },
   })
 );
-app.use(express.json());
+// Capture raw body via express.json verify callback — safe, doesn't consume the stream twice
+app.use(express.json({
+  verify: (req: any, _res, buf) => { req.rawBody = buf; },
+}));
 app.use(cookieParser());
 app.use((req, res, next) => {
   const headerRequestId = req.header('x-request-id');
@@ -219,6 +236,8 @@ app.use('/api/inpatient', inpatientRouter);
 app.use('/api/nursing', nursingRouter);
 app.use('/api/pharmacy', pharmacyRouter);
 app.use('/api/sync', syncRouter);
+app.use('/api/hew', hewRouter);
+app.use('/api/sms', smsRouter);
 
 
 const clinicRegistrationSchema = z.object({

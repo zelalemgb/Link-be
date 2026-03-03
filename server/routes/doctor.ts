@@ -7,6 +7,7 @@ import {
   doctorVisitHistorySaveSchema,
   saveDoctorVisitHistory,
 } from '../services/doctorVisitHistoryService';
+import { cdssEvaluateRequestSchema, evaluateCdss } from '../services/cdssService';
 
 const router = Router();
 router.use(requireUser, requireScopedUser);
@@ -116,6 +117,30 @@ router.post('/visits/:id/history', async (req, res) => {
       500,
       'CONFLICT_DOCTOR_HISTORY_SAVE_FAILED',
       error?.message || 'Failed to save doctor visit history'
+    );
+  }
+});
+
+router.post('/cdss/evaluate', async (req, res) => {
+  const parsed = cdssEvaluateRequestSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    return sendContractError(
+      res,
+      400,
+      'VALIDATION_INVALID_CDSS_PAYLOAD',
+      parsed.error.issues[0]?.message || 'Invalid CDSS evaluation payload'
+    );
+  }
+
+  try {
+    const result = await evaluateCdss(parsed.data);
+    return res.json(result);
+  } catch (error: any) {
+    return sendContractError(
+      res,
+      500,
+      'CONFLICT_CDSS_EVALUATION_FAILED',
+      error?.message || 'Failed to evaluate CDSS rules'
     );
   }
 });
@@ -621,6 +646,336 @@ router.get('/inpatients', async (req, res) => {
   } catch (error: any) {
     console.error('Doctor inpatients error:', error?.message || error);
     return res.status(500).json({ error: error.message || 'Failed to fetch doctor inpatients' });
+  }
+});
+
+// ─── HYPOTHESIS: pre-consultation clinical picture ───────────────────────────
+// Maps triage vitals + patient data → CDSS → a pre-formed hypothesis card.
+// Called the moment a visit enters the `with_doctor` stage so the health
+// worker sees a clinical picture before the consultation begins.
+
+const PATHWAY_DRUG_KEYWORDS: Record<string, string[]> = {
+  fever: ['artemether', 'lumefantrine', 'artemisinin', 'rdt', 'malaria', 'paracetamol', 'acetaminophen', 'antipyretic'],
+  respiratory: ['amoxicillin', 'azithromycin', 'salbutamol', 'prednisolone', 'oxygen', 'bronchodilator'],
+  maternal: ['oxytocin', 'magnesium', 'methyldopa', 'labetalol', 'misoprostol', 'iron', 'folate'],
+  pediatric: ['amoxicillin', 'zinc', 'ors', 'rehydration', 'paracetamol', 'vitamin'],
+  cardiac: ['aspirin', 'atenolol', 'amlodipine', 'furosemide', 'captopril'],
+  default: ['paracetamol', 'amoxicillin', 'metronidazole', 'ors'],
+};
+
+const resolvePathwayKeys = (cohort: string, hardStops: any[], warnings: any[], chiefComplaint: string): string[] => {
+  const keys = new Set<string>();
+  const text = [chiefComplaint, ...hardStops.map((h: any) => h.message), ...warnings.map((w: any) => w.message)]
+    .join(' ')
+    .toLowerCase();
+
+  if (cohort === 'maternal') keys.add('maternal');
+  if (cohort === 'pediatric') keys.add('pediatric');
+  if (/fever|malaria|temperature|febrile/.test(text)) keys.add('fever');
+  if (/breath|respir|oxygen|cough|chest|spo2/.test(text)) keys.add('respiratory');
+  if (/heart|cardiac|chest pain|bp|hypertens/.test(text)) keys.add('cardiac');
+  if (keys.size === 0) keys.add('default');
+  return Array.from(keys);
+};
+
+router.get('/visits/:id/hypothesis', async (req, res) => {
+  const visitIdResult = visitIdParamSchema.safeParse(req.params.id);
+  if (!visitIdResult.success) {
+    return sendContractError(res, 400, 'VALIDATION_INVALID_VISIT_ID', 'Visit id must be a valid UUID');
+  }
+
+  const { facilityId } = req.user!;
+  if (!facilityId) return res.status(400).json({ error: 'Missing facility context' });
+
+  try {
+    // 1. Fetch visit with patient + vitals
+    const { data: visit, error: visitError } = await supabaseAdmin
+      .from('visits_with_current_stage')
+      .select(`
+        id,
+        patient_id,
+        reason,
+        visit_notes,
+        triage_urgency,
+        triage_triggers,
+        temperature,
+        blood_pressure,
+        heart_rate,
+        respiratory_rate,
+        oxygen_saturation,
+        weight,
+        pain_score,
+        patients (
+          id,
+          full_name,
+          age,
+          gender
+        )
+      `)
+      .eq('id', visitIdResult.data)
+      .eq('facility_id', facilityId)
+      .single();
+
+    if (visitError || !visit) {
+      return sendContractError(res, 404, 'NOT_FOUND_VISIT', 'Visit not found');
+    }
+
+    const patient = (visit as any).patients as any;
+    const ageYears = patient?.age ?? null;
+    const sex = patient?.gender ?? null;
+    const chiefComplaint = (visit as any).reason || (visit as any).visit_notes || '';
+
+    // 2. Build CDSS input from triage data
+    const cdssInput = {
+      checkpoint: 'triage' as const,
+      patient: { ageYears, sex, pregnant: null },
+      vitals: {
+        temperature: (visit as any).temperature ?? null,
+        bloodPressure: (visit as any).blood_pressure ?? null,
+        heartRate: (visit as any).heart_rate ?? null,
+        respiratoryRate: (visit as any).respiratory_rate ?? null,
+        oxygenSaturation: (visit as any).oxygen_saturation ?? null,
+        weightKg: (visit as any).weight ?? null,
+      },
+      symptoms: (visit as any).triage_triggers || [],
+      chiefComplaint,
+      clinicalNotes: (visit as any).visit_notes || null,
+      diagnosis: null,
+      pendingOrders: [],
+      acknowledgeOutstandingOrders: false,
+      includeAiAdvisory: false,
+    };
+
+    // 3. Run CDSS
+    const cdssResult = await evaluateCdss(cdssInput);
+
+    // 4. Determine drug pathway and fetch relevant stock
+    const pathwayKeys = resolvePathwayKeys(
+      cdssResult.cohort,
+      cdssResult.hardStops,
+      cdssResult.warnings,
+      chiefComplaint
+    );
+    const drugKeywords = [...new Set(pathwayKeys.flatMap((k) => PATHWAY_DRUG_KEYWORDS[k] || []))];
+
+    const stockPromises = drugKeywords.slice(0, 8).map((keyword) =>
+      supabaseAdmin
+        .from('inventory_items')
+        .select('id, name, generic_name, current_quantity, reorder_level, dosage_form, strength')
+        .eq('facility_id', facilityId)
+        .eq('is_active', true)
+        .ilike('name', `%${keyword}%`)
+        .limit(2)
+    );
+
+    const stockResults = await Promise.all(stockPromises);
+    const seenIds = new Set<string>();
+    const relevantStock = stockResults
+      .flatMap((r) => r.data || [])
+      .filter((item: any) => {
+        if (seenIds.has(item.id)) return false;
+        seenIds.add(item.id);
+        return true;
+      })
+      .slice(0, 8)
+      .map((item: any) => {
+        const qty = item.current_quantity ?? 0;
+        const reorder = item.reorder_level ?? 0;
+        const status: 'in_stock' | 'low_stock' | 'out_of_stock' =
+          qty <= 0 ? 'out_of_stock' : qty <= reorder ? 'low_stock' : 'in_stock';
+        return {
+          id: item.id,
+          name: item.name,
+          genericName: item.generic_name,
+          dosageForm: item.dosage_form,
+          strength: item.strength,
+          currentQuantity: qty,
+          status,
+        };
+      });
+
+    return res.json({
+      visitId: visitIdResult.data,
+      patient: {
+        name: patient?.full_name,
+        age: ageYears,
+        gender: sex,
+      },
+      chiefComplaint,
+      triageUrgency: (visit as any).triage_urgency,
+      cdss: {
+        cohort: cdssResult.cohort,
+        hardStops: cdssResult.hardStops,
+        warnings: cdssResult.warnings,
+        recommendations: cdssResult.recommendations,
+        referral: cdssResult.referral,
+        briefSummary: cdssResult.briefSummary,
+      },
+      pathwayKeys,
+      relevantStock,
+    });
+  } catch (error: any) {
+    console.error('Hypothesis error:', error?.message || error);
+    return sendContractError(res, 500, 'CONFLICT_HYPOTHESIS_FAILED', error?.message || 'Failed to generate hypothesis');
+  }
+});
+
+// ─── DEBRIEF: post-consultation skill-building summary ───────────────────────
+// After the consultation closes, this surfaces a quiet comparison between
+// what the clinician did and what the protocol expected — not as a score,
+// but as a learning moment.
+
+router.get('/visits/:id/debrief', async (req, res) => {
+  const visitIdResult = visitIdParamSchema.safeParse(req.params.id);
+  if (!visitIdResult.success) {
+    return sendContractError(res, 400, 'VALIDATION_INVALID_VISIT_ID', 'Visit id must be a valid UUID');
+  }
+
+  const { facilityId, profileId: clinicianId } = req.user!;
+  if (!facilityId) return res.status(400).json({ error: 'Missing facility context' });
+
+  try {
+    // 1. Fetch visit + patient
+    const { data: visit, error: visitError } = await supabaseAdmin
+      .from('visits')
+      .select(`
+        id,
+        patient_id,
+        reason,
+        visit_notes,
+        triage_urgency,
+        triage_triggers,
+        temperature,
+        blood_pressure,
+        heart_rate,
+        respiratory_rate,
+        oxygen_saturation,
+        weight,
+        created_at,
+        status_updated_at,
+        patients ( id, full_name, age, gender )
+      `)
+      .eq('id', visitIdResult.data)
+      .eq('facility_id', facilityId)
+      .single();
+
+    if (visitError || !visit) {
+      return sendContractError(res, 404, 'NOT_FOUND_VISIT', 'Visit not found');
+    }
+
+    // 2. Fetch doctor visit history (clinical notes + diagnosis)
+    const { data: history } = await supabaseAdmin
+      .from('doctor_visit_histories')
+      .select('chief_complaints, assessment, treatment_plan, diagnosis, created_at, updated_at')
+      .eq('visit_id', visitIdResult.data)
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    // 3. Fetch medication orders placed during this visit
+    const { data: medOrders } = await supabaseAdmin
+      .from('medication_orders')
+      .select('medication_name, generic_name, dosage, route, frequency, status, created_at')
+      .eq('visit_id', visitIdResult.data)
+      .order('created_at', { ascending: true });
+
+    // 4. Re-run CDSS at consult checkpoint with saved data to get protocol expectation
+    const patient = (visit as any).patients as any;
+    const symptoms: string[] = [
+      ...((visit as any).triage_triggers || []),
+      ...((history as any)?.chief_complaints?.flatMap((cc: any) => cc.hpi?.associatedSymptoms || []) || []),
+    ];
+
+    const cdssInput = {
+      checkpoint: 'consult' as const,
+      patient: {
+        ageYears: patient?.age ?? null,
+        sex: patient?.gender ?? null,
+        pregnant: null,
+      },
+      vitals: {
+        temperature: (visit as any).temperature ?? null,
+        bloodPressure: (visit as any).blood_pressure ?? null,
+        heartRate: (visit as any).heart_rate ?? null,
+        respiratoryRate: (visit as any).respiratory_rate ?? null,
+        oxygenSaturation: (visit as any).oxygen_saturation ?? null,
+        weightKg: (visit as any).weight ?? null,
+      },
+      symptoms,
+      chiefComplaint: (visit as any).reason || '',
+      clinicalNotes: (visit as any).visit_notes || null,
+      diagnosis: (history as any)?.diagnosis || null,
+      pendingOrders: [],
+      acknowledgeOutstandingOrders: true,
+      includeAiAdvisory: false,
+    };
+
+    const cdssResult = await evaluateCdss(cdssInput);
+
+    // 5. Build divergence analysis
+    const divergences: Array<{ type: 'missed_recommendation' | 'unaddressed_warning'; description: string }> = [];
+
+    // Check if any hard stops or warnings were present that may not have been addressed
+    cdssResult.hardStops.forEach((stop: any) => {
+      divergences.push({
+        type: 'unaddressed_warning',
+        description: `Protocol hard-stop triggered: ${stop.message}`,
+      });
+    });
+
+    cdssResult.warnings.forEach((warn: any) => {
+      const diagText = ((history as any)?.diagnosis || '').toLowerCase();
+      const notesText = ((history as any)?.treatment_plan || '').toLowerCase();
+      const mentionedInDocs = warn.message.split(' ')
+        .filter((w: string) => w.length > 4)
+        .some((w: string) => diagText.includes(w.toLowerCase()) || notesText.includes(w.toLowerCase()));
+      if (!mentionedInDocs) {
+        divergences.push({
+          type: 'missed_recommendation',
+          description: warn.message,
+        });
+      }
+    });
+
+    // 6. Compute duration
+    const startTime = new Date((visit as any).created_at).getTime();
+    const endTime = (visit as any).status_updated_at
+      ? new Date((visit as any).status_updated_at).getTime()
+      : Date.now();
+    const durationMinutes = Math.round((endTime - startTime) / 60000);
+
+    const verdict: 'correct' | 'partial' | 'review' =
+      divergences.length === 0 ? 'correct' : divergences.length <= 2 ? 'partial' : 'review';
+
+    return res.json({
+      visitId: visitIdResult.data,
+      patient: { name: patient?.full_name, age: patient?.age, gender: patient?.gender },
+      durationMinutes,
+      verdict,
+      divergences,
+      cdssExpectation: {
+        cohort: cdssResult.cohort,
+        hardStops: cdssResult.hardStops,
+        warnings: cdssResult.warnings,
+        recommendations: cdssResult.recommendations,
+        briefSummary: cdssResult.briefSummary,
+      },
+      medicationsPrescribed: (medOrders || []).map((m: any) => ({
+        name: m.medication_name,
+        genericName: m.generic_name,
+        dosage: m.dosage,
+        route: m.route,
+        frequency: m.frequency,
+      })),
+      diagnosis: (history as any)?.diagnosis || null,
+      insights: [
+        cdssResult.briefSummary.text,
+        ...(cdssResult.recommendations.slice(0, 2).map((r: any) => r.text)),
+      ].filter(Boolean),
+    });
+  } catch (error: any) {
+    console.error('Debrief error:', error?.message || error);
+    return sendContractError(res, 500, 'CONFLICT_DEBRIEF_FAILED', error?.message || 'Failed to generate debrief');
   }
 });
 

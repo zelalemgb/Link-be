@@ -1,0 +1,102 @@
+{
+  "version": "2026.02.27",
+  "name": "Ethiopia PHC Hybrid CDSS Baseline",
+  "sources": [
+    "Ethiopian Primary Health Care Clinical Guideline",
+    "Ethiopian IMNCI/IMCI guidance",
+    "WHO emergency and referral red-flag guidance",
+    "General internal medicine danger-sign and referral guidance"
+  ],
+  "thresholds": {
+    "oxygenSaturationCritical": 90,
+    "feverWithNeckStiffnessTemp": 38.5,
+    "maternalSevereBpSystolic": 160,
+    "maternalSevereBpDiastolic": 110,
+    "pediatricDangerRespiratoryRate5to11": 30,
+    "pediatricDangerRespiratoryRate12to14": 25
+  },
+  "requiredVitalsByCheckpoint": {
+    "consult": ["temperature", "bloodPressure", "heartRate", "respiratoryRate"],
+    "route": ["temperature", "bloodPressure", "heartRate", "respiratoryRate"],
+    "admit": ["temperature", "bloodPressure", "heartRate", "respiratoryRate", "oxygenSaturation"],
+    "discharge": ["temperature", "bloodPressure", "heartRate", "respiratoryRate"]
+  },
+  "hardStopRules": [
+    {
+      "id": "CDSS-HS-001",
+      "code": "CDSS_HARD_OXYGEN_SAT_CRITICAL",
+      "message": "Critical hypoxia detected (SpO2 <= 90%). Urgent escalation/referral is required.",
+      "clinicalIntent": "red_flag_referral"
+    },
+    {
+      "id": "CDSS-HS-002",
+      "code": "CDSS_HARD_FEVER_NECK_STIFFNESS",
+      "message": "Fever with neck stiffness suggests possible severe CNS infection. Urgent referral is required.",
+      "clinicalIntent": "red_flag_referral"
+    },
+    {
+      "id": "CDSS-HS-003",
+      "code": "CDSS_HARD_MATERNAL_SEVERE_HYPERTENSION",
+      "message": "Maternal severe hypertension with danger symptoms detected. Emergency referral is required.",
+      "clinicalIntent": "maternal_emergency_referral"
+    },
+    {
+      "id": "CDSS-HS-004",
+      "code": "CDSS_HARD_MATERNAL_BLEEDING",
+      "message": "Pregnancy-related bleeding is a maternal emergency red flag. Urgent referral is required.",
+      "clinicalIntent": "maternal_emergency_referral"
+    },
+    {
+      "id": "CDSS-HS-005",
+      "code": "CDSS_HARD_PEDIATRIC_RESP_DISTRESS",
+      "message": "Pediatric respiratory danger signs detected. Urgent referral is required.",
+      "clinicalIntent": "pediatric_emergency_referral"
+    },
+    {
+      "id": "CDSS-HS-006",
+      "code": "CDSS_HARD_PEDIATRIC_WEIGHT_REQUIRED",
+      "message": "Pediatric weight is required before final treatment/disposition decisions.",
+      "clinicalIntent": "dosing_safety"
+    },
+    {
+      "id": "CDSS-HS-007",
+      "code": "CDSS_HARD_DIAGNOSIS_REQUIRED_FOR_CLOSURE",
+      "message": "Diagnosis is required before admit/discharge decisions.",
+      "clinicalIntent": "closure_safety"
+    },
+    {
+      "id": "CDSS-HS-008",
+      "code": "CDSS_HARD_PENDING_ORDERS_ACK_REQUIRED",
+      "message": "Outstanding orders exist. Confirm acknowledgment before discharge.",
+      "clinicalIntent": "discharge_safety"
+    }
+  ],
+  "warningRules": [
+    {
+      "id": "CDSS-SW-001",
+      "code": "CDSS_WARN_MISSING_REQUIRED_VITALS",
+      "message": "Some required vitals are missing for this checkpoint.",
+      "clinicalIntent": "data_quality"
+    },
+    {
+      "id": "CDSS-SW-002",
+      "code": "CDSS_WARN_PENDING_ORDERS_ACKNOWLEDGED",
+      "message": "Discharge with pending orders acknowledged. Ensure patient follow-up instructions are clear.",
+      "clinicalIntent": "discharge_safety"
+    }
+  ],
+  "baselineRecommendations": {
+    "adult": [
+      "Use local PHC first-line management and reassess response at follow-up.",
+      "Escalate/referral if red flags persist or worsen."
+    ],
+    "pediatric": [
+      "Use age/weight-adjusted management and reassess early.",
+      "If respiratory distress or danger signs progress, refer urgently."
+    ],
+    "maternal": [
+      "Apply maternal danger-sign screening at every encounter.",
+      "Escalate urgently for severe BP, bleeding, severe headache, visual symptoms, or epigastric pain."
+    ]
+  }
+}
