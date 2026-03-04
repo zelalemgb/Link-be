@@ -1187,4 +1187,147 @@ router.post('/visits/:id/stage', async (req, res) => {
     }
 });
 
+/**
+ * GET /api/patients/:patientId/pre-visit-context
+ * Returns pre-triage SMS context and HEW community notes for a patient.
+ * Used by the clinician mobile app to pre-populate the consultation wizard
+ * before the doctor opens the consult — closing the loop between:
+ *   1. Africa's Talking SMS triage (pre_triage_requests)
+ *   2. HEW community visit notes (community_notes)
+ */
+router.get('/:patientId/pre-visit-context', async (req, res) => {
+    const { patientId } = req.params;
+    const { tenantId, facilityId } = req.user!;
+
+    try {
+        // Fetch patient to get phone (needed for AT phone-match fallback)
+        const { data: patient, error: patientErr } = await supabaseAdmin
+            .from('patients')
+            .select('id, phone')
+            .eq('id', patientId)
+            .eq('facility_id', facilityId)
+            .single();
+
+        if (patientErr || !patient) {
+            return res.status(404).json({ error: 'Patient not found' });
+        }
+
+        // Build pre_triage_requests query: match by linked_patient_id OR from_phone
+        // Only return records not yet linked to a visit (pending intake)
+        let preTriageQuery = supabaseAdmin
+            .from('pre_triage_requests')
+            .select(
+                'id, created_at, from_phone, raw_text, parsed_symptoms, recommended_urgency, ai_summary, linked_patient_id, linked_visit_id, status'
+            )
+            .eq('facility_id', facilityId)
+            .is('linked_visit_id', null)
+            .order('created_at', { ascending: false })
+            .limit(1);
+
+        if (patient.phone) {
+            preTriageQuery = preTriageQuery.or(
+                `linked_patient_id.eq.${patientId},from_phone.eq.${patient.phone}`
+            );
+        } else {
+            preTriageQuery = preTriageQuery.eq('linked_patient_id', patientId);
+        }
+
+        // Community notes: unlinked notes for this patient (from HEW field visits)
+        const communityNotesQuery = supabaseAdmin
+            .from('community_notes')
+            .select(
+                'id, created_at, visit_type, text, danger_signs, follow_up_due, visit_id, hew_user_id'
+            )
+            .eq('patient_id', patientId)
+            .is('visit_id', null)
+            .order('created_at', { ascending: false })
+            .limit(5);
+
+        const [preTriageResult, communityNotesResult] = await Promise.all([
+            preTriageQuery,
+            communityNotesQuery,
+        ]);
+
+        const preTriage = preTriageResult.data?.[0] ?? null;
+        const communityNotes = communityNotesResult.data ?? [];
+
+        return res.json({ preTriage, communityNotes });
+    } catch (error: any) {
+        return res
+            .status(500)
+            .json({ error: error.message || 'Failed to fetch pre-visit context' });
+    }
+});
+
+/**
+ * PATCH /api/patients/:patientId/pre-visit-context/link
+ * Links pre-triage records and HEW community notes to a completed visit.
+ * Called automatically after visitRepo.save() in ConsultReferralOutcomeScreen.
+ */
+router.patch('/:patientId/pre-visit-context/link', async (req, res) => {
+    const { patientId } = req.params;
+    const { tenantId, facilityId, profileId, role } = req.user!;
+    const { visitId, preTiageIds, communityNoteIds } = req.body;
+
+    if (!visitId) return res.status(400).json({ error: 'visitId required' });
+
+    try {
+        const updates: Promise<any>[] = [];
+
+        if (Array.isArray(preTiageIds) && preTiageIds.length > 0) {
+            updates.push(
+                supabaseAdmin
+                    .from('pre_triage_requests')
+                    .update({
+                        linked_patient_id: patientId,
+                        linked_visit_id: visitId,
+                        status: 'linked',
+                    })
+                    .in('id', preTiageIds)
+                    .eq('facility_id', facilityId)
+            );
+        }
+
+        if (Array.isArray(communityNoteIds) && communityNoteIds.length > 0) {
+            updates.push(
+                supabaseAdmin
+                    .from('community_notes')
+                    .update({ visit_id: visitId })
+                    .in('id', communityNoteIds)
+                    .eq('patient_id', patientId)
+            );
+        }
+
+        await Promise.all(updates);
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'link_pre_visit_context',
+                eventType: 'update',
+                entityType: 'visit',
+                entityId: visitId,
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+                metadata: {
+                    preTiage_ids_linked: preTiageIds?.length ?? 0,
+                    community_note_ids_linked: communityNoteIds?.length ?? 0,
+                },
+            });
+        }
+
+        return res.json({ success: true });
+    } catch (error: any) {
+        return res
+            .status(500)
+            .json({ error: error.message || 'Failed to link pre-visit context' });
+    }
+});
+
 export default router;

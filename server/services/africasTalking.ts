@@ -14,8 +14,11 @@ import crypto from 'crypto';
 
 const AT_API_KEY  = process.env.AT_API_KEY ?? '';
 const AT_USERNAME = process.env.AT_USERNAME ?? 'sandbox';
-const AT_SENDER   = process.env.AT_SENDER_ID ?? 'LINK';          // Registered short-code or alphanumeric
-const AT_BASE_URL = 'https://api.africastalking.com/version1/messaging';
+const AT_SENDER   = process.env.AT_SENDER_ID ?? 'LINK';
+const isSandbox   = AT_USERNAME === 'sandbox';
+const AT_BASE_URL = isSandbox
+  ? 'https://api.sandbox.africastalking.com/version1/messaging'
+  : 'https://api.africastalking.com/version1/messaging';
 
 // ─── Signature validation ─────────────────────────────────────────────────────
 
@@ -155,12 +158,18 @@ export async function sendSms({ to, message }: SendSmsOptions): Promise<SendSmsR
     return { success: true, messageId: 'dev-skip' };
   }
 
+  // In sandbox mode use the shortcode as sender so replies appear in the AT simulator.
+  // Alphanumeric sender IDs (e.g. "LINK") are not valid in the sandbox environment.
+  const effectiveSender = isSandbox ? '10727' : AT_SENDER;
+
   const params = new URLSearchParams({
     username: AT_USERNAME,
     to,
     message,
-    ...(AT_SENDER ? { from: AT_SENDER } : {}),
+    ...(effectiveSender ? { from: effectiveSender } : {}),
   });
+
+  console.log(`[AT] Sending SMS to=${to} from=${effectiveSender} sandbox=${isSandbox}`);
 
   const res = await fetch(AT_BASE_URL, {
     method: 'POST',
@@ -174,18 +183,22 @@ export async function sendSms({ to, message }: SendSmsOptions): Promise<SendSmsR
 
   if (!res.ok) {
     const text = await res.text();
-    console.error('[AT] Send SMS failed', res.status, text);
+    console.error('[AT] Send SMS HTTP error', res.status, text);
     return { success: false, error: `AT API error ${res.status}` };
   }
 
   const json = (await res.json()) as any;
+  console.log('[AT] Send SMS response:', JSON.stringify(json));
+
   const recipient = json?.SMSMessageData?.Recipients?.[0];
   const messageId = recipient?.messageId ?? undefined;
   const status    = recipient?.status ?? 'unknown';
 
   if (status !== 'Success') {
+    console.error(`[AT] Recipient status not Success: ${status}`, JSON.stringify(recipient));
     return { success: false, error: `AT delivery status: ${status}` };
   }
 
+  console.log(`[AT] SMS sent successfully messageId=${messageId}`);
   return { success: true, messageId };
 }

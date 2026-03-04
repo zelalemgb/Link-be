@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
-import type { SyncOpType } from '../../shared/contracts/sync';
+import type { SyncOpType, SyncTombstone } from '../../shared/contracts/sync';
+import { applyOpsToDatabase, type NormalizedOp } from './syncApplyService';
 
 export type SyncContractErrorCode =
   | `AUTH_${string}`
@@ -163,7 +164,11 @@ export const ingestSyncPush = async ({
 }): Promise<
   SyncResult<{
     serverTime: string;
-    results: Array<{ opId: string; status: 'ingested' | 'duplicate' }>;
+    results: Array<{
+      opId: string;
+      status: 'ingested' | 'duplicate' | 'conflict';
+      conflictReason?: string;
+    }>;
   }>
 > => {
   try {
@@ -219,7 +224,7 @@ export const ingestSyncPush = async ({
       }
     });
 
-    const results: Array<{ opId: string; status: 'ingested' | 'duplicate' }> = [];
+    const results: Array<{ opId: string; status: 'ingested' | 'duplicate' | 'conflict'; conflictReason?: string }> = [];
     const inserts: Array<{
       tenant_id: string;
       facility_id: string;
@@ -274,6 +279,37 @@ export const ingestSyncPush = async ({
       if (insertError) {
         throw new Error(insertError.message);
       }
+
+      // ── W2-BE-022: Apply newly ingested ops to domain tables (LWW merge) ──
+      const opsToApply: NormalizedOp[] = opsNormalized
+        .filter((op) => results.find((r) => r.opId === op.opId && r.status === 'ingested'))
+        .map((op) => ({
+          opId:            op.opId,
+          entityType:      op.entityType,
+          entityId:        op.entityId,
+          opType:          op.opType,
+          data:            op.data,
+          clientCreatedAt: op.clientCreatedAt,
+        }));
+
+      if (opsToApply.length > 0) {
+        const applyResults = await applyOpsToDatabase(opsToApply, {
+          authUserId: scopedActor.authUserId,
+          tenantId:   scopedActor.tenantId,
+          facilityId: scopedActor.facilityId,
+          role:       scopedActor.role,
+        });
+
+        // Update results with apply outcomes (conflict overrides ingested)
+        for (const ar of applyResults) {
+          const existing = results.find((r) => r.opId === ar.opId);
+          if (existing && ar.status === 'conflict') {
+            existing.status = 'conflict';
+            existing.conflictReason = ar.conflictReason;
+          }
+          // 'skipped' (unknown entity type) stays as 'ingested' — op is in ledger
+        }
+      }
     }
 
     return {
@@ -319,6 +355,7 @@ export const loadSyncPull = async ({
       clientCreatedAt: string;
       serverCreatedAt: string;
     }>;
+    tombstones: SyncTombstone[];
   }>
 > => {
   try {
@@ -394,6 +431,51 @@ export const loadSyncPull = async ({
       };
     });
 
+    // ── Tombstones: entities soft-deleted since cursor ─────────────────────
+    // Derive a wall-clock threshold from the cursor's seq created_at so that
+    // we can join with sync_tombstones.deleted_at (different timeline from seq).
+    let tombstones: SyncTombstone[] = [];
+    try {
+      let tombstoneQuery = supabaseAdmin
+        .from('sync_tombstones')
+        .select('entity_type, entity_id, deleted_at, deleted_revision')
+        .eq('tenant_id', scopedActor.tenantId)
+        .eq('facility_id', facilityId)
+        .order('deleted_revision', { ascending: true })
+        .limit(200);
+
+      // If cursor provided, fetch the wall-clock timestamp of that seq so we can
+      // filter tombstones that arrived after the client's last known sync point.
+      if (typeof cursor === 'number') {
+        const { data: cursorRow } = await supabaseAdmin
+          .from('sync_op_ledger')
+          .select('created_at')
+          .eq('tenant_id', scopedActor.tenantId)
+          .eq('facility_id', facilityId)
+          .eq('seq', cursor)
+          .maybeSingle();
+
+        if (cursorRow?.created_at) {
+          tombstoneQuery = tombstoneQuery.gt('deleted_at', cursorRow.created_at);
+        }
+      }
+
+      const { data: tombstoneRows, error: tombErr } = await tombstoneQuery;
+      if (tombErr) {
+        console.warn('[syncPull] tombstones query failed:', tombErr.message);
+      } else {
+        tombstones = (tombstoneRows || []).map((row: any) => ({
+          entityType:      String(row.entity_type || ''),
+          entityId:        String(row.entity_id || ''),
+          deletedAt:       String(row.deleted_at || ''),
+          deletedRevision: Number(row.deleted_revision || 0),
+        }));
+      }
+    } catch (tombErr: any) {
+      console.warn('[syncPull] tombstones fetch error:', tombErr?.message);
+      // Non-fatal — return empty tombstones array
+    }
+
     return {
       ok: true,
       data: {
@@ -401,6 +483,7 @@ export const loadSyncPull = async ({
         cursor: nextCursor,
         hasMore,
         ops,
+        tombstones,
       },
     };
   } catch (error: any) {

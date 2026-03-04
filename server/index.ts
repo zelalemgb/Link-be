@@ -123,9 +123,14 @@ app.use(
     referrerPolicy: { policy: 'no-referrer' },
   })
 );
-// Capture raw body via express.json verify callback — safe, doesn't consume the stream twice
+// Capture raw body via verify callbacks — needed for AT webhook signature verification
 app.use(express.json({
   verify: (req: any, _res, buf) => { req.rawBody = buf; },
+}));
+// Africa's Talking sends webhooks as application/x-www-form-urlencoded
+app.use(express.urlencoded({
+  extended: true,
+  verify: (req: any, _res, buf) => { req.rawBody = req.rawBody ?? buf; },
 }));
 app.use(cookieParser());
 app.use((req, res, next) => {

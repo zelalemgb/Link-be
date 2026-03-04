@@ -76,19 +76,27 @@ router.post('/inbound', async (req: Request, res: Response) => {
   }
 
   // ── 4. Resolve facility from short-code ───────────────────────────────────
-  // Facilities store their AT short-code in settings->>'at_short_code'
-  // Fall back to a default facility if no match (useful during dev / sandbox)
-  const { data: facilityRow } = await supabaseAdmin
+  // Try to match by at_short_code column first.
+  // In sandbox / dev fall back to the first facility so testing works without config.
+  let { data: facilityRow } = await supabaseAdmin
     .from('facilities')
     .select('id, tenant_id')
-    .filter('settings->>at_short_code', 'eq', shortCode)
+    .eq('at_short_code', shortCode)
     .maybeSingle();
 
   if (!facilityRow) {
-    console.warn(`[SMS] No facility matched short-code ${shortCode} — storing with null facility`);
-    // We still store so nothing is lost; a cron can re-assign later
-    // For now return 200 to avoid AT retries
-    return res.status(200).json({ status: 'unresolved_facility' });
+    console.warn(`[SMS] No facility matched short-code ${shortCode} — falling back to first facility (sandbox mode)`);
+    const { data: fallback } = await supabaseAdmin
+      .from('facilities')
+      .select('id, tenant_id')
+      .limit(1)
+      .maybeSingle();
+
+    if (!fallback) {
+      console.error('[SMS] No facilities found in database — cannot process SMS');
+      return res.status(200).json({ status: 'no_facility' });
+    }
+    facilityRow = fallback;
   }
 
   const { id: facilityId, tenant_id: tenantId } = facilityRow;
