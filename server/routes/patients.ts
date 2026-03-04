@@ -1272,7 +1272,7 @@ router.patch('/:patientId/pre-visit-context/link', async (req, res) => {
     if (!visitId) return res.status(400).json({ error: 'visitId required' });
 
     try {
-        const updates: Promise<any>[] = [];
+        const updates: PromiseLike<any>[] = [];
 
         if (Array.isArray(preTiageIds) && preTiageIds.length > 0) {
             updates.push(
