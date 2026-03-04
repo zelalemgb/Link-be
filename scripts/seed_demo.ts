@@ -5,30 +5,68 @@
  * demo portal at /demo. Idempotent — safe to re-run between demos.
  *
  * What it creates:
- *   - A demo tenant and facility (Kara Kore Health Center)
- *   - 3 demo staff accounts (nurse, doctor, hew) with password: Demo@LinkHC2026
- *   - 1 demo patient: Tigist Alemu (28F)
- *   - 1 pre_triage_requests record (AT SMS intake with urgency=urgent)
- *   - 1 community_notes record (HEW home visit from 7 days ago)
- *   - 1 triage visit with vitals (Temp 38.4°C, SpO2 93%, BP 138/88)
+ *   - Demo facility: Kara Kore Health Center
+ *   - Demo patient: Tigist Alemu (28F)
+ *   - 1 pre_triage_requests record (AT SMS intake, urgency=urgent)
+ *   - 1 community_notes record (HEW home visit, 7 days ago)
+ *   - 1 triage visit + vitals (Temp 38.4°C, SpO2 93%, BP 138/88)
  *
  * Usage:
- *   npx tsx link-be/scripts/seed_demo.ts
- *   npx tsx link-be/scripts/seed_demo.ts --reset   # delete then re-seed
+ *   npx tsx scripts/seed_demo.ts
+ *   npx tsx scripts/seed_demo.ts --reset   # wipe clinical records then re-seed
  *
- * Environment:
- *   Reads from link-be/.env or the shell environment.
- *   Requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.
+ * Environment — reads in this order (first wins):
+ *   1. Shell environment variables
+ *   2. link-be/.env
+ *   3. ../.env.local  (root workspace — where VITE_SUPABASE_URL lives)
+ *
+ * Required variables:
+ *   SUPABASE_URL or VITE_SUPABASE_URL   — your project URL
+ *   SUPABASE_SERVICE_ROLE_KEY           — from Supabase dashboard → Settings → API
+ *
+ * Quick run with explicit values:
+ *   SUPABASE_URL=https://xxx.supabase.co \
+ *   SUPABASE_SERVICE_ROLE_KEY=eyJ... \
+ *   npx tsx scripts/seed_demo.ts
  */
 
-import 'dotenv/config';
+import { config } from 'dotenv';
+import { resolve } from 'path';
 import { createClient } from '@supabase/supabase-js';
 
-const SUPABASE_URL          = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL ?? '';
-const SUPABASE_SERVICE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
+// Load env files — order matters (later files don't override earlier ones)
+config({ path: resolve(__dirname, '../.env') });           // link-be/.env
+config({ path: resolve(__dirname, '../../.env.local') }); // root .env.local (VITE_ vars)
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error('❌  SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set');
+const SUPABASE_URL         = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL ?? '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
+
+// ─── Preflight checks ─────────────────────────────────────────────────────────
+
+if (!SUPABASE_URL || SUPABASE_URL.includes('127.0.0.1') || SUPABASE_URL.includes('localhost')) {
+  console.error(`
+❌  SUPABASE_URL is missing or points to localhost.
+    Set it to your production project URL:
+
+      SUPABASE_URL=https://qxihedrgltophafkuasa.supabase.co \\
+      SUPABASE_SERVICE_ROLE_KEY=eyJ... \\
+      npx tsx scripts/seed_demo.ts
+
+    Or add SUPABASE_URL to link-be/.env
+`);
+  process.exit(1);
+}
+
+if (!SUPABASE_SERVICE_KEY || SUPABASE_SERVICE_KEY === 'test-service-role-key') {
+  console.error(`
+❌  SUPABASE_SERVICE_ROLE_KEY is missing or is still the placeholder value.
+
+    Get the real key from:
+      Supabase Dashboard → your project → Settings → API → service_role key
+
+    Then run:
+      SUPABASE_SERVICE_ROLE_KEY=eyJ... npx tsx scripts/seed_demo.ts
+`);
   process.exit(1);
 }
 
@@ -36,22 +74,16 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 
-// ─── Deterministic IDs (idempotent re-runs) ────────────────────────────────
+// ─── Deterministic IDs (idempotent re-runs) ───────────────────────────────────
 
 const IDS = {
-  tenant:          'demo-tenant-linkhc-001',
-  facility:        'demo-facility-karakore-001',
-  patient:         'demo-patient-tigist-001',
-  preTriage:       'demo-pretriage-001',
-  communityNote:   'demo-community-note-001',
-  triageVisit:     'demo-triage-visit-001',
-  triageVitals:    'demo-triage-vitals-001',
-  userNurse:       'demo-user-nurse-hiwot-001',
-  userDoctor:      'demo-user-doctor-dawit-001',
-  userHew:         'demo-user-hew-birtukan-001',
+  facility:      'demo-facility-karakore-001',
+  patient:       'demo-patient-tigist-001',
+  preTriage:     'demo-pretriage-001',
+  communityNote: 'demo-community-note-001',
+  triageVisit:   'demo-triage-visit-001',
+  triageVitals:  'demo-triage-vitals-001',
 };
-
-const DEMO_PASSWORD = 'Demo@LinkHC2026';
 
 const NOW   = new Date().toISOString();
 const AGO7D = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -61,10 +93,10 @@ const reset = process.argv.includes('--reset');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function upsert(table: string, data: object, idField = 'id') {
+async function upsert(table: string, data: object, conflict = 'id') {
   const { error } = await supabase
     .from(table)
-    .upsert(data, { onConflict: idField, ignoreDuplicates: false });
+    .upsert(data, { onConflict: conflict });
   if (error) {
     console.warn(`  ⚠️  ${table}: ${error.message}`);
   } else {
@@ -73,14 +105,17 @@ async function upsert(table: string, data: object, idField = 'id') {
 }
 
 async function deleteDemo() {
-  console.log('\n🗑️  Removing previous demo data…');
-  await supabase.from('visit_vitals').delete().eq('id', IDS.triageVitals);
-  await supabase.from('visits').delete().eq('id', IDS.triageVisit);
-  await supabase.from('community_notes').delete().eq('id', IDS.communityNote);
-  await supabase.from('pre_triage_requests').delete().eq('id', IDS.preTriage);
-  await supabase.from('patients').delete().eq('id', IDS.patient);
-  // Profiles / facility / tenant — leave unless explicitly clearing
-  console.log('  ✅  Done');
+  console.log('\n🗑️  Removing previous demo clinical records…');
+  for (const [table, id] of [
+    ['visit_vitals',        IDS.triageVitals],
+    ['visits',              IDS.triageVisit],
+    ['community_notes',     IDS.communityNote],
+    ['pre_triage_requests', IDS.preTriage],
+  ] as const) {
+    const { error } = await supabase.from(table).delete().eq('id', id);
+    if (error) console.warn(`  ⚠️  ${table}: ${error.message}`);
+    else       console.log(`  🗑️  ${table}`);
+  }
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────────
@@ -88,61 +123,26 @@ async function deleteDemo() {
 async function main() {
   console.log('\n🌱  LinkHC Demo Seed Script\n');
   console.log(`   Supabase: ${SUPABASE_URL}`);
-  console.log(`   Reset:    ${reset}`);
+  console.log(`   Reset:    ${reset}\n`);
 
-  if (reset) {
-    await deleteDemo();
-  }
+  if (reset) await deleteDemo();
 
-  // 1. Facility (upsert — idempotent)
-  console.log('\n📍  Facility…');
+  // 1. Facility
+  console.log('📍  Facility…');
   await upsert('facilities', {
-    id:           IDS.facility,
-    name:         'Kara Kore Health Center',
-    type:         'health_center',
-    region:       'Amhara',
-    zone:         'North Shewa',
-    woreda:       'Minjar Shenkora',
-    phone:        '+251113456789',
-    is_active:    true,
-    created_at:   NOW,
-    updated_at:   NOW,
+    id:         IDS.facility,
+    name:       'Kara Kore Health Center',
+    type:       'health_center',
+    region:     'Amhara',
+    zone:       'North Shewa',
+    woreda:     'Minjar Shenkora',
+    phone:      '+251113456789',
+    is_active:  true,
+    created_at: NOW,
+    updated_at: NOW,
   });
 
-  // 2. Demo staff profiles
-  console.log('\n👥  Staff profiles…');
-  const staffProfiles = [
-    {
-      id:          IDS.userNurse,
-      full_name:   'Hiwot Girma',
-      email:       'demo.nurse@linkhc.demo',
-      role:        'nurse',
-      facility_id: IDS.facility,
-      is_demo:     true,
-    },
-    {
-      id:          IDS.userDoctor,
-      full_name:   'Dr. Dawit Bekele',
-      email:       'demo.doctor@linkhc.demo',
-      role:        'doctor',
-      facility_id: IDS.facility,
-      is_demo:     true,
-    },
-    {
-      id:          IDS.userHew,
-      full_name:   'Birtukan Tadesse',
-      email:       'demo.hew@linkhc.demo',
-      role:        'health_extension_worker',
-      facility_id: IDS.facility,
-      is_demo:     true,
-    },
-  ];
-
-  for (const profile of staffProfiles) {
-    await upsert('profiles', { ...profile, created_at: NOW, updated_at: NOW });
-  }
-
-  // 3. Patient: Tigist Alemu
+  // 2. Patient: Tigist Alemu
   console.log('\n🧑‍⚕️  Patient: Tigist Alemu…');
   await upsert('patients', {
     id:            IDS.patient,
@@ -156,45 +156,42 @@ async function main() {
     kebele:        'Kebele 05',
     woreda:        'Minjar Shenkora',
     facility_id:   IDS.facility,
-    is_demo:       true,
     created_at:    NOW,
     updated_at:    NOW,
   });
 
-  // 4. Pre-triage request (Africa's Talking SMS intake)
+  // 3. AT SMS pre-triage (3 hours ago, urgency=urgent)
   console.log('\n📱  Pre-triage: AT SMS intake…');
   await upsert('pre_triage_requests', {
     id:                  IDS.preTriage,
     created_at:          AGO3H,
     from_phone:          '+251911000001',
-    raw_text:            'qoqila dukkuba hafuura dhorkaa',   // Oromo: fever, headache, breathing difficulty
+    raw_text:            'qoqila dukkuba hafuura dhorkaa',
     parsed_symptoms:     ['fever', 'headache', 'breathing'],
     recommended_urgency: 'urgent',
-    ai_summary:          'Patient reported fever, headache, and difficulty breathing. Urgency classified as URGENT — recommend same-day clinic visit.',
-    reply_sent:          'Waamuun keessan fudhanne. Dhukkubni keessan ariifachiisaa dha. Har\'a kilinika dhaqaa. (Your symptoms are urgent. Please visit the clinic today.)',
+    ai_summary:          'Patient reported fever, headache, and difficulty breathing. Urgency: URGENT — recommend same-day visit.',
+    reply_sent:          "Har'a kilinika dhaqaa. (Your symptoms are urgent. Please visit the clinic today.)",
     linked_patient_id:   IDS.patient,
     linked_visit_id:     null,
     status:              'pending',
     facility_id:         IDS.facility,
   });
 
-  // 5. HEW community note (7 days ago)
+  // 4. HEW community note (7 days ago)
   console.log('\n🌿  Community note: HEW home visit…');
   await upsert('community_notes', {
     id:            IDS.communityNote,
     created_at:    AGO7D,
     patient_id:    IDS.patient,
-    hew_user_id:   IDS.userHew,
     visit_type:    'home_visit',
-    text:          'Visited Tigist at her home. She complained of persistent cough for 3 days. Observed rapid breathing at rest (approx 24/min). Temp not measured. Advised to visit health center if not improving. Follow-up scheduled in one week.',
+    text:          'Visited Tigist at her home. Persistent cough for 3 days. Observed rapid breathing at rest (~24/min). Advised to visit health center. Follow-up scheduled in one week.',
     danger_signs:  { breathing_problem: true, fever: true },
-    follow_up_due: new Date().toISOString().slice(0, 10), // today
-    visit_id:      null,   // not yet linked to a clinic visit
-    is_demo:       true,
+    follow_up_due: new Date().toISOString().slice(0, 10),
+    visit_id:      null,
   });
 
-  // 6. Triage visit with vitals (recorded by Nurse Hiwot today)
-  console.log('\n🩺  Triage visit + vitals…');
+  // 5. Triage visit
+  console.log('\n🩺  Triage visit…');
   await upsert('visits', {
     id:              IDS.triageVisit,
     patient_id:      IDS.patient,
@@ -204,12 +201,12 @@ async function main() {
     chief_complaint: 'Fever, difficulty breathing',
     status:          'triage_complete',
     notes:           'Triage urgency: urgent\nSpO2 93% — respiratory concern. BP borderline elevated.',
-    provider_id:     IDS.userNurse,
-    is_demo:         true,
     created_at:      NOW,
     updated_at:      NOW,
   });
 
+  // 6. Triage vitals
+  console.log('\n💉  Triage vitals…');
   await upsert('visit_vitals', {
     id:               IDS.triageVitals,
     visit_id:         IDS.triageVisit,
@@ -228,22 +225,22 @@ async function main() {
   });
 
   // ─── Summary ─────────────────────────────────────────────────────────────
+  console.log(`
+✅  Demo seed complete!
 
-  console.log('\n✅  Demo seed complete!\n');
-  console.log('─────────────────────────────────────────────────────');
-  console.log('  Demo patient:   Tigist Alemu  (+251911000001)');
-  console.log('  Facility:       Kara Kore Health Center');
-  console.log('');
-  console.log('  Demo accounts (password: Demo@LinkHC2026)');
-  console.log('  ├─ Nurse:   demo.nurse@linkhc.demo');
-  console.log('  ├─ Doctor:  demo.doctor@linkhc.demo');
-  console.log('  └─ HEW:     demo.hew@linkhc.demo');
-  console.log('');
-  console.log('  Pre-seeded:');
-  console.log('  ├─ AT SMS pre-triage  (3h ago, urgency=urgent)');
-  console.log('  ├─ HEW community note (7 days ago, breathing concern)');
-  console.log('  └─ Triage vitals      (SpO2 93%, Temp 38.4°C, BP 138/88)');
-  console.log('─────────────────────────────────────────────────────\n');
+─────────────────────────────────────────────────────────
+  Supabase:     ${SUPABASE_URL}
+  Demo patient: Tigist Alemu  (+251911000001)
+  Facility:     Kara Kore Health Center
+
+  Pre-seeded:
+  ├─ AT SMS pre-triage  (3h ago, urgency=urgent)
+  ├─ HEW community note (7 days ago, breathing + fever flags)
+  └─ Triage vitals      (SpO2 93%, Temp 38.4°C, BP 138/88)
+
+  Live demo URL: https://linkhc.org/demo  (after deploy)
+─────────────────────────────────────────────────────────
+`);
 }
 
 main().catch((err) => {
