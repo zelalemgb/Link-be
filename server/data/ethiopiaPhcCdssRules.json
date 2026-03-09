@@ -1,21 +1,46 @@
 {
-  "version": "2026.02.27",
-  "name": "Ethiopia PHC Hybrid CDSS Baseline",
+  "version": "2026.03.06",
+  "name": "Ethiopia PHC Comprehensive CDSS — Evidence-Based Clinical Rules",
   "sources": [
-    "Ethiopian Primary Health Care Clinical Guideline",
-    "Ethiopian IMNCI/IMCI guidance",
-    "WHO emergency and referral red-flag guidance",
-    "General internal medicine danger-sign and referral guidance"
+    "Ethiopian Primary Health Care Clinical Guideline (MoH 2020)",
+    "Ethiopian Standard Treatment Guidelines for General Hospitals (MoH 2020)",
+    "Ethiopian IMNCI/IMCI Integrated Management of Childhood Illness Protocol",
+    "Ethiopian National Tuberculosis, Leprosy and HIV Control Programme Guidelines (2022)",
+    "Ethiopian HIV Testing and Treatment Guideline — Test-and-Treat Protocol",
+    "Ethiopian PMTCT Programme Guidelines (MoH 2021)",
+    "Ethiopian Community Management of Acute Malnutrition (CMAM) Protocol",
+    "Ethiopian Obstetrics and Gynaecology Guideline — Maternal Danger Signs",
+    "Ethiopian NCD Prevention and Control Guideline (Hypertension, Diabetes)",
+    "Ethiopian Antimicrobial Stewardship National Action Plan",
+    "WHO Emergency and Referral Red-Flag Guidance",
+    "WHO mhGAP Intervention Guide v2.0",
+    "WHO IMNCI Chart Booklet (Adapted for Ethiopian Context)"
   ],
   "thresholds": {
     "oxygenSaturationCritical": 90,
+    "oxygenSaturationWarning": 94,
     "feverWithNeckStiffnessTemp": 38.5,
+    "adultFeverThresholdC": 37.5,
+    "pediatricFeverThresholdC": 37.5,
     "maternalSevereBpSystolic": 160,
     "maternalSevereBpDiastolic": 110,
+    "maternalPreeclampsiaSpSystolic": 140,
+    "maternalPreeclampsiaDiastolic": 90,
     "pediatricDangerRespiratoryRate5to11": 30,
-    "pediatricDangerRespiratoryRate12to14": 25
+    "pediatricDangerRespiratoryRate12to14": 25,
+    "adultTachypnoeaThreshold": 30,
+    "adultTachycardiaThreshold": 100,
+    "hyperBpSystolicEmergency": 180,
+    "hyperBpDiastolicEmergency": 120,
+    "hyperBpSystolicWarning": 140,
+    "hyperBpDiastolicWarning": 90,
+    "muacSamThresholdMm": 115,
+    "muacMamThresholdMm": 125,
+    "neonatalAgeMonths": 1,
+    "pediatricAgeYearsMax": 15
   },
   "requiredVitalsByCheckpoint": {
+    "triage": ["temperature", "heartRate", "respiratoryRate"],
     "consult": ["temperature", "bloodPressure", "heartRate", "respiratoryRate"],
     "route": ["temperature", "bloodPressure", "heartRate", "respiratoryRate"],
     "admit": ["temperature", "bloodPressure", "heartRate", "respiratoryRate", "oxygenSaturation"],
@@ -25,78 +50,288 @@
     {
       "id": "CDSS-HS-001",
       "code": "CDSS_HARD_OXYGEN_SAT_CRITICAL",
-      "message": "Critical hypoxia detected (SpO2 <= 90%). Urgent escalation/referral is required.",
+      "message": "Critical hypoxia (SpO2 ≤90%). Give high-flow oxygen 10–15 L/min immediately. Identify underlying cause. Arrange urgent escalation or referral to hospital with oxygen therapy.",
       "clinicalIntent": "red_flag_referral"
     },
     {
       "id": "CDSS-HS-002",
       "code": "CDSS_HARD_FEVER_NECK_STIFFNESS",
-      "message": "Fever with neck stiffness suggests possible severe CNS infection. Urgent referral is required.",
+      "message": "Fever with neck stiffness — bacterial meningitis until proven otherwise. Give IV/IM ceftriaxone 2g (adult) or 100mg/kg (child) as pre-referral treatment. Emergency transfer to hospital immediately.",
       "clinicalIntent": "red_flag_referral"
     },
     {
       "id": "CDSS-HS-003",
       "code": "CDSS_HARD_MATERNAL_SEVERE_HYPERTENSION",
-      "message": "Maternal severe hypertension with danger symptoms detected. Emergency referral is required.",
+      "message": "Severe hypertension in pregnancy (BP ≥160/110) with danger signs — severe pre-eclampsia. Administer MgSO4 loading dose (4g IV over 20 min + 10g IM) and antihypertensive (nifedipine 10mg oral). Emergency obstetric referral.",
       "clinicalIntent": "maternal_emergency_referral"
     },
     {
       "id": "CDSS-HS-004",
       "code": "CDSS_HARD_MATERNAL_BLEEDING",
-      "message": "Pregnancy-related bleeding is a maternal emergency red flag. Urgent referral is required.",
+      "message": "Pregnancy-related vaginal bleeding — antepartum haemorrhage. Do NOT perform vaginal examination. Establish IV access, give IV fluids. Emergency obstetric referral immediately — every minute counts.",
       "clinicalIntent": "maternal_emergency_referral"
     },
     {
       "id": "CDSS-HS-005",
       "code": "CDSS_HARD_PEDIATRIC_RESP_DISTRESS",
-      "message": "Pediatric respiratory danger signs detected. Urgent referral is required.",
+      "message": "Paediatric respiratory danger signs (chest indrawing, stridor, cyanosis, lethargy, convulsions, or unable to drink). Classify as severe pneumonia or very severe febrile disease. Give pre-referral amoxicillin + oxygen. Refer urgently.",
       "clinicalIntent": "pediatric_emergency_referral"
     },
     {
       "id": "CDSS-HS-006",
       "code": "CDSS_HARD_PEDIATRIC_WEIGHT_REQUIRED",
-      "message": "Pediatric weight is required before final treatment/disposition decisions.",
+      "message": "Paediatric weight is required before dosing, treatment routing, or discharge decisions can be made. Weigh the child before proceeding.",
       "clinicalIntent": "dosing_safety"
     },
     {
       "id": "CDSS-HS-007",
       "code": "CDSS_HARD_DIAGNOSIS_REQUIRED_FOR_CLOSURE",
-      "message": "Diagnosis is required before admit/discharge decisions.",
+      "message": "A working diagnosis must be recorded before admit or discharge decisions can be finalised.",
       "clinicalIntent": "closure_safety"
     },
     {
       "id": "CDSS-HS-008",
       "code": "CDSS_HARD_PENDING_ORDERS_ACK_REQUIRED",
-      "message": "Outstanding orders exist. Confirm acknowledgment before discharge.",
+      "message": "Outstanding orders exist. Review and acknowledge all pending orders before discharging the patient.",
       "clinicalIntent": "discharge_safety"
+    },
+    {
+      "id": "CDSS-HS-009",
+      "code": "CDSS_HARD_SEVERE_MALARIA",
+      "message": "Severe malaria danger signs detected (convulsions, impaired consciousness, inability to drink, severe vomiting, prostration, jaundice, or dark urine). IV artesunate is first-line. If IV unavailable, give rectal artesunate pre-referral. Emergency transfer.",
+      "clinicalIntent": "red_flag_referral"
+    },
+    {
+      "id": "CDSS-HS-010",
+      "code": "CDSS_HARD_HEMOPTYSIS_TB",
+      "message": "Haemoptysis detected. Apply infection control immediately: mask patient, separate from waiting area. Urgent evaluation for TB and other causes. Refer to hospital with Xpert MTB/RIF and chest X-ray capability.",
+      "clinicalIntent": "infection_control_referral"
+    },
+    {
+      "id": "CDSS-HS-011",
+      "code": "CDSS_HARD_MATERNAL_ECLAMPSIA",
+      "message": "Convulsion in a pregnant patient — eclampsia until proven otherwise. Protect airway. Administer MgSO4 4g IV over 20 min + 10g IM loading dose. Emergency obstetric transfer with IV access maintained.",
+      "clinicalIntent": "maternal_emergency_referral"
+    },
+    {
+      "id": "CDSS-HS-012",
+      "code": "CDSS_HARD_MATERNAL_PPH",
+      "message": "Postpartum haemorrhage (blood loss >500mL or clinical shock signs). Apply bimanual uterine compression. Give oxytocin 10 IU IM/IV + IV fluid resuscitation. Emergency obstetric transfer if not at CEmONC facility.",
+      "clinicalIntent": "maternal_emergency_referral"
+    },
+    {
+      "id": "CDSS-HS-013",
+      "code": "CDSS_HARD_PEDIATRIC_SAM_COMPLICATIONS",
+      "message": "Severe Acute Malnutrition with medical complication (infection, severe anaemia, oedema, poor appetite). Refer immediately to inpatient therapeutic feeding unit (TFU/SC). Do not manage as outpatient.",
+      "clinicalIntent": "pediatric_emergency_referral"
+    },
+    {
+      "id": "CDSS-HS-014",
+      "code": "CDSS_HARD_SEVERE_DEHYDRATION",
+      "message": "Severe dehydration (lethargic or unconscious, sunken eyes, skin pinch very slow, unable to drink). Start IV Ringer's Lactate 100mL/kg immediately (Plan C). If IV not possible, refer urgently with ORS via NGT.",
+      "clinicalIntent": "red_flag_referral"
+    },
+    {
+      "id": "CDSS-HS-015",
+      "code": "CDSS_HARD_NEONATAL_DANGER",
+      "message": "Neonatal danger signs present (not feeding/breastfeeding, convulsions, fast or difficult breathing, jaundice in first 24 hours, hypothermia, bulging fontanelle, or severe skin infection). Stabilise: warmth, airway, glucose. Emergency neonatal unit referral.",
+      "clinicalIntent": "neonatal_emergency_referral"
+    },
+    {
+      "id": "CDSS-HS-016",
+      "code": "CDSS_HARD_HYPERTENSIVE_EMERGENCY",
+      "message": "Hypertensive emergency (BP ≥180/120 with end-organ symptoms: chest pain, confusion, focal weakness, visual change, pulmonary oedema). Start IV labetalol or oral nifedipine 10mg. ECG. Emergency referral to hospital with ICU.",
+      "clinicalIntent": "red_flag_referral"
+    },
+    {
+      "id": "CDSS-HS-017",
+      "code": "CDSS_HARD_ANAPHYLAXIS",
+      "message": "Anaphylaxis (urticaria + hypotension/airway compromise/wheeze after exposure). Administer epinephrine 0.5mg IM (adult) or 0.01mg/kg IM (child, max 0.5mg) into outer thigh immediately. Lay supine, legs elevated. IV access. Emergency transfer.",
+      "clinicalIntent": "red_flag_referral"
+    },
+    {
+      "id": "CDSS-HS-018",
+      "code": "CDSS_HARD_SEPSIS_SUSPECTED",
+      "message": "Sepsis criteria met (fever/hypothermia + tachycardia + tachypnoea with a confirmed infection source). Blood cultures if available. IV ceftriaxone 2g within 1 hour. IV fluid 30mL/kg bolus. Urgent referral to hospital.",
+      "clinicalIntent": "red_flag_referral"
     }
   ],
   "warningRules": [
     {
       "id": "CDSS-SW-001",
       "code": "CDSS_WARN_MISSING_REQUIRED_VITALS",
-      "message": "Some required vitals are missing for this checkpoint.",
+      "message": "Required vital signs are missing for this checkpoint. Complete all vitals before making clinical decisions.",
       "clinicalIntent": "data_quality"
     },
     {
       "id": "CDSS-SW-002",
       "code": "CDSS_WARN_PENDING_ORDERS_ACKNOWLEDGED",
-      "message": "Discharge with pending orders acknowledged. Ensure patient follow-up instructions are clear.",
+      "message": "Discharge with pending orders acknowledged. Give patient clear return-if-worsening instructions and document follow-up plan.",
       "clinicalIntent": "discharge_safety"
+    },
+    {
+      "id": "CDSS-SW-003",
+      "code": "CDSS_WARN_MALARIA_RDT_POSITIVE",
+      "message": "Positive malaria RDT. Prescribe first-line ACT (Artemether-Lumefantrine) per weight/age dosing chart. Counsel patient on completing the full 3-day course and to return immediately if danger signs appear.",
+      "clinicalIntent": "treatment_protocol"
+    },
+    {
+      "id": "CDSS-SW-004",
+      "code": "CDSS_WARN_MALARIA_IN_PREGNANCY",
+      "message": "Malaria in pregnancy requires careful choice of treatment. AL is safe from the second trimester. Use quinine 600mg TDS + clindamycin 300mg TDS for 7 days in the first trimester. Confirm gestational age before prescribing.",
+      "clinicalIntent": "treatment_protocol"
+    },
+    {
+      "id": "CDSS-SW-005",
+      "code": "CDSS_WARN_TB_SCREENING_INDICATED",
+      "message": "TB screening indicated (prolonged cough plus systemic symptoms). Request sputum Xpert MTB/RIF. Apply infection control: mask patient, use separate ventilated waiting area. Document TB household contacts.",
+      "clinicalIntent": "screening_protocol"
+    },
+    {
+      "id": "CDSS-SW-006",
+      "code": "CDSS_WARN_TB_CONTACT",
+      "message": "Known TB contact. Screen for active TB disease with Xpert and CXR. If active TB excluded, assess IPT eligibility (all HIV-positive contacts, and children under 5 in household) — give isoniazid 5mg/kg daily × 6 months.",
+      "clinicalIntent": "screening_protocol"
+    },
+    {
+      "id": "CDSS-SW-007",
+      "code": "CDSS_WARN_HIV_TEST_INDICATED",
+      "message": "Clinical features suggestive of HIV (recurrent infections, oral thrush, herpes zoster, unexplained weight loss/wasting, or generalised lymphadenopathy). Offer HIV rapid test with counselling per HCT/PITC protocol.",
+      "clinicalIntent": "screening_protocol"
+    },
+    {
+      "id": "CDSS-SW-008",
+      "code": "CDSS_WARN_HIV_ART_ADHERENCE",
+      "message": "Patient on ART: review adherence, most recent viral load and CD4 count. Screen for TB co-infection and opportunistic infections at every visit. Refill supply to maintain uninterrupted ART.",
+      "clinicalIntent": "chronic_disease_management"
+    },
+    {
+      "id": "CDSS-SW-009",
+      "code": "CDSS_WARN_SAM_DETECTED",
+      "message": "Severe Acute Malnutrition without complications (MUAC <11.5cm, no oedema, good appetite). Eligible for Outpatient Therapeutic Programme (OTP). Dispense RUTF, de-worm, give amoxicillin prophylaxis and Vitamin A. Schedule weekly follow-up.",
+      "clinicalIntent": "treatment_protocol"
+    },
+    {
+      "id": "CDSS-SW-010",
+      "code": "CDSS_WARN_MAM_DETECTED",
+      "message": "Moderate Acute Malnutrition (MUAC 11.5–12.5cm). Refer to Supplementary Feeding Programme (SFP). Treat any underlying illness. Monthly weight and MUAC follow-up. Nutrition counselling for caregiver.",
+      "clinicalIntent": "treatment_protocol"
+    },
+    {
+      "id": "CDSS-SW-011",
+      "code": "CDSS_WARN_ANEMIA_SUSPECTED",
+      "message": "Clinical anaemia signs (pale conjunctiva, palms, or tongue). Check haemoglobin or haematocrit. Severe anaemia (Hb <7g/dL) requires urgent management and possible transfusion. Identify and treat underlying cause.",
+      "clinicalIntent": "investigation_required"
+    },
+    {
+      "id": "CDSS-SW-012",
+      "code": "CDSS_WARN_PREECLAMPSIA_MILD",
+      "message": "Elevated BP in pregnancy (140–159/90–109). Perform dipstick urinalysis for proteinuria. Increase ANC monitoring frequency. Consider low-dose aspirin 75–150mg if <20 weeks. Refer promptly if BP worsens or symptoms develop.",
+      "clinicalIntent": "maternal_monitoring"
+    },
+    {
+      "id": "CDSS-SW-013",
+      "code": "CDSS_WARN_PMTCT_HIV_TEST",
+      "message": "HIV status not documented for this pregnancy. Offer HIV and syphilis test at the first ANC visit per PMTCT Option B+ protocol. If HIV-positive: initiate ART immediately regardless of CD4 count.",
+      "clinicalIntent": "screening_protocol"
+    },
+    {
+      "id": "CDSS-SW-014",
+      "code": "CDSS_WARN_ANTENATAL_IRON_FOLATE",
+      "message": "Iron and folic acid supplementation not documented for this pregnancy. Prescribe daily iron-folate (60mg elemental iron + 400mcg folic acid) throughout pregnancy and continuing 3 months postpartum.",
+      "clinicalIntent": "treatment_protocol"
+    },
+    {
+      "id": "CDSS-SW-015",
+      "code": "CDSS_WARN_PNEUMONIA_FAST_BREATHING",
+      "message": "Fast breathing with fever or cough — classify pneumonia per IMNCI. Treat with amoxicillin (weight-based). Reassess at 48 hours. Refer if not improving, if chest indrawing develops, or if oxygen saturation falls.",
+      "clinicalIntent": "treatment_protocol"
+    },
+    {
+      "id": "CDSS-SW-016",
+      "code": "CDSS_WARN_ASTHMA_SUSPECTED",
+      "message": "Wheeze or recurrent breathing difficulty — assess for asthma. For acute attack: salbutamol MDI 4–8 puffs + spacer every 20 min × 3 doses. Add prednisolone 1mg/kg if moderate or severe. Refer if no response after 1 hour.",
+      "clinicalIntent": "treatment_protocol"
+    },
+    {
+      "id": "CDSS-SW-017",
+      "code": "CDSS_WARN_DEHYDRATION_MODERATE",
+      "message": "Moderate dehydration with diarrhoea. Give ORS 75mL/kg over 4 hours (Plan B). Zinc 10mg/day (age <6m) or 20mg/day (age ≥6m) for 10 days in children. Continue feeding and breastfeeding. Reassess every hour.",
+      "clinicalIntent": "treatment_protocol"
+    },
+    {
+      "id": "CDSS-SW-018",
+      "code": "CDSS_WARN_HYPERTENSION_UNCONTROLLED",
+      "message": "Elevated blood pressure. Confirm on repeat reading after 15 min rest. Initiate or optimise antihypertensive (amlodipine 5mg or HCTZ 12.5–25mg as first-line). Lifestyle counselling. Follow-up in 2–4 weeks.",
+      "clinicalIntent": "chronic_disease_management"
+    },
+    {
+      "id": "CDSS-SW-019",
+      "code": "CDSS_WARN_MENTAL_HEALTH_SCREENING",
+      "message": "Mental health concern identified. Apply mhGAP assessment. Assess suicide risk — do not leave high-risk patient alone. Involve caregiver/family. Haloperidol per mhGAP for acute psychosis. Refer if beyond PHC management capacity.",
+      "clinicalIntent": "mental_health_protocol"
+    },
+    {
+      "id": "CDSS-SW-020",
+      "code": "CDSS_WARN_ANTIBIOTIC_STEWARDSHIP",
+      "message": "Broad-spectrum antibiotic considered. Apply stewardship: confirm bacterial infection, use narrowest effective agent per Ethiopia STG, document indication and intended duration. Avoid fluoroquinolones as first-line for common URTI/community infections.",
+      "clinicalIntent": "antibiotic_stewardship"
+    },
+    {
+      "id": "CDSS-SW-021",
+      "code": "CDSS_WARN_OXY_SAT_BORDERLINE",
+      "message": "Borderline oxygen saturation (91–94%). Monitor closely. Administer supplemental oxygen if symptomatic or if SpO2 remains below 94%. Identify and address the cause. Consider referral if not improving within 30 minutes.",
+      "clinicalIntent": "monitoring_required"
+    },
+    {
+      "id": "CDSS-SW-022",
+      "code": "CDSS_WARN_DIABETES_HYPERGLYCEMIA",
+      "message": "Elevated blood glucose or known diabetes documented. Check fasting/random glucose. Optimise glycaemic control. Screen for complications (diabetic foot, retinopathy, nephropathy). Lifestyle counselling on diet and activity.",
+      "clinicalIntent": "chronic_disease_management"
+    },
+    {
+      "id": "CDSS-SW-023",
+      "code": "CDSS_WARN_DRUG_ALLERGY_CHECK",
+      "message": "Patient has a documented drug allergy. Review all prescribed medications against the allergy list before dispensing. Document any new adverse drug reactions encountered.",
+      "clinicalIntent": "medication_safety"
+    },
+    {
+      "id": "CDSS-SW-024",
+      "code": "CDSS_WARN_MALARIA_SUSPECT_NO_RDT",
+      "message": "Febrile illness in a malaria-endemic area without confirmed RDT or microscopy result. Do not treat empirically with ACT without diagnostic confirmation per Ethiopia malaria elimination guidelines.",
+      "clinicalIntent": "diagnostic_protocol"
     }
   ],
   "baselineRecommendations": {
     "adult": [
-      "Use local PHC first-line management and reassess response at follow-up.",
-      "Escalate/referral if red flags persist or worsen."
+      "Complete a full history and physical examination before prescribing. Document all findings.",
+      "Assess for the five highest-burden conditions at Ethiopian PHC: malaria, respiratory tract infection, diarrhoeal disease, tuberculosis, and HIV/AIDS — at every encounter where clinically relevant.",
+      "Record all required vital signs at each checkpoint. Blood pressure and temperature are mandatory from consult onwards.",
+      "Apply antibiotic stewardship: only prescribe antibiotics when bacterial infection is confirmed or strongly suspected. Document indication and duration.",
+      "Screen for hypertension and diabetes at every adult encounter — BP and random glucose are routine investigations.",
+      "Provide patient education on medication adherence, nutrition, and clear return-if-worsening instructions at every discharge.",
+      "Document any known drug allergies and cross-check against all prescribed medications before dispensing.",
+      "Use the standard referral pathway for any condition beyond PHC management capacity — complete the referral form with a clinical summary and pre-referral treatment given."
     ],
     "pediatric": [
-      "Use age/weight-adjusted management and reassess early.",
-      "If respiratory distress or danger signs progress, refer urgently."
+      "Begin every paediatric encounter with the IMNCI danger sign assessment: unconscious/lethargic, convulsions, unable to drink/breastfeed, vomiting everything.",
+      "Check vaccination status at every visit and update per the Expanded Programme on Immunisation (EPI) schedule.",
+      "Measure and record weight, MUAC, and height at every encounter. Plot on the WHO growth chart.",
+      "For any child with fever: perform malaria RDT and assess respiratory rate for pneumonia classification and hydration status for dehydration classification.",
+      "Always use weight-based dosing for all paediatric medications. Confirm weight before prescribing.",
+      "For any child with IMNCI danger signs: administer pre-referral treatment and arrange immediate transfer with a written referral form.",
+      "Vitamin A supplementation: every 6 months for children 6–59 months. Document dose and date in child health card.",
+      "Screen for acute malnutrition at every visit: MUAC, bilateral pitting oedema, and conduct appetite test if SAM is suspected."
     ],
     "maternal": [
-      "Apply maternal danger-sign screening at every encounter.",
-      "Escalate urgently for severe BP, bleeding, severe headache, visual symptoms, or epigastric pain."
+      "Screen for maternal danger signs at every ANC and postnatal encounter: severe headache, visual disturbance, epigastric pain, heavy vaginal bleeding, reduced fetal movement, and convulsions.",
+      "At first ANC: document HIV status, PMTCT enrolment, syphilis test result, iron-folate dispensing, blood group, and gestational age. Repeat at each subsequent visit.",
+      "Blood pressure is mandatory at every maternal encounter. Any BP ≥140/90 requires urinalysis for proteinuria and increased monitoring.",
+      "Document gestational age by LMP and fundal height at each ANC visit. Target the 8-visit ANC model per Ethiopia RMNCH guidelines.",
+      "For every delivery: apply Active Management of Third Stage of Labour (AMTSL) — oxytocin 10 IU IM, controlled cord traction, and uterine massage — to reduce PPH risk.",
+      "Refer all high-risk pregnancies to CEmONC facility in advance: previous caesarean section, twin pregnancy, severe anaemia, malpresentation, pre-eclampsia, or previous PPH history.",
+      "Postnatal care within 24–48 hours: support breastfeeding initiation, cord care, neonatal danger sign counselling, maternal complication check, and family planning counselling.",
+      "Screen all pregnant women for syphilis and offer PMTCT HIV testing. If positive: initiate ART immediately (Option B+) and plan for safe delivery and infant prophylaxis."
     ]
   }
 }

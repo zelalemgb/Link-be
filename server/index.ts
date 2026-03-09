@@ -11,6 +11,7 @@ import crypto from 'crypto';
 // Config & Middleware
 import { supabaseAdmin } from './config/supabase';
 import { requireUser, superAdminGuard } from './middleware/auth';
+import { csrfProtection } from './middleware/csrf';
 
 // Routes
 import authRouter from './routes/auth';
@@ -36,6 +37,10 @@ import pharmacyRouter from './routes/pharmacy';
 import syncRouter from './routes/sync';
 import hewRouter from './routes/hew';
 import smsRouter from './routes/sms';
+import subscriptionRouter from './routes/subscription';
+import webhookRouter from './routes/webhook';
+import agentRouter from './routes/agent';
+import { subscriptionGuard } from './middleware/subscriptionGuard';
 import { recordResponseStatus } from './services/monitoring';
 
 export const app = express();
@@ -133,6 +138,7 @@ app.use(express.urlencoded({
   verify: (req: any, _res, buf) => { req.rawBody = req.rawBody ?? buf; },
 }));
 app.use(cookieParser());
+app.use(csrfProtection);
 app.use((req, res, next) => {
   const headerRequestId = req.header('x-request-id');
   const requestId = headerRequestId?.trim() || crypto.randomUUID();
@@ -219,8 +225,25 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
+// Rate limiters for authentication routes
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  limit: 15, // 15 attempts per 15 minutes
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Please try again later.' },
+  keyGenerator: (req) => req.ip || req.header('x-forwarded-for') || 'unknown',
+});
+
+const patientAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  message: { error: 'Too many login attempts. Please try again later.' },
+  keyGenerator: (req) => req.ip || req.header('x-forwarded-for') || 'unknown',
+});
+
 // Mount Routes
-app.use('/api/auth', authRouter);
+app.use('/api/auth', authLimiter, authRouter);
 app.use('/api/master-data', masterDataRouter);
 app.use('/api/patients', patientsRouter);
 app.use('/api/staff', staffRouter);
@@ -229,7 +252,7 @@ app.use('/api/inventory', inventoryRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/reception', receptionRouter);
 app.use('/api/orders', ordersRouter);
-app.use('/api/patient-auth', patientAuthRouter);
+app.use('/api/patient-auth', patientAuthLimiter, patientAuthRouter);
 app.use('/api/patient-portal', patientPortalRouter);
 app.use('/api/monitoring', monitoringRouter);
 app.use('/api/facilities', facilitiesRouter);
@@ -243,6 +266,13 @@ app.use('/api/pharmacy', pharmacyRouter);
 app.use('/api/sync', syncRouter);
 app.use('/api/hew', hewRouter);
 app.use('/api/sms', smsRouter);
+// ── Subscription, billing and licensing ────────────────────────────────────
+app.use('/api/subscription', subscriptionRouter);
+app.use('/api/webhook', webhookRouter);      // Chapa + Stripe webhooks (no auth)
+app.use('/api/agent', agentRouter);          // Regional agent portal
+// Subscription enforcement — must be registered AFTER auth routes
+// and AFTER /api/subscription, /api/webhook, /api/agent (which handle their own auth)
+app.use(subscriptionGuard);
 
 
 const clinicRegistrationSchema = z.object({

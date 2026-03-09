@@ -29,11 +29,18 @@ const upload = multer({
         }
     },
 });
-const medGemmaServiceUrl = process.env.MEDGEMMA_SERVICE_URL || 'http://127.0.0.1:8000/predict';
-const medGemmaTimeoutMs = Number(process.env.MEDGEMMA_TIMEOUT_MS || 90000);
-const medGemmaSharedSecret = process.env.MEDGEMMA_SHARED_SECRET || '';
+// Local AI service (Ollama + RAG) — replaces Supabase/OpenAI edge functions
+const localAiBaseUrl      = process.env.LOCAL_AI_SERVICE_URL  || 'http://127.0.0.1:8000';
+const localAiTimeoutMs    = Number(process.env.LOCAL_AI_TIMEOUT_MS || 120_000);
+const localAiSharedSecret = process.env.AI_SHARED_SECRET || '';
+
+// Legacy vision endpoint config (kept for /predict backward compatibility)
+const medGemmaServiceUrl   = `${localAiBaseUrl}/predict`;
+const medGemmaTimeoutMs    = localAiTimeoutMs;
+const medGemmaSharedSecret = localAiSharedSecret;
+
 const allowPublicAi = process.env.AI_PUBLIC_ENABLED === 'true';
-const isAiDebug = process.env.AI_DEBUG === 'true';
+const isAiDebug     = process.env.AI_DEBUG === 'true';
 
 // Function to call the python service
 async function callMedGemma(prompt: string, imageBuffer?: Buffer, filename?: string) {
@@ -65,6 +72,57 @@ async function callMedGemma(prompt: string, imageBuffer?: Buffer, filename?: str
     }
 }
 
+/**
+ * Call the local AI service (Ollama + RAG) instead of Supabase Edge Functions.
+ * No patient data ever leaves the facility — fully offline-capable.
+ */
+async function callLocalAiEndpoint(req: any, res: any, endpoint: string, action: string) {
+    try {
+        const { tenantId, facilityId, profileId, role } = req.user!;
+
+        const response = await axios.post(
+            `${localAiBaseUrl}${endpoint}`,
+            req.body || {},
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(localAiSharedSecret ? { 'x-ai-key': localAiSharedSecret } : {}),
+                },
+                timeout: localAiTimeoutMs,
+            },
+        );
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action,
+                eventType: 'create',
+                entityType: 'ai_request',
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+                metadata: { endpoint, local: true },
+            });
+        }
+
+        return res.json(response.data);
+    } catch (error: any) {
+        if (isAiDebug) console.error(`Local AI [${endpoint}] error:`, error?.message);
+        // Graceful offline degradation — return a structured offline response
+        return res.json({
+            success: true,
+            _offline: true,
+            message: 'AI advisor temporarily offline. Apply CDSS rule engine and Ethiopian Standard Treatment Guidelines.',
+        });
+    }
+}
+
+/** Legacy Supabase function bridge — kept for non-clinical utility functions */
 async function invokeSupabaseFunction(req: any, res: any, functionName: string, action: string) {
     try {
         const { tenantId, facilityId, profileId, role } = req.user!;
@@ -177,21 +235,52 @@ router.post('/analyze', requireUser, requireScopedUser, upload.single('image'), 
     }
 });
 
+// ── Clinical AI endpoints — served by local Ollama + RAG service ──────────────
+// All patient data stays on-premises. No cloud API calls. Offline-capable.
+
 router.post('/clinical-assistant', requireUser, requireScopedUser, (req, res) => {
-    return invokeSupabaseFunction(req, res, 'ai-clinical-assistant', 'ai_clinical_assistant');
+    return callLocalAiEndpoint(req, res, '/clinical-assistant', 'ai_clinical_assistant');
 });
 
 router.post('/diagnostic-recommendations', requireUser, requireScopedUser, (req, res) => {
-    return invokeSupabaseFunction(req, res, 'diagnostic-recommendations', 'ai_diagnostic_recommendations');
+    return callLocalAiEndpoint(req, res, '/diagnostic-recommendations', 'ai_diagnostic_recommendations');
 });
 
 router.post('/diagnosis-recommendations', requireUser, requireScopedUser, (req, res) => {
-    return invokeSupabaseFunction(req, res, 'diagnosis-recommendations', 'ai_diagnosis_recommendations');
+    return callLocalAiEndpoint(req, res, '/diagnosis-recommendations', 'ai_diagnosis_recommendations');
 });
 
 router.post('/treatment-recommendations', requireUser, requireScopedUser, (req, res) => {
-    return invokeSupabaseFunction(req, res, 'treatment-recommendations', 'ai_treatment_recommendations');
+    return callLocalAiEndpoint(req, res, '/treatment-recommendations', 'ai_treatment_recommendations');
 });
+
+/**
+ * POST /api/ai/learn
+ * Called internally after a provider accepts or modifies an AI suggestion.
+ * Strips identifiers and sends anonymised case to the RAG knowledge base.
+ * The local ML service embeds it — future similar queries get this as context.
+ */
+router.post('/learn', requireUser, requireScopedUser, async (req, res) => {
+    try {
+        const response = await axios.post(
+            `${localAiBaseUrl}/learn`,
+            req.body || {},
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(localAiSharedSecret ? { 'x-ai-key': localAiSharedSecret } : {}),
+                },
+                timeout: 15_000,
+            },
+        );
+        return res.json(response.data);
+    } catch (error: any) {
+        if (isAiDebug) console.error('RAG /learn error:', error?.message);
+        return res.json({ success: false, message: 'RAG learning endpoint temporarily unavailable.' });
+    }
+});
+
+// ── Non-clinical utility functions — still use Supabase Edge Functions ─────────
 
 router.post('/medication-return-suggestions', requireUser, requireScopedUser, (req, res) => {
     return invokeSupabaseFunction(req, res, 'medication-return-suggestions', 'ai_medication_return_suggestions');

@@ -6,6 +6,56 @@ import type { AuthUser } from './auth';
 const sendContractError = (res: Response, status: number, code: string, message: string) =>
   res.status(status).json({ code, message });
 
+// In-memory LRU cache for user profiles (60-second TTL, max 500 entries)
+interface CacheEntry {
+  profile: any;
+  expiresAt: number;
+}
+
+class UserProfileCache {
+  private cache: Map<string, CacheEntry> = new Map();
+  private readonly ttlMs = 60 * 1000; // 60 seconds
+  private readonly maxEntries = 500;
+
+  get(authUserId: string): any | null {
+    const entry = this.cache.get(authUserId);
+    if (!entry) return null;
+
+    // Check if expired
+    if (Date.now() > entry.expiresAt) {
+      this.cache.delete(authUserId);
+      return null;
+    }
+
+    return entry.profile;
+  }
+
+  set(authUserId: string, profile: any): void {
+    // Evict oldest entry if at capacity
+    if (this.cache.size >= this.maxEntries) {
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey) this.cache.delete(firstKey);
+    }
+
+    this.cache.set(authUserId, {
+      profile,
+      expiresAt: Date.now() + this.ttlMs,
+    });
+  }
+
+  // Lazily evict expired entries
+  cleanup(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if (now > entry.expiresAt) {
+        this.cache.delete(key);
+      }
+    }
+  }
+}
+
+const userProfileCache = new UserProfileCache();
+
 export const requireSyncUser = async (req: Request, res: Response, next: NextFunction) => {
   const authHeader = req.header('authorization') || '';
   const token = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7) : undefined;
@@ -23,19 +73,38 @@ export const requireSyncUser = async (req: Request, res: Response, next: NextFun
     }
 
     const authUserId = data.user.id;
-    const { data: profile, error: profileErr } = await supabaseAdmin
-      .from('users')
-      .select('id, tenant_id, facility_id, user_role')
-      .eq('auth_user_id', authUserId)
-      .limit(1)
-      .maybeSingle();
 
-    if (profileErr) {
-      throw new Error(profileErr.message);
+    // Check cache first
+    let profile = userProfileCache.get(authUserId);
+
+    // If not in cache, fetch user profile to get role and facility context
+    if (!profile) {
+      const { data: fetchedProfile, error: profileErr } = await supabaseAdmin
+        .from('users')
+        .select('id, tenant_id, facility_id, user_role')
+        .eq('auth_user_id', authUserId)
+        .limit(1)
+        .maybeSingle();
+
+      if (profileErr) {
+        throw new Error(profileErr.message);
+      }
+
+      profile = fetchedProfile;
+
+      // Cache the profile if found
+      if (profile) {
+        userProfileCache.set(authUserId, profile);
+      }
     }
 
     if (!profile) {
       return sendContractError(res, 403, 'PERM_MISSING_USER_PROFILE', 'Missing user profile');
+    }
+
+    // Periodically clean up expired cache entries
+    if (Math.random() < 0.01) {
+      userProfileCache.cleanup();
     }
 
     const resolved: AuthUser = {

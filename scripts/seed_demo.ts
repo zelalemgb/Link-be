@@ -77,13 +77,17 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 // ─── Deterministic IDs (idempotent re-runs) ───────────────────────────────────
 
 const IDS = {
-  facility:      'demo-facility-karakore-001',
+  facility:      'demo-facility-zelalem-001',
   patient:       'demo-patient-tigist-001',
   preTriage:     'demo-pretriage-001',
   communityNote: 'demo-community-note-001',
   triageVisit:   'demo-triage-visit-001',
   triageVitals:  'demo-triage-vitals-001',
 };
+
+// Africa's Talking short-code registered to Zelalem Hospital
+// In AT sandbox this is the default shortcode; update for production
+const AT_SHORT_CODE = process.env.AT_SHORT_CODE ?? '10727';
 
 const NOW   = new Date().toISOString();
 const AGO7D = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -127,19 +131,20 @@ async function main() {
 
   if (reset) await deleteDemo();
 
-  // 1. Facility
+  // 1. Facility — Zelalem Hospital (tagged to AT short-code for SMS intake)
   console.log('📍  Facility…');
   await upsert('facilities', {
-    id:         IDS.facility,
-    name:       'Kara Kore Health Center',
-    type:       'health_center',
-    region:     'Amhara',
-    zone:       'North Shewa',
-    woreda:     'Minjar Shenkora',
-    phone:      '+251113456789',
-    is_active:  true,
-    created_at: NOW,
-    updated_at: NOW,
+    id:            IDS.facility,
+    name:          'Zelalem Hospital',
+    type:          'hospital',
+    region:        'Addis Ababa',
+    zone:          'Addis Ababa',
+    woreda:        'Kirkos',
+    phone:         '+251113456789',
+    at_short_code: AT_SHORT_CODE,
+    is_active:     true,
+    created_at:    NOW,
+    updated_at:    NOW,
   });
 
   // 2. Patient: Tigist Alemu
@@ -160,17 +165,20 @@ async function main() {
     updated_at:    NOW,
   });
 
-  // 3. AT SMS pre-triage (3 hours ago, urgency=urgent)
+  // 3. AT SMS pre-triage (3 hours ago, urgency=urgent, routed via at_short_code)
   console.log('\n📱  Pre-triage: AT SMS intake…');
   await upsert('pre_triage_requests', {
     id:                  IDS.preTriage,
     created_at:          AGO3H,
     from_phone:          '+251911000001',
+    to_short_code:       AT_SHORT_CODE,
     raw_text:            'qoqila dukkuba hafuura dhorkaa',
     parsed_symptoms:     ['fever', 'headache', 'breathing'],
     recommended_urgency: 'urgent',
     ai_summary:          'Patient reported fever, headache, and difficulty breathing. Urgency: URGENT — recommend same-day visit.',
-    reply_sent:          "Har'a kilinika dhaqaa. (Your symptoms are urgent. Please visit the clinic today.)",
+    reply_text:          "Har'a hospitaalaa dhaqaa. Mallattooleen kee hatattamaa mirkaneessa. (Your symptoms are urgent. Please come to Zelalem Hospital today.)",
+    reply_sent:          true,
+    reply_sent_at:       new Date(Date.now() - 3 * 60 * 60 * 1000 + 15000).toISOString(),
     linked_patient_id:   IDS.patient,
     linked_visit_id:     null,
     status:              'pending',
@@ -231,10 +239,10 @@ async function main() {
 ─────────────────────────────────────────────────────────
   Supabase:     ${SUPABASE_URL}
   Demo patient: Tigist Alemu  (+251911000001)
-  Facility:     Kara Kore Health Center
+  Facility:     Zelalem Hospital (AT short-code: ${AT_SHORT_CODE})
 
   Pre-seeded:
-  ├─ AT SMS pre-triage  (3h ago, urgency=urgent)
+  ├─ AT SMS pre-triage  (3h ago, urgency=urgent, short-code ${AT_SHORT_CODE})
   ├─ HEW community note (7 days ago, breathing + fever flags)
   └─ Triage vitals      (SpO2 93%, Temp 38.4°C, BP 138/88)
 

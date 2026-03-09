@@ -2,6 +2,7 @@ import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { supabaseAdmin } from '../config/supabase';
 import { requirePatientSession } from '../middleware/patient-auth';
+import { responseCache } from '../middleware/cache';
 import { recordAuditEvent } from '../services/audit-log';
 
 const router = Router();
@@ -16,7 +17,7 @@ const patientPortalLimiter = rateLimit({
  * GET /api/mobile/patient/active-visit
  * Get the active visit for the authenticated patient
  */
-router.get('/patient/active-visit', patientPortalLimiter, async (req, res) => {
+router.get('/patient/active-visit', patientPortalLimiter, responseCache(15), async (req, res) => {
     const { patientAccountId, tenantId } = req.patient!;
 
     try {
@@ -139,7 +140,7 @@ router.get('/patient/active-visit', patientPortalLimiter, async (req, res) => {
  * GET /api/mobile/patient/stats
  * Get dashboard statistics for the authenticated patient
  */
-router.get('/patient/stats', patientPortalLimiter, async (req, res) => {
+router.get('/patient/stats', patientPortalLimiter, responseCache(30), async (req, res) => {
     const { patientAccountId, tenantId } = req.patient!;
 
     try {
@@ -165,30 +166,17 @@ router.get('/patient/stats', patientPortalLimiter, async (req, res) => {
 
         const patientIds = patientRows.map((patient) => patient.id);
 
-        // Get total visits
-        let totalVisitQuery = supabaseAdmin
-            .from('visits')
-            .select('id', { count: 'exact', head: true })
-            .in('patient_id', patientIds);
-
-        if (tenantId) {
-            totalVisitQuery = totalVisitQuery.eq('tenant_id', tenantId);
-        }
-
-        const { count: totalVisits } = await totalVisitQuery;
-
-        // Get active tasks (unpaid orders)
-        // First get all visit IDs for this patient to use in IN clause
+        // Get all visit IDs and total count in one query
         let patientVisitQuery = supabaseAdmin
             .from('visits')
-            .select('id')
+            .select('id', { count: 'exact' })
             .in('patient_id', patientIds);
 
         if (tenantId) {
             patientVisitQuery = patientVisitQuery.eq('tenant_id', tenantId);
         }
 
-        const { data: patientVisits } = await patientVisitQuery;
+        const { data: patientVisits, count: totalVisits } = await patientVisitQuery;
 
         const visitIds = patientVisits?.map(v => v.id) || [];
 
@@ -261,7 +249,7 @@ router.get('/patient/stats', patientPortalLimiter, async (req, res) => {
  * GET /api/mobile/patient/visit-history
  * Get visit history for the authenticated patient
  */
-router.get('/patient/visit-history', patientPortalLimiter, async (req, res) => {
+router.get('/patient/visit-history', patientPortalLimiter, responseCache(60), async (req, res) => {
     const limit = parseInt(req.query.limit as string) || 10;
     const { patientAccountId, tenantId } = req.patient!;
 
