@@ -359,8 +359,11 @@ const buildHistoryCohortContext = ({
 };
 
 const validateCohortSpecificHistorySafetyRules = (
-  context: HistoryCohortContext
+  context: HistoryCohortContext,
+  action: DoctorHistoryAction = 'save'
 ): DoctorVisitHistoryMutationFailure | null => {
+  // Draft saves skip cohort-specific safety checks so partial work can be persisted.
+  if (action === 'draft') return null;
   if (context.cohort === 'pediatric') {
     if (!(context.weight !== null && context.weight > 0)) {
       return error(
@@ -413,18 +416,22 @@ const validateCohortSpecificHistorySafetyRules = (
   return null;
 };
 
+/**
+ * Validate the minimal set of required history fields.
+ *
+ * Extended details (HS-002…HS-005: duration, associated symptoms, allergies,
+ * medications) are only enforced for non-draft actions.  Draft saves only
+ * require a chief complaint (HS-001) so the doctor can save partial work at
+ * any time without being blocked by incomplete history sections.
+ */
 const validateMinimalHistorySafetyRules = (
-  payload: DoctorVisitHistorySavePayload
+  payload: DoctorVisitHistorySavePayload,
+  action: DoctorHistoryAction = 'save'
 ): DoctorVisitHistoryMutationFailure | null => {
   const firstComplaint = payload.chiefComplaints[0];
   const chiefComplaint = normalizeText(firstComplaint?.complaint);
-  const duration = normalizeText(firstComplaint?.hpi?.duration);
-  const associatedSymptoms = (firstComplaint?.hpi?.associatedSymptoms || [])
-    .map((symptom) => normalizeText(symptom))
-    .filter(Boolean);
-  const allergies = normalizeText(payload.medicalHistory.allergies);
-  const medications = normalizeText(payload.medicalHistory.medications);
 
+  // HS-001 is always required — a chief complaint must exist for any save.
   if (!chiefComplaint) {
     return error(
       400,
@@ -432,6 +439,20 @@ const validateMinimalHistorySafetyRules = (
       'Chief complaint is required before you can continue.'
     );
   }
+
+  // HS-002 through HS-005 are only enforced for non-draft actions.
+  const isDraft = action === 'draft';
+  if (isDraft) {
+    return null;
+  }
+
+  const duration = normalizeText(firstComplaint?.hpi?.duration);
+  const associatedSymptoms = (firstComplaint?.hpi?.associatedSymptoms || [])
+    .map((symptom) => normalizeText(symptom))
+    .filter(Boolean);
+  const allergies = normalizeText(payload.medicalHistory.allergies);
+  const medications = normalizeText(payload.medicalHistory.medications);
+
   if (!duration) {
     return error(
       400,
@@ -775,7 +796,7 @@ export const saveDoctorVisitHistory = async ({
     const scopedActor = actorResult.data;
     const historyAction = normalizeHistoryAction(payload);
 
-    const safetyFailure = validateMinimalHistorySafetyRules(payload);
+    const safetyFailure = validateMinimalHistorySafetyRules(payload, historyAction);
     if (safetyFailure) {
       return safetyFailure;
     }
@@ -828,7 +849,7 @@ export const saveDoctorVisitHistory = async ({
       visitRow,
       patientRow,
     });
-    const cohortValidationFailure = validateCohortSpecificHistorySafetyRules(cohortContext);
+    const cohortValidationFailure = validateCohortSpecificHistorySafetyRules(cohortContext, historyAction);
     if (cohortValidationFailure) {
       return cohortValidationFailure;
     }

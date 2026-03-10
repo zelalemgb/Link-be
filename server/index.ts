@@ -1,4 +1,12 @@
-import 'dotenv/config';
+// Load .env from link-be/ regardless of which directory the process is started from.
+// When launched via `tsx link-be/server/index.ts` from the repo root the CWD is the
+// root, not link-be/, so dotenv/config would silently miss the env file.
+import { config as loadDotenv } from 'dotenv';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = dirname(__filename);
+loadDotenv({ path: resolve(__dirname, '../../.env') });
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';

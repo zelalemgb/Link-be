@@ -979,4 +979,152 @@ router.get('/visits/:id/debrief', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CDSS Background Recommendation Logging
+// ─────────────────────────────────────────────────────────────────────────────
+
+const cdssRecBodySchema = z.object({
+  recommendation_type: z.enum(['diagnosis', 'treatment', 'alert', 'referral']),
+  recommendation_text: z.string().min(1).max(2000),
+  source:             z.string().max(255).optional().nullable(),
+  context_snapshot:   z.record(z.unknown()).optional().nullable(),
+});
+
+const cdssRecResponseSchema = z.object({
+  doctor_response: z.enum(['accepted', 'ignored']),
+  responded_at:    z.string().datetime().optional(),
+});
+
+/** POST /doctor/visits/:visitId/cdss-recommendations
+ *  Log a new background CDSS recommendation shown to the doctor.
+ */
+router.post('/visits/:visitId/cdss-recommendations', async (req, res) => {
+  const visitId = visitIdParamSchema.safeParse(req.params.visitId);
+  if (!visitId.success) {
+    return sendContractError(res, 400, 'VALIDATION_INVALID_VISIT_ID', 'Invalid visit ID');
+  }
+
+  const body = cdssRecBodySchema.safeParse(req.body || {});
+  if (!body.success) {
+    return sendContractError(
+      res, 400, 'VALIDATION_INVALID_CDSS_REC_PAYLOAD',
+      body.error.issues[0]?.message || 'Invalid recommendation payload'
+    );
+  }
+
+  const { tenantId, facilityId, profileId } = req.user!;
+
+  try {
+    // Verify the visit belongs to this facility
+    const { data: visit, error: visitErr } = await supabaseAdmin
+      .from('visits')
+      .select('id, facility_id, tenant_id')
+      .eq('id', visitId.data)
+      .eq('facility_id', facilityId)
+      .single();
+
+    if (visitErr || !visit) {
+      return sendContractError(res, 404, 'NOT_FOUND_VISIT', 'Visit not found');
+    }
+
+    const { data: rec, error: insertErr } = await supabaseAdmin
+      .from('cdss_recommendations')
+      .insert({
+        visit_id:            visitId.data,
+        tenant_id:           tenantId,
+        facility_id:         facilityId,
+        recommendation_type: body.data.recommendation_type,
+        recommendation_text: body.data.recommendation_text,
+        source:              body.data.source ?? null,
+        context_snapshot:    body.data.context_snapshot ?? null,
+        doctor_response:     'pending',
+      })
+      .select('id, created_at')
+      .single();
+
+    if (insertErr || !rec) {
+      console.error('CDSS rec insert error:', insertErr?.message);
+      return sendContractError(res, 500, 'CONFLICT_CDSS_REC_INSERT_FAILED', 'Failed to log recommendation');
+    }
+
+    await recordAuditEvent({
+      action:        'cdss_recommendation_logged',
+      eventType:     'clinical_decision_support',
+      entityType:    'cdss_recommendation',
+      tenantId,
+      facilityId,
+      actorUserId:   profileId,
+      metadata: {
+        visit_id:            visitId.data,
+        recommendation_type: body.data.recommendation_type,
+        rec_id:              rec.id,
+      },
+    });
+
+    return res.status(201).json({ success: true, id: rec.id, created_at: rec.created_at });
+  } catch (error: any) {
+    console.error('CDSS rec log error:', error?.message || error);
+    return sendContractError(res, 500, 'CONFLICT_CDSS_REC_LOG_FAILED', error?.message || 'Failed to log recommendation');
+  }
+});
+
+/** PATCH /doctor/visits/:visitId/cdss-recommendations/:recId
+ *  Record the doctor's response (accepted | ignored) to a logged recommendation.
+ */
+router.patch('/visits/:visitId/cdss-recommendations/:recId', async (req, res) => {
+  const visitId = visitIdParamSchema.safeParse(req.params.visitId);
+  const recId   = visitIdParamSchema.safeParse(req.params.recId);
+  if (!visitId.success || !recId.success) {
+    return sendContractError(res, 400, 'VALIDATION_INVALID_IDS', 'Invalid visit or recommendation ID');
+  }
+
+  const body = cdssRecResponseSchema.safeParse(req.body || {});
+  if (!body.success) {
+    return sendContractError(
+      res, 400, 'VALIDATION_INVALID_CDSS_RESPONSE_PAYLOAD',
+      body.error.issues[0]?.message || 'Invalid response payload'
+    );
+  }
+
+  const { tenantId, facilityId, profileId } = req.user!;
+
+  try {
+    const { data: updated, error: updateErr } = await supabaseAdmin
+      .from('cdss_recommendations')
+      .update({
+        doctor_response: body.data.doctor_response,
+        responded_at:    body.data.responded_at ?? new Date().toISOString(),
+      })
+      .eq('id', recId.data)
+      .eq('visit_id', visitId.data)
+      .eq('facility_id', facilityId)
+      .select('id, doctor_response, responded_at')
+      .single();
+
+    if (updateErr || !updated) {
+      return sendContractError(res, 404, 'NOT_FOUND_CDSS_REC', 'Recommendation not found or already responded');
+    }
+
+    await recordAuditEvent({
+      action:        'cdss_recommendation_responded',
+      eventType:     'clinical_decision_support',
+      entityType:    'cdss_recommendation',
+      tenantId,
+      facilityId,
+      actorUserId:   profileId,
+      metadata: {
+        rec_id:          recId.data,
+        visit_id:        visitId.data,
+        doctor_response: body.data.doctor_response,
+      },
+    });
+
+    return res.json({ success: true, ...updated });
+  } catch (error: any) {
+    console.error('CDSS rec respond error:', error?.message || error);
+    return sendContractError(res, 500, 'CONFLICT_CDSS_REC_RESPOND_FAILED', error?.message || 'Failed to update recommendation');
+  }
+});
+
 export default router;
+

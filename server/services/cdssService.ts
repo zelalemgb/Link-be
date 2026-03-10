@@ -41,6 +41,7 @@ export type CdsEvaluateResult = {
   hardStops: CdsIssue[];
   warnings: CdsIssue[];
   recommendations: CdsRecommendation[];
+  consultationPhase: 'emergency' | 'diagnostic' | 'awaiting_results' | 'interpret_results' | 'treatment';
   referral: {
     required: boolean;
     urgency: ReferralUrgency | null;
@@ -91,6 +92,15 @@ const evaluateSchema = z.object({
   pendingOrders: z.array(z.string()).default([]),
   acknowledgeOutstandingOrders: z.boolean().default(false),
   includeAiAdvisory: z.boolean().default(false),
+  labResults: z.array(z.object({
+    name: z.string(),
+    value: z.string(),
+    referenceRange: z.string().optional().nullable(),
+  })).default([]),
+  imagingResults: z.array(z.object({
+    study: z.string(),
+    findings: z.string(),
+  })).default([]),
 });
 
 export type CdsEvaluateInput = z.infer<typeof evaluateSchema>;
@@ -283,6 +293,257 @@ const maybeBuildAiAdvisory = async (
 
 export const cdssEvaluateRequestSchema = evaluateSchema;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FOCUSED NEXT-STEP ENGINE
+//
+// Instead of running every condition check in parallel and returning whatever
+// happened to fire first, this function maps the current consultation STATE to
+// the SINGLE most important action the doctor should take right now.
+//
+// Logic runs as a priority ladder:
+//   1. Emergency / danger signs  → handled upstream by hard-stops (not here)
+//   2. Results are back          → handled by result-interpretation recs (not here)
+//   3. Working diagnosis set     → recommend the specific treatment protocol
+//   4. Tests ordered, pending    → acknowledge; nothing new to recommend yet
+//   5. No workup started yet     → recommend the ONE key diagnostic test for
+//                                  this chief complaint cluster
+// ─────────────────────────────────────────────────────────────────────────────
+const buildFocusedNextStep = (
+  input: CdsEvaluateInput,
+  mergedContext: string[],
+  cohort: CdsCohort,
+): CdsRecommendation | null => {
+  const ctx = mergedContext;
+
+  // Has a specific test been ordered or resulted already?
+  const testOrdered = (partial: string) =>
+    input.pendingOrders.some(o => o.toLowerCase().includes(partial));
+  const testResulted = (partial: string) =>
+    input.labResults.some(r => r.name.toLowerCase().includes(partial)) ||
+    input.imagingResults.some(r => r.study.toLowerCase().includes(partial));
+  const testDone = (partial: string) => testOrdered(partial) || testResulted(partial);
+
+  const hasDiagnosis = normalizeText(input.diagnosis).length > 0;
+
+  // If results are back or a diagnosis is set we want the result-interpretation
+  // recs (higher priority) to lead. Return null so the pipeline uses them.
+  if (input.labResults.length > 0 || input.imagingResults.length > 0) return null;
+
+  // ── FEVER / FEBRILE ILLNESS ──────────────────────────────────────────────
+  // Malaria is the most common cause of fever in Ethiopia — confirm before
+  // anything else. Do not simultaneously suggest TB screening, anaemia workup, etc.
+  if (containsAny(ctx, ['fever', 'febrile', 'high temperature', 'high grade fever',
+      'chills', 'rigors', 'hot body', 'feeling hot', 'pyrexia'])) {
+    if (!testDone('malaria') && !testDone('rdt') && !testDone('rapid')) {
+      return {
+        text: 'Order Malaria RDT — first-line test for any febrile illness. Do not treat empirically before confirming.',
+        source: 'Ethiopian Malaria Elimination Guidelines / IMNCI',
+      };
+    }
+    if (testOrdered('malaria') || testOrdered('rdt')) {
+      // Ordered but result not back yet — nothing new to recommend
+      return {
+        text: 'Malaria RDT ordered — await result before initiating treatment. Monitor vital signs and danger signs.',
+        source: 'Ethiopian Malaria Elimination Guidelines',
+      };
+    }
+    // Result is back (handled by result-interpretation recs above via null return)
+    return null;
+  }
+
+  // ── COUGH ────────────────────────────────────────────────────────────────
+  if (containsAny(ctx, ['cough', 'productive cough', 'dry cough', 'wet cough',
+      'coughing up', 'chronic cough', 'haemoptysis', 'hemoptysis'])) {
+    const hasProlonged = containsAny(ctx, ['2 week', '>2 week', 'two week', 'chronic',
+        'months', 'persistent cough', 'prolonged cough', 'cough for weeks', 'weeks of cough']);
+    const hasTBSigns  = containsAny(ctx, ['night sweat', 'weight loss', 'wasting',
+        'drenching sweat', 'haemoptysis', 'hemoptysis', 'blood in sputum']);
+    const hasRespDistress = containsAny(ctx, ['fast breathing', 'tachypnoea', 'chest indrawing',
+        'shortness of breath', 'difficulty breathing', 'unable to breathe', 'grunting', 'stridor']);
+
+    // TB screening takes priority over general chest workup
+    if (hasProlonged && hasTBSigns) {
+      if (!testDone('sputum') && !testDone('xpert') && !testDone('afb') && !testDone('mtb')) {
+        return {
+          text: 'Order Sputum Xpert MTB/RIF — cough ≥2 weeks with systemic symptoms meets TB screening criteria. Apply infection control: mask patient, separate waiting area.',
+          source: 'Ethiopian National TB/HIV Guidelines (2022)',
+        };
+      }
+      if (testOrdered('sputum') || testOrdered('xpert')) {
+        return {
+          text: 'Sputum Xpert ordered — await result. Continue infection control precautions. HIV test if status unknown.',
+          source: 'Ethiopian National TB Guidelines (2022)',
+        };
+      }
+      return null;
+    }
+
+    // Acute cough with respiratory distress → CXR
+    if (hasRespDistress && !testDone('chest') && !testDone('cxr')) {
+      return {
+        text: 'Order Chest X-ray — respiratory distress with cough requires imaging to classify pneumonia severity and guide treatment.',
+        source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)',
+      };
+    }
+
+    // Simple acute cough, no red flags, no prior workup → classify by IMNCI
+    if (!hasDiagnosis && !hasRespDistress && !testDone('chest')) {
+      return {
+        text: 'Classify cough severity using IMNCI: count respiratory rate (fast breathing?), assess chest indrawing, SpO2. Order CXR if any of these are present.',
+        source: 'Ethiopian IMNCI',
+      };
+    }
+    return null;
+  }
+
+  // ── DIARRHOEA ────────────────────────────────────────────────────────────
+  if (containsAny(ctx, ['diarrhoea', 'diarrhea', 'loose stool', 'watery stool',
+      'frequent stool', 'loose motions', 'acute gastroenteritis'])) {
+    const hasSevereDehydration = containsAny(ctx, ['unable to drink', 'sunken eyes severe',
+        'very slow skin pinch', 'lethargic', 'unconscious', 'absent radial pulse']);
+    const hasBloodyStool = containsAny(ctx, ['bloody stool', 'blood in stool', 'dysentery',
+        'mucus stool', 'frank blood']);
+
+    if (hasSevereDehydration) {
+      return {
+        text: 'Severe dehydration — start IV Ringer\'s Lactate 100mL/kg immediately (Plan C). Refer if IV access not available.',
+        source: 'WHO / Ethiopian IMNCI Guideline',
+      };
+    }
+    if (hasBloodyStool && !testDone('stool') && !hasDiagnosis) {
+      return {
+        text: 'Order Stool R/E (routine and examination) — bloody diarrhoea requires microscopy to differentiate dysentery (shigella/amoeba) from other causes before antibiotic selection.',
+        source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)',
+      };
+    }
+    if (!hasDiagnosis) {
+      return {
+        text: 'Assess dehydration status (Plan A/B/C). Prescribe ORS if any dehydration. Add zinc 20mg/day × 10 days. Antibiotics only for bloody stool or confirmed cholera.',
+        source: 'WHO / Ethiopian IMNCI Guideline',
+      };
+    }
+    return null;
+  }
+
+  // ── URINARY SYMPTOMS ─────────────────────────────────────────────────────
+  if (containsAny(ctx, ['dysuria', 'burning urine', 'burning micturition', 'urinary frequency',
+      'urinary urgency', 'flank pain', 'loin pain', 'suprapubic pain'])) {
+    if (!testDone('urine') && !testDone('urinalysis') && !testDone('dipstick')) {
+      return {
+        text: 'Order Urine Dipstick (nitrites + leucocytes) — confirms UTI diagnosis and guides antibiotic selection. Send urine C&S if recurrent.',
+        source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)',
+      };
+    }
+    if (testOrdered('urine') || testOrdered('urinalysis')) {
+      return {
+        text: 'Urine dipstick ordered — await result. Ensure adequate fluid intake. Avoid empirical antibiotics until result available.',
+        source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)',
+      };
+    }
+    return null;
+  }
+
+  // ── HEADACHE / HYPERTENSION ──────────────────────────────────────────────
+  if (containsAny(ctx, ['headache', 'head pain', 'severe headache', 'dizziness',
+      'hypertension', 'high blood pressure', 'blurred vision'])) {
+    const bp = parseBloodPressure(input.vitals.bloodPressure || null);
+    if (!bp) {
+      return {
+        text: 'Measure blood pressure — hypertension must be excluded in any patient with headache or dizziness before other workup.',
+        source: 'Ethiopian NCD Guideline',
+      };
+    }
+    // BP is recorded — the condition-specific BP checks (hard-stops/warnings) handle the rest
+    return null;
+  }
+
+  // ── POLYURIA / DIABETES SCREENING ───────────────────────────────────────
+  if (containsAny(ctx, ['polyuria', 'polydipsia', 'excessive thirst', 'frequent urination',
+      'diabetes', 'high blood sugar', 'unexplained weight loss'])) {
+    if (!testDone('glucose') && !testDone('rbs') && !testDone('fbs') && !testDone('blood sugar')
+        && !testDone('hba1c')) {
+      return {
+        text: 'Order Random Blood Sugar (RBS) — polyuria and polydipsia require diabetes confirmation before any treatment is initiated.',
+        source: 'Ethiopian NCD Guideline',
+      };
+    }
+    if (testOrdered('glucose') || testOrdered('rbs') || testOrdered('fbs')) {
+      return {
+        text: 'Blood sugar test ordered — await result. Advise water intake. Do not initiate glucose-lowering therapy before confirming diagnosis.',
+        source: 'Ethiopian NCD Guideline',
+      };
+    }
+    return null;
+  }
+
+  // ── CHEST PAIN ───────────────────────────────────────────────────────────
+  if (containsAny(ctx, ['chest pain', 'central chest pain', 'retrosternal pain',
+      'chest tightness', 'crushing chest', 'radiating arm pain', 'jaw pain cardiac'])) {
+    if (!testDone('ecg') && !testDone('electrocardiogram') && !testDone('ekg')) {
+      return {
+        text: 'Order ECG immediately — chest pain requires ECG to exclude STEMI and life-threatening arrhythmia before other workup.',
+        source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)',
+      };
+    }
+    return null;
+  }
+
+  // ── JAUNDICE ─────────────────────────────────────────────────────────────
+  if (containsAny(ctx, ['jaundice', 'yellow eyes', 'yellow skin', 'icteric',
+      'scleral icterus', 'yellowish'])) {
+    if (!testDone('lft') && !testDone('liver function') && !testDone('bilirubin')
+        && !testDone('hepatitis')) {
+      return {
+        text: 'Order LFT (bilirubin, ALT, AST, ALP) and Hepatitis B surface antigen — jaundice requires hepatic cause confirmation before treatment.',
+        source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)',
+      };
+    }
+    return null;
+  }
+
+  // ── ABDOMINAL PAIN ───────────────────────────────────────────────────────
+  if (containsAny(ctx, ['abdominal pain', 'stomach pain', 'belly pain', 'epigastric pain',
+      'right upper quadrant', 'right iliac fossa', 'periumbilical pain', 'lower abdominal'])) {
+    const hasSurgicalSigns = containsAny(ctx, ['guarding', 'rigidity', 'rebound tenderness',
+        'board-like abdomen', 'acute abdomen']);
+    if (hasSurgicalSigns) {
+      return {
+        text: 'Surgical emergency signs present — order Abdominal Ultrasound + FBC urgently and arrange surgical referral. Do not give opioids before surgical assessment.',
+        source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)',
+      };
+    }
+    if (!testDone('abdomen') && !testDone('ultrasound') && !testDone('abdominal us')) {
+      return {
+        text: 'Order Abdominal Ultrasound — localised or unexplained abdominal pain requires imaging to exclude surgical causes (appendicitis, cholecystitis, obstruction).',
+        source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)',
+      };
+    }
+    return null;
+  }
+
+  // ── MATERNAL / ANC ───────────────────────────────────────────────────────
+  if (cohort === 'maternal') {
+    const hivTested = containsAny(ctx, ['hiv test', 'hiv result', 'hiv positive',
+        'hiv negative', 'pmtct', 'art in pregnancy']);
+    if (!hivTested && !testDone('hiv')) {
+      return {
+        text: 'Offer HIV rapid test — mandatory at first ANC visit per PMTCT Option B+ protocol. Also test for syphilis (RPR/VDRL).',
+        source: 'Ethiopian PMTCT Programme Guidelines (2021)',
+      };
+    }
+    const bpChecked = parseBloodPressure(input.vitals.bloodPressure || null);
+    if (!bpChecked) {
+      return {
+        text: 'Measure blood pressure — mandatory at every ANC visit to screen for pre-eclampsia.',
+        source: 'Ethiopian ANC Guideline / RMNCH',
+      };
+    }
+    return null;
+  }
+
+  return null; // No focused step identified — fall through to condition-specific recs
+};
+
 export const evaluateCdss = async (inputRaw: unknown): Promise<CdsEvaluateResult> => {
   const input = evaluateSchema.parse(inputRaw);
   const checkpoint = input.checkpoint as CdsCheckpoint;
@@ -290,13 +551,34 @@ export const evaluateCdss = async (inputRaw: unknown): Promise<CdsEvaluateResult
 
   const hardStops: CdsIssue[] = [];
   const warnings: CdsIssue[] = [];
-  const recommendations = buildBaselineRecommendations(cohort);
+  // Baseline recs are generic boilerplate — held separately so condition-specific
+  // and result-confirmed recs always take priority in the final output.
+  const baselineRecs = buildBaselineRecommendations(cohort);
+  const recommendations: CdsRecommendation[] = [];
 
   const symptomsNormalized = input.symptoms.map(normalizeSymptom);
   const notesLower = normalizeText(input.clinicalNotes).toLowerCase();
   const complaintLower = normalizeText(input.chiefComplaint).toLowerCase();
   const mergedSymptomContext = [...symptomsNormalized, notesLower, complaintLower];
   const ageYears = input.patient.ageYears ?? null;
+
+  // Inject lab results and imaging findings so all existing containsAny rules
+  // automatically benefit from actual result values (e.g. "rdt positive" → treatment path).
+  if (input.labResults.length > 0) {
+    mergedSymptomContext.push(
+      input.labResults.map(r => `${r.name} ${r.value}`).join(' ').toLowerCase()
+    );
+  }
+  if (input.imagingResults.length > 0) {
+    mergedSymptomContext.push(
+      input.imagingResults.map(r => `${r.study} ${r.findings}`).join(' ').toLowerCase()
+    );
+  }
+  // Set of result names already available — used to suppress redundant "order X" guidance
+  const resultNames = new Set<string>([
+    ...input.labResults.map(r => r.name.toLowerCase()),
+    ...input.imagingResults.map(r => r.study.toLowerCase()),
+  ]);
 
   // Hard-stop 1: critical oxygen saturation.
   if (
@@ -686,6 +968,206 @@ export const evaluateCdss = async (inputRaw: unknown): Promise<CdsEvaluateResult
     pushIssue(warnings, 'CDSS_WARN_DRUG_ALLERGY_CHECK', 'CDSS-SW-023', 'Documented drug allergy. Cross-check all prescriptions against allergy list before dispensing.');
   }
 
+  // Mark split between condition-specific recs (from symptom matching above) and
+  // result-confirmed recs (from actual lab/imaging values below).
+  // Result-confirmed recs have highest priority — they are certain, not suspected.
+  const conditionRecsCount = recommendations.length;
+
+  // ── RESULT INTERPRETATION ────────────────────────────────────────────────
+  // Parse key numerical values and positive/negative flags from actual results.
+  // Generates severity-specific recommendations that symptom text alone cannot.
+  for (const lab of input.labResults) {
+    const nameLower = lab.name.toLowerCase();
+    const valueLower = lab.value.toLowerCase();
+
+    // Haemoglobin — severity-graded anaemia management
+    if (nameLower.includes('hb') || nameLower.includes('hemoglobin') || nameLower.includes('haemoglobin')) {
+      const hbMatch = lab.value.match(/(\d+\.?\d*)/);
+      if (hbMatch) {
+        const hb = parseFloat(hbMatch[1]);
+        if (hb < 7) {
+          pushIssue(hardStops, 'CDSS_RESULT_SEVERE_ANAEMIA', 'CDSS-R-001',
+            `Severe anaemia: Hb ${hb} g/dL. Urgent referral for transfusion evaluation. Give iron + treat underlying cause.`);
+        } else if (hb < 10) {
+          if (!warnings.find(w => w.code === 'CDSS_WARN_ANEMIA_SUSPECTED')) {
+            pushIssue(warnings, 'CDSS_RESULT_MODERATE_ANAEMIA', 'CDSS-R-002',
+              `Moderate anaemia: Hb ${hb} g/dL. Iron supplementation and treat underlying cause. Repeat CBC in 4 weeks.`);
+          }
+          recommendations.push({
+            text: `Moderate anaemia (Hb ${hb} g/dL): ferrous sulfate 200mg TDS for 3 months. Treat underlying cause (malaria/helminth). Dietary counselling. Repeat CBC in 4 weeks.`,
+            source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)'
+          });
+        }
+      }
+    }
+
+    // Blood glucose — hypoglycaemia and hyperglycaemia
+    if (nameLower.includes('glucose') || nameLower.includes('rbs') || nameLower.includes('fbs') || nameLower.includes('blood sugar')) {
+      const glcMatch = lab.value.match(/(\d+\.?\d*)/);
+      if (glcMatch) {
+        const glc = parseFloat(glcMatch[1]);
+        const isMmol = valueLower.includes('mmol');
+        const glcMgDl = isMmol ? glc * 18 : glc;
+        if (glcMgDl < 70) {
+          pushIssue(hardStops, 'CDSS_RESULT_HYPOGLYCAEMIA', 'CDSS-R-003',
+            `Hypoglycaemia: glucose ${lab.value}. Give oral glucose (if conscious) or 50% dextrose 25mL IV. Recheck in 15 minutes.`);
+        } else if (glcMgDl > 400) {
+          pushIssue(hardStops, 'CDSS_RESULT_SEVERE_HYPERGLYCAEMIA', 'CDSS-R-004',
+            `Severe hyperglycaemia: glucose ${lab.value}. Assess for DKA (ketones, pH). IV fluids + insulin protocol. Urgent referral.`);
+        } else if (glcMgDl > 200) {
+          pushIssue(warnings, 'CDSS_RESULT_HYPERGLYCAEMIA', 'CDSS-R-005',
+            `Elevated glucose ${lab.value}. Optimise diabetes management. Check HbA1c if not recently done.`);
+          recommendations.push({
+            text: `Glucose ${lab.value} — optimise DM control: review medications, reinforce dietary adherence. Target FBS <7 mmol/L (126 mg/dL). Consider adding/intensifying insulin if oral agents inadequate.`,
+            source: 'Ethiopian NCD Guideline'
+          });
+        }
+      }
+    }
+
+    // Malaria RDT — P. vivax requires different regimen (primaquine)
+    if ((nameLower.includes('malaria') || nameLower.includes('rdt') || nameLower.includes('rapid malaria')) &&
+        (valueLower.includes('positive') || valueLower.includes('pos') || valueLower.includes('+'))) {
+      if (valueLower.includes('vivax') || valueLower.includes('p.v') || valueLower.includes('pv')) {
+        recommendations.push({
+          text: 'P. vivax confirmed: chloroquine 25mg base/kg over 3 days. Add primaquine 0.25mg/kg/day × 14 days after checking G6PD status. Do not give primaquine in pregnancy.',
+          source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)'
+        });
+      }
+    }
+
+    // Sputum / Xpert — TB confirmed
+    if ((nameLower.includes('sputum') || nameLower.includes('xpert') || nameLower.includes('afb') || nameLower.includes('mtb')) &&
+        (valueLower.includes('positive') || valueLower.includes('detected') || valueLower.includes('reactive'))) {
+      if (!warnings.find(w => w.code === 'CDSS_RESULT_TB_CONFIRMED')) {
+        pushIssue(warnings, 'CDSS_RESULT_TB_CONFIRMED', 'CDSS-R-006',
+          `TB confirmed (${lab.name}: ${lab.value}). Register in TB register. Initiate Category I regimen. Notify household contacts.`);
+        recommendations.push({
+          text: `TB confirmed: initiate 2RHZE/4RH (Category I). Register in TB register. Notify and screen household contacts. HIV test if status unknown. Baseline LFT before rifampicin.`,
+          source: 'Ethiopian National TB Guidelines (2022)'
+        });
+      }
+    }
+
+    // HIV rapid test reactive
+    if ((nameLower.includes('hiv') || nameLower.includes('hiv rapid')) &&
+        (valueLower.includes('positive') || valueLower.includes('reactive'))) {
+      if (!warnings.find(w => w.code === 'CDSS_RESULT_HIV_REACTIVE')) {
+        pushIssue(warnings, 'CDSS_RESULT_HIV_REACTIVE', 'CDSS-R-007',
+          `HIV rapid test reactive. Confirm with WHO serial algorithm. Baseline CD4, WHO staging, screen for TB. Initiate ART same day per Test-and-Treat.`);
+        recommendations.push({
+          text: `HIV reactive: confirm with second rapid test. If confirmed: baseline CD4, WHO staging, screen for TB and OIs. Initiate ART same day — TLE (tenofovir + lamivudine + efavirenz) as preferred first-line. Enrol in ART register.`,
+          source: 'Ethiopian HIV Testing and Treatment Guideline'
+        });
+      }
+    }
+
+    // WBC — leukocytosis / leukopenia
+    if (nameLower.includes('wbc') || nameLower.includes('white blood cell') || nameLower.includes('total wbc')) {
+      const wbcMatch = lab.value.match(/(\d+\.?\d*)/);
+      if (wbcMatch) {
+        const raw = parseFloat(wbcMatch[1]);
+        // Normalise to 10³/μL — values >200 are likely absolute counts
+        const wbcK = raw > 200 ? raw / 1000 : raw;
+        if (wbcK > 30) {
+          pushIssue(warnings, 'CDSS_RESULT_MARKED_LEUKOCYTOSIS', 'CDSS-R-008',
+            `Marked leukocytosis: WBC ${lab.value}. Consider severe bacterial infection or haematological malignancy. Blood film and urgent review.`);
+        } else if (wbcK > 12) {
+          pushIssue(warnings, 'CDSS_RESULT_LEUKOCYTOSIS', 'CDSS-R-009',
+            `Leukocytosis: WBC ${lab.value}. Correlates with bacterial infection or physiological stress. Treat underlying cause.`);
+        } else if (wbcK < 3) {
+          pushIssue(warnings, 'CDSS_RESULT_LEUKOPENIA', 'CDSS-R-010',
+            `Leukopenia: WBC ${lab.value}. Evaluate for viral infection (HIV, dengue), drug effect, or haematological disorder.`);
+        }
+      }
+    }
+
+    // Urine dipstick — UTI and proteinuria
+    if (nameLower.includes('urine') || nameLower.includes('urinalysis') || nameLower.includes('dipstick') || nameLower.includes('ua ')) {
+      if (valueLower.includes('nitrite') && (valueLower.includes('positive') || valueLower.includes('+'))) {
+        pushIssue(warnings, 'CDSS_RESULT_UTI_DIPSTICK', 'CDSS-R-011',
+          `Urine dipstick nitrite positive — UTI. Trimethoprim-sulfamethoxazole or amoxicillin × 5–7 days. Send urine C&S if recurrent.`);
+        recommendations.push({
+          text: `UTI: co-trimoxazole 960mg BD × 5 days (non-pregnant adults). Pregnancy: amoxicillin 500mg TDS × 7 days. Upper UTI or pyelonephritis: ciprofloxacin 500mg BD × 7 days. Send urine C&S if recurrent.`,
+          source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)'
+        });
+      }
+      if (/2\+|3\+|\+\+/.test(valueLower) && valueLower.includes('protein')) {
+        if (cohort === 'maternal') {
+          pushIssue(warnings, 'CDSS_RESULT_PROTEINURIA_MATERNAL', 'CDSS-R-012',
+            `Significant proteinuria in pregnancy — combined with elevated BP indicates pre-eclampsia. Urgent obstetric review.`);
+        } else {
+          pushIssue(warnings, 'CDSS_RESULT_PROTEINURIA', 'CDSS-R-013',
+            `Significant proteinuria (2+/3+). Evaluate for nephrotic syndrome, diabetic nephropathy, or hypertensive nephropathy.`);
+        }
+      }
+    }
+  }
+
+  // Imaging result interpretation
+  for (const img of input.imagingResults) {
+    const studyLower = img.study.toLowerCase();
+    const findingsLower = img.findings.toLowerCase();
+
+    // CXR — infiltrates / consolidation → pneumonia management
+    if ((studyLower.includes('chest') || studyLower.includes('cxr') || studyLower.includes('chest x')) &&
+        (findingsLower.includes('infiltrat') || findingsLower.includes('consolidat') || findingsLower.includes('opacity') || findingsLower.includes('haziness'))) {
+      pushIssue(warnings, 'CDSS_RESULT_CXR_INFILTRATES', 'CDSS-R-014',
+        `CXR: ${img.findings}. Consistent with pneumonia. Initiate antibiotic treatment; oxygen if SpO2 <94%.`);
+      recommendations.push({
+        text: `CXR infiltrates/consolidation — community-acquired pneumonia: amoxicillin-clavulanate 625mg TDS × 7 days or azithromycin 500mg OD × 3 days (atypical). Assess severity (CURB-65). Oxygen if SpO2 <94%. Refer if CURB-65 ≥2.`,
+        source: 'Ethiopian Standard Treatment Guidelines (MoH 2020)'
+      });
+    }
+
+    // CXR — pleural effusion
+    if ((studyLower.includes('chest') || studyLower.includes('cxr')) &&
+        (findingsLower.includes('pleural effusion') || findingsLower.includes('effusion'))) {
+      pushIssue(warnings, 'CDSS_RESULT_PLEURAL_EFFUSION', 'CDSS-R-015',
+        `Pleural effusion on CXR. Evaluate cause (TB, cardiac failure, malignancy). Refer for thoracentesis if large or cause unclear.`);
+    }
+
+    // Abdominal ultrasound — surgical emergency signs
+    if ((studyLower.includes('abdomen') || studyLower.includes('abdominal') || studyLower.includes('ultrasound') || studyLower.includes('fast')) &&
+        (findingsLower.includes('free fluid') || findingsLower.includes('perforation') || findingsLower.includes('abscess'))) {
+      pushIssue(hardStops, 'CDSS_RESULT_ACUTE_ABDOMEN_IMAGING', 'CDSS-R-016',
+        `Abdominal imaging: ${img.findings}. Possible surgical emergency — urgent surgical referral.`);
+    }
+
+    // ECG — STEMI and atrial fibrillation
+    if (studyLower.includes('ecg') || studyLower.includes('electrocardiogram') || studyLower.includes('ekg')) {
+      if (findingsLower.includes('st elevation') || findingsLower.includes('stemi')) {
+        pushIssue(hardStops, 'CDSS_RESULT_STEMI', 'CDSS-R-017',
+          `ECG: ST elevation — STEMI. Aspirin 300mg + clopidogrel 300mg stat. Urgent cardiac referral for PCI or thrombolysis.`);
+      } else if (findingsLower.includes('atrial fibrillation') || findingsLower.includes(' af ') || findingsLower.includes('af,') || findingsLower.includes('irregular rhythm')) {
+        pushIssue(warnings, 'CDSS_RESULT_AF_ECG', 'CDSS-R-018',
+          `ECG: atrial fibrillation. Assess haemodynamic stability. Rate control (digoxin/metoprolol) and anticoagulation. Cardiology referral.`);
+      }
+    }
+  }
+
+  // Suppress "order X" recommendations when results for that test already exist
+  if (resultNames.size > 0) {
+    const suppressMap: Array<[string, RegExp]> = [
+      ['malaria', /\border\s+(malaria|rdt|rapid malaria)\b/i],
+      ['cbc',     /\border\s+(cbc|full blood count|blood count)\b/i],
+      ['glucose', /\border\s+(blood glucose|fasting blood sugar|random blood sugar|rbs|fbs)\b/i],
+      ['hiv',     /\border\s+(hiv rapid|hiv test)\b/i],
+      ['urine',   /\border\s+(urinalysis|urine dipstick)\b/i],
+      ['sputum',  /\border\s+(sputum|xpert|afb)\b/i],
+    ];
+    for (const [key, orderPattern] of suppressMap) {
+      const hasResult = [...resultNames].some(n => n.includes(key));
+      if (hasResult) {
+        for (let i = recommendations.length - 1; i >= 0; i--) {
+          if (orderPattern.test(recommendations[i].text)) {
+            recommendations.splice(i, 1);
+          }
+        }
+      }
+    }
+  }
+
   if (checkpoint === 'discharge' && input.pendingOrders.length > 0) {
     if (!input.acknowledgeOutstandingOrders) {
       pushIssue(
@@ -725,6 +1207,47 @@ export const evaluateCdss = async (inputRaw: unknown): Promise<CdsEvaluateResult
     ['CDSS_HARD_OXYGEN_SAT_CRITICAL', 'CDSS_HARD_MATERNAL_SEVERE_HYPERTENSION'].includes(item.code)
   );
 
+  // ── PRIORITISED RECOMMENDATION PIPELINE ─────────────────────────────────
+  // Priority order (highest → lowest):
+  //   1. Emergency        — hard-stops fire; recommendations suppressed entirely
+  //   2. Result-confirmed — actual lab/imaging values drove the recommendation
+  //   3. Focused ladder   — chief-complaint × workup-state decision tree
+  //   4. Condition-match  — broad symptom-pattern recs (kept as fallback only)
+  //   5. Baseline         — generic boilerplate (last resort)
+  const resultConfirmedRecs = recommendations.slice(conditionRecsCount);
+  const conditionSpecificRecs = recommendations.slice(0, conditionRecsCount);
+  const focusedStep = buildFocusedNextStep(input, mergedSymptomContext, cohort);
+
+  let finalRecs: CdsRecommendation[];
+  if (hardStops.length > 0) {
+    // Emergency: the hard-stop IS the next step. No additional recs.
+    finalRecs = [];
+  } else if (resultConfirmedRecs.length > 0) {
+    // Results are back and interpreted: show confirmed recs (max 2).
+    finalRecs = resultConfirmedRecs.slice(0, 2);
+  } else if (focusedStep) {
+    // Chief-complaint ladder identified one clear next action.
+    finalRecs = [focusedStep];
+  } else if (conditionSpecificRecs.length > 0) {
+    // Broad symptom match, no focused step — take the single highest-ranked match.
+    finalRecs = conditionSpecificRecs.slice(0, 1);
+  } else {
+    // Nothing patient-specific matched. Stay silent — generic reminders add noise,
+    // not guidance. The advisor should only speak when it has something actionable.
+    finalRecs = [];
+  }
+
+  // Consultation phase — tells the frontend what kind of guidance is appropriate now.
+  const hasResults = input.labResults.length > 0 || input.imagingResults.length > 0;
+  const hasDiagnosis = normalizeText(input.diagnosis).length > 0;
+  const consultationPhase =
+    hardStops.length > 0              ? 'emergency'
+    : hasResults && hasDiagnosis      ? 'treatment'
+    : hasResults                      ? 'interpret_results'
+    : input.pendingOrders.length > 0  ? 'awaiting_results'
+    : hasDiagnosis                    ? 'treatment'
+    :                                   'diagnostic';
+
   const aiAdvisory = await maybeBuildAiAdvisory(input, cohort);
   const referralRequired = hardStops.length > 0;
   const briefSummary = buildBriefSummary({
@@ -733,7 +1256,7 @@ export const evaluateCdss = async (inputRaw: unknown): Promise<CdsEvaluateResult
     hardStops,
     warnings,
     referralRequired,
-    topRecommendation: recommendations[0],
+    topRecommendation: finalRecs[0],
   });
 
   return {
@@ -743,7 +1266,8 @@ export const evaluateCdss = async (inputRaw: unknown): Promise<CdsEvaluateResult
     cohort,
     hardStops,
     warnings,
-    recommendations,
+    recommendations: finalRecs,
+    consultationPhase,
     referral: {
       required: referralRequired,
       urgency: hardStops.length === 0 ? null : hasEmergency ? 'emergency' : 'urgent',
