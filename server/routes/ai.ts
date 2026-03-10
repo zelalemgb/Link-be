@@ -5,6 +5,11 @@ import FormData from 'form-data';
 import { supabaseAdmin } from '../config/supabase';
 import { requireUser, requireScopedUser } from '../middleware/auth';
 import { recordAuditEvent } from '../services/audit-log';
+import {
+    LINK_AGENT_CLINICIAN_INTENTS,
+    linkAgentInteractionRequestSchema,
+    runLinkAgentInteraction,
+} from '../services/linkAgentService';
 
 const router = express.Router();
 const ALLOWED_IMAGE_MIMETYPES = new Set([
@@ -232,6 +237,98 @@ router.post('/analyze', requireUser, requireScopedUser, upload.single('image'), 
     } catch (error: any) {
         console.error('AI Analysis Route Error');
         res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// ── Link Agent unified interaction model (B5.1) ──────────────────────────────
+router.post('/link-agent/interaction', requireUser, requireScopedUser, async (req, res) => {
+    const parsed = linkAgentInteractionRequestSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+        return res.status(400).json({
+            error: parsed.error.issues[0]?.message || 'Invalid Link Agent interaction payload',
+        });
+    }
+
+    try {
+        const result = await runLinkAgentInteraction(parsed.data, {
+            localAiBaseUrl,
+            localAiTimeoutMs,
+            localAiSharedSecret,
+        });
+
+        const { tenantId, facilityId, profileId, role } = req.user!;
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'link_agent_interaction',
+                eventType: 'create',
+                entityType: 'ai_request',
+                tenantId,
+                facilityId: facilityId || null,
+                actorUserId: profileId || null,
+                actorRole: role || null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+                metadata: {
+                    surface: parsed.data.surface,
+                    intent: parsed.data.intent,
+                    status: result.agent.status,
+                    source: result.agent.source,
+                    safeMode: true,
+                },
+            });
+        }
+
+        return res.json(result);
+    } catch (error: any) {
+        if (isAiDebug) {
+            console.error('Link Agent interaction error:', error?.message || error);
+        }
+        return res.status(500).json({
+            error: 'Failed to process Link Agent interaction',
+        });
+    }
+});
+
+router.post('/link-agent/interaction-public', async (req, res) => {
+    const parsed = linkAgentInteractionRequestSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+        return res.status(400).json({
+            error: parsed.error.issues[0]?.message || 'Invalid Link Agent interaction payload',
+        });
+    }
+
+    if (
+        parsed.data.surface === 'clinician' ||
+        LINK_AGENT_CLINICIAN_INTENTS.includes(parsed.data.intent)
+    ) {
+        return res.status(403).json({
+            error: 'Authenticated clinician context is required for clinician guidance',
+        });
+    }
+
+    try {
+        const result = await runLinkAgentInteraction(
+            {
+                ...parsed.data,
+                safeMode: true,
+            },
+            {
+                localAiBaseUrl,
+                localAiTimeoutMs,
+                localAiSharedSecret,
+            }
+        );
+        return res.json(result);
+    } catch (error: any) {
+        if (isAiDebug) {
+            console.error('Public Link Agent interaction error:', error?.message || error);
+        }
+        return res.status(500).json({
+            error: 'Failed to process Link Agent interaction',
+        });
     }
 });
 

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import ruleset from '../data/ethiopiaPhcCdssRules.json';
-import { supabaseAdmin } from '../config/supabase';
+import { runLinkAgentInteraction } from './linkAgentService';
 
 type CdsCheckpoint = 'triage' | 'consult' | 'route' | 'admit' | 'discharge';
 type CdsCohort = 'adult' | 'pediatric' | 'maternal';
@@ -56,6 +56,12 @@ const bpRegex = /(\d{2,3})\s*\/\s*(\d{2,3})/;
 const normalizeText = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
 
 const normalizeSymptom = (value: string) => value.trim().toLowerCase();
+
+const buildLinkAgentRuntimeConfig = () => ({
+  localAiBaseUrl: process.env.LOCAL_AI_SERVICE_URL || 'http://127.0.0.1:8000',
+  localAiTimeoutMs: Number(process.env.LOCAL_AI_TIMEOUT_MS || 120_000),
+  localAiSharedSecret: process.env.AI_SHARED_SECRET || '',
+});
 
 const containsAny = (haystack: string[], needles: string[]) =>
   needles.some((needle) => haystack.some((item) => item.includes(needle)));
@@ -224,6 +230,17 @@ const buildBriefSummary = ({
   };
 };
 
+const mapProbabilityToConfidence = (
+  probability: unknown
+): CdsAiAdvisory['confidence'] | undefined => {
+  if (typeof probability !== 'string') return undefined;
+  const normalized = probability.trim().toLowerCase();
+  if (normalized === 'high') return 'high';
+  if (normalized === 'medium') return 'medium';
+  if (normalized === 'low') return 'low';
+  return undefined;
+};
+
 const maybeBuildAiAdvisory = async (
   input: CdsEvaluateInput,
   cohort: CdsCohort
@@ -238,48 +255,55 @@ const maybeBuildAiAdvisory = async (
   }
 
   try {
-    const { data, error } = await supabaseAdmin.functions.invoke('ai-clinical-assistant', {
-      body: {
-        patientData: {
-          age: input.patient.ageYears || 0,
-          gender: input.patient.sex || '',
-          chiefComplaint: input.chiefComplaint || input.symptoms[0] || 'Not specified',
-          vitals: {
-            temperature: input.vitals.temperature || undefined,
-            bloodPressure: input.vitals.bloodPressure || undefined,
-            heartRate: input.vitals.heartRate || undefined,
-            respiratoryRate: input.vitals.respiratoryRate || undefined,
-            oxygenSaturation: input.vitals.oxygenSaturation || undefined,
-            weight: input.vitals.weightKg || undefined,
+    const interaction = await runLinkAgentInteraction(
+      {
+        surface: 'clinician',
+        intent: 'clinical_assistant',
+        payload: {
+          patientData: {
+            age: input.patient.ageYears || 0,
+            gender: input.patient.sex || '',
+            chiefComplaint: input.chiefComplaint || input.symptoms[0] || 'Not specified',
+            vitals: {
+              temperature: input.vitals.temperature || undefined,
+              bloodPressure: input.vitals.bloodPressure || undefined,
+              heartRate: input.vitals.heartRate || undefined,
+              respiratoryRate: input.vitals.respiratoryRate || undefined,
+              oxygenSaturation: input.vitals.oxygenSaturation || undefined,
+              weight: input.vitals.weightKg || undefined,
+            },
+            observations: input.clinicalNotes || input.symptoms.join(', ') || 'Not documented',
+            medicalHistory: `${cohort} assessment`,
           },
-          observations: input.clinicalNotes || input.symptoms.join(', ') || 'Not documented',
-          medicalHistory: `${cohort} assessment`,
         },
+        safeMode: true,
       },
-    });
+      buildLinkAgentRuntimeConfig()
+    );
 
-    if (error || !data?.success) {
+    if (interaction.agent.status !== 'generated') {
       return {
         enabled: true,
         status: 'unavailable',
         requiresClinicianConfirmation: true,
-        error: error?.message || data?.error || 'AI advisory unavailable',
+        error: interaction.message || 'AI advisory unavailable',
       };
     }
 
-    const topDx = data?.analysis?.differentialDiagnosis?.[0]?.diagnosis;
+    const topDifferential = interaction.content?.analysis?.differentialDiagnosis?.[0];
+    const topDx = topDifferential?.diagnosis;
     const summary =
       typeof topDx === 'string' && topDx.trim().length > 0
-        ? `Top AI suggestion: ${topDx}. Requires clinician confirmation.`
-        : 'AI advisory generated. Requires clinician confirmation.';
+        ? `Top Link Agent suggestion: ${topDx}. Requires clinician confirmation.`
+        : 'Link Agent advisory generated. Requires clinician confirmation.';
 
     return {
       enabled: true,
       status: 'generated',
       requiresClinicianConfirmation: true,
       summary,
-      confidence: 'medium',
-      model: 'ai-clinical-assistant',
+      confidence: mapProbabilityToConfidence(topDifferential?.probability) || 'medium',
+      model: interaction.agent.model || 'link_agent_v1',
     };
   } catch (error: any) {
     return {

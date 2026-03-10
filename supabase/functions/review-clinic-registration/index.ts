@@ -10,6 +10,73 @@ const RESEND_API_KEY = Deno.env.get('RESEND_API_KEY');
 const supabaseAdmin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
+const WORKSPACE_CORE_MODULES = [
+  'patients',
+  'visits',
+  'records',
+  'referrals',
+  'follow_up',
+  'link_agent',
+  'cdss_core',
+];
+
+const WORKSPACE_COMMON_MODULES = [
+  'reception',
+  'triage',
+  'cashier',
+  'lab',
+  'imaging',
+  'pharmacy',
+  'patient_app_sync',
+  'hew_referral_handoff',
+];
+
+const WORKSPACE_ADVANCED_MODULES = [
+  'inventory',
+  'inpatient',
+  'analytics',
+  'multi_facility',
+  'public_health',
+  'cdss_advanced',
+];
+
+type RequestedSetupMode = 'recommended' | 'custom' | 'full';
+
+const normalizeModuleList = (value: unknown) => {
+  const unique = new Set<string>();
+  if (!Array.isArray(value)) return [];
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue;
+    const normalized = entry.trim().toLowerCase();
+    if (!normalized) continue;
+    unique.add(normalized);
+  }
+  return Array.from(unique);
+};
+
+const normalizeRequestedSetupMode = (value: unknown): RequestedSetupMode => {
+  if (value === 'custom' || value === 'full' || value === 'recommended') {
+    return value;
+  }
+  return 'recommended';
+};
+
+const resolveRequestedModules = (setupMode: RequestedSetupMode, requestedModules: unknown) => {
+  if (setupMode === 'full') {
+    return normalizeModuleList([
+      ...WORKSPACE_CORE_MODULES,
+      ...WORKSPACE_COMMON_MODULES,
+      ...WORKSPACE_ADVANCED_MODULES,
+    ]);
+  }
+
+  if (setupMode === 'recommended') {
+    return normalizeModuleList([...WORKSPACE_CORE_MODULES, ...WORKSPACE_COMMON_MODULES]);
+  }
+
+  return normalizeModuleList([...WORKSPACE_CORE_MODULES, ...normalizeModuleList(requestedModules)]);
+};
+
 const normalizeFrontendOrigin = (value: string) => value.replace(/#.*$/, '').replace(/\/+$/, '');
 
 const buildClinicOnboardingUrl = (facilityId: string, adminEmail: string) => {
@@ -554,6 +621,11 @@ Deno.serve(async (req) => {
     const normalizedAdminPhone = registration.admin_phone
       ? registration.admin_phone.toString().replace(/\s+/g, '')
       : null;
+    const requestedSetupMode = normalizeRequestedSetupMode(registration.requested_setup_mode);
+    const requestedModules = resolveRequestedModules(
+      requestedSetupMode,
+      registration.requested_modules
+    );
 
     if (!normalizedClinicName) {
       return fail('Clinic name is required');
@@ -568,7 +640,14 @@ Deno.serve(async (req) => {
     if (!facilityId || !tenantId) {
       const { data: tenantInsert, error: tenantErr } = await supabaseAdmin
         .from('tenants')
-        .insert({ name: normalizedClinicName, is_active: true })
+        .insert({
+          name: normalizedClinicName,
+          is_active: true,
+          workspace_type: 'clinic',
+          setup_mode: requestedSetupMode,
+          team_mode: 'solo',
+          enabled_modules: requestedModules,
+        })
         .select('id')
         .single();
 
@@ -643,6 +722,53 @@ Deno.serve(async (req) => {
 
       if (approveErr) {
         throw new Error(approveErr.message);
+      }
+    }
+
+    if (tenantId) {
+      const { data: tenantRow, error: tenantLoadError } = await supabaseAdmin
+        .from('tenants')
+        .select('id, workspace_type, setup_mode, team_mode, enabled_modules')
+        .eq('id', tenantId)
+        .maybeSingle();
+
+      if (tenantLoadError) {
+        throw new Error(tenantLoadError.message);
+      }
+
+      if (tenantRow) {
+        const normalizedExistingModules = normalizeModuleList(tenantRow.enabled_modules);
+        const nextSetupMode =
+          tenantRow.setup_mode && tenantRow.setup_mode !== 'legacy'
+            ? tenantRow.setup_mode
+            : requestedSetupMode;
+        const nextTeamMode =
+          tenantRow.team_mode && tenantRow.team_mode !== 'legacy'
+            ? tenantRow.team_mode
+            : 'solo';
+        const nextModules =
+          normalizedExistingModules.length > 0
+            ? normalizedExistingModules
+            : resolveRequestedModules(
+                nextSetupMode === 'custom' || nextSetupMode === 'full' || nextSetupMode === 'recommended'
+                  ? nextSetupMode
+                  : requestedSetupMode,
+                requestedModules
+              );
+
+        const { error: tenantUpdateError } = await supabaseAdmin
+          .from('tenants')
+          .update({
+            workspace_type: tenantRow.workspace_type || 'clinic',
+            setup_mode: nextSetupMode,
+            team_mode: nextTeamMode,
+            enabled_modules: nextModules,
+          })
+          .eq('id', tenantId);
+
+        if (tenantUpdateError) {
+          throw new Error(tenantUpdateError.message);
+        }
       }
     }
 

@@ -286,6 +286,11 @@ ALTER TABLE public.agent_assignments      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.agent_commissions      ENABLE ROW LEVEL SECURITY;
 
 -- Tenant-scoped access
+DROP POLICY IF EXISTS "tenant_iso_payment_events" ON public.payment_events;
+DROP POLICY IF EXISTS "tenant_iso_license_keys" ON public.license_keys;
+DROP POLICY IF EXISTS "tenant_iso_hub_registrations" ON public.hub_registrations;
+DROP POLICY IF EXISTS "tenant_iso_trial_reminders" ON public.trial_reminder_logs;
+DROP POLICY IF EXISTS "tenant_iso_onboarding" ON public.onboarding_checklist;
 CREATE POLICY "tenant_iso_payment_events"     ON public.payment_events     USING (tenant_id = (SELECT tenant_id FROM public.users WHERE id = auth.uid() LIMIT 1));
 CREATE POLICY "tenant_iso_license_keys"       ON public.license_keys       USING (tenant_id = (SELECT tenant_id FROM public.users WHERE id = auth.uid() LIMIT 1));
 CREATE POLICY "tenant_iso_hub_registrations"  ON public.hub_registrations  USING (tenant_id = (SELECT tenant_id FROM public.users WHERE id = auth.uid() LIMIT 1));
@@ -293,6 +298,9 @@ CREATE POLICY "tenant_iso_trial_reminders"    ON public.trial_reminder_logs USIN
 CREATE POLICY "tenant_iso_onboarding"         ON public.onboarding_checklist USING (tenant_id = (SELECT tenant_id FROM public.users WHERE id = auth.uid() LIMIT 1));
 
 -- Agent access: agents only see their own records
+DROP POLICY IF EXISTS "agent_self_access" ON public.agents;
+DROP POLICY IF EXISTS "agent_assignment_access" ON public.agent_assignments;
+DROP POLICY IF EXISTS "agent_commission_access" ON public.agent_commissions;
 CREATE POLICY "agent_self_access" ON public.agents USING (user_id = auth.uid());
 CREATE POLICY "agent_assignment_access" ON public.agent_assignments USING (agent_id = (SELECT id FROM public.agents WHERE user_id = auth.uid() LIMIT 1));
 CREATE POLICY "agent_commission_access" ON public.agent_commissions USING (agent_id = (SELECT id FROM public.agents WHERE user_id = auth.uid() LIMIT 1));

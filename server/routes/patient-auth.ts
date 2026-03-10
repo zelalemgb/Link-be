@@ -237,7 +237,7 @@ router.post('/verify-otp', otpLimiter, async (req, res) => {
     const token = signSession(patient.id, phoneNumber);
     setPatientSessionCookies(res, token);
 
-    return res.json({ success: true, patient });
+    return res.json({ success: true, patient, sessionToken: token });
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.errors[0]?.message || 'Invalid request' });
@@ -354,7 +354,7 @@ router.post('/register', otpLimiter, async (req, res) => {
       requestId: req.requestId || null,
     });
 
-    return res.status(201).json({ patient: created });
+    return res.status(201).json({ patient: created, sessionToken: token });
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.errors[0]?.message || 'Invalid request' });
@@ -447,7 +447,7 @@ router.post('/dev-login', otpLimiter, async (req, res) => {
       requestId: req.requestId || null,
     });
 
-    return res.json({ patient });
+    return res.json({ patient, sessionToken: token });
   } catch (error: any) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.errors[0]?.message || 'Invalid request' });

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
 import request from 'supertest';
+import axios from 'axios';
 
 const ensureSupabaseEnv = () => {
   process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'http://127.0.0.1';
@@ -199,7 +200,7 @@ test('doctor CDSS evaluate returns maternal severe hypertension hard stop', asyn
     );
     assert.equal(response.body.cohort, 'maternal');
     assert.equal(
-      response.body.briefSummary?.guidelineBasis?.includes('WHO emergency and referral red-flag guidance'),
+      response.body.briefSummary?.guidelineBasis?.includes('WHO Emergency and Referral Red-Flag Guidance'),
       true
     );
   } finally {
@@ -244,5 +245,118 @@ test('doctor CDSS evaluate blocks discharge when pending orders are not acknowle
   } finally {
     (supabaseAdmin as any).from = originalFrom;
     (supabaseAdmin as any).auth = originalAuth;
+  }
+});
+
+test('doctor CDSS evaluate generates advisory via Link Agent interaction when enabled', async () => {
+  const { doctorRouter, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+  const originalAuth = (supabaseAdmin as any).auth;
+  const originalAxiosPost = (axios as any).post;
+  const previousFlag = process.env.CDSS_AI_ADVISORY_ENABLED;
+
+  try {
+    process.env.CDSS_AI_ADVISORY_ENABLED = 'true';
+
+    (supabaseAdmin as any).auth = {
+      getUser: async () => ({
+        data: { user: { id: 'auth-user-1' } },
+        error: null,
+      }),
+    };
+    (supabaseAdmin as any).from = createFromStub();
+    (axios as any).post = async (url: string) => {
+      assert.match(url, /\/link-agent\/respond$/);
+      return {
+        data: {
+          success: true,
+          agent: {
+            model: 'link_agent_v1',
+            surface: 'clinician',
+            intent: 'clinical_assistant',
+            status: 'generated',
+            safeMode: true,
+            source: 'local_ai',
+          },
+          message: 'Link Agent generated clinician support.',
+          content: {
+            success: true,
+            analysis: {
+              differentialDiagnosis: [
+                {
+                  diagnosis: 'Community acquired pneumonia',
+                  probability: 'High',
+                },
+              ],
+            },
+          },
+        },
+      };
+    };
+
+    const app = buildApp(doctorRouter);
+    const response = await request(app)
+      .post('/api/doctor/cdss/evaluate')
+      .set('authorization', 'Bearer valid-token')
+      .send({
+        ...validPayload(),
+        includeAiAdvisory: true,
+      });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.aiAdvisory.enabled, true);
+    assert.equal(response.body.aiAdvisory.status, 'generated');
+    assert.match(response.body.aiAdvisory.summary, /Community acquired pneumonia/);
+    assert.equal(response.body.aiAdvisory.model, 'link_agent_v1');
+  } finally {
+    process.env.CDSS_AI_ADVISORY_ENABLED = previousFlag || 'false';
+    (supabaseAdmin as any).from = originalFrom;
+    (supabaseAdmin as any).auth = originalAuth;
+    (axios as any).post = originalAxiosPost;
+  }
+});
+
+test('doctor CDSS evaluate marks advisory unavailable when Link Agent falls back', async () => {
+  const { doctorRouter, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+  const originalAuth = (supabaseAdmin as any).auth;
+  const originalAxiosPost = (axios as any).post;
+  const previousFlag = process.env.CDSS_AI_ADVISORY_ENABLED;
+
+  try {
+    process.env.CDSS_AI_ADVISORY_ENABLED = 'true';
+
+    (supabaseAdmin as any).auth = {
+      getUser: async () => ({
+        data: { user: { id: 'auth-user-1' } },
+        error: null,
+      }),
+    };
+    (supabaseAdmin as any).from = createFromStub();
+    (axios as any).post = async () => {
+      throw new Error('local ai unavailable');
+    };
+
+    const app = buildApp(doctorRouter);
+    const response = await request(app)
+      .post('/api/doctor/cdss/evaluate')
+      .set('authorization', 'Bearer valid-token')
+      .send({
+        ...validPayload(),
+        includeAiAdvisory: true,
+      });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.aiAdvisory.enabled, true);
+    assert.equal(response.body.aiAdvisory.status, 'unavailable');
+    assert.match(
+      response.body.aiAdvisory.error,
+      /(Link Agent is offline|AI advisory unavailable)/i
+    );
+  } finally {
+    process.env.CDSS_AI_ADVISORY_ENABLED = previousFlag || 'false';
+    (supabaseAdmin as any).from = originalFrom;
+    (supabaseAdmin as any).auth = originalAuth;
+    (axios as any).post = originalAxiosPost;
   }
 });

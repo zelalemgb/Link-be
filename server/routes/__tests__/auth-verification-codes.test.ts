@@ -33,3 +33,13 @@ test('auth route verifies codes via dedicated endpoint and no longer compares pl
   assert.match(source, /code:\s*hashedCode/);
   assert.doesNotMatch(source, /\.eq\('code',\s*verificationCode\)/);
 });
+
+test('clinic admin onboarding route preserves linkage flow and returns provisioning diagnostics', () => {
+  const sourcePath = path.resolve(__dirname, '../auth.ts');
+  const source = fs.readFileSync(sourcePath, 'utf8');
+
+  assert.match(source, /router\.post\('\/clinic-admin-onboarding\/complete'/);
+  assert.match(source, /update\(\{\s*admin_user_id:\s*authUserId\s*\}\)/);
+  assert.match(source, /user_role:\s*'admin'/);
+  assert.match(source, /provisioning/);
+});

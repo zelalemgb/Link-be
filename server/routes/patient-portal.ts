@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
 import { requirePatientSession, requirePatientCsrf } from '../middleware/patient-auth';
 import { recordAuditEvent } from '../services/audit-log';
+import { buildPatientSyncedRecords } from '../services/patientRecordsSyncService';
 import {
   grantPatientPortalConsent,
   revokePatientPortalConsent,
@@ -260,6 +261,51 @@ router.delete('/documents/:id', requirePatientSession, requirePatientCsrf, async
     return res.status(204).send();
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Failed to delete document' });
+  }
+});
+
+router.get('/records/synced', requirePatientSession, async (req, res) => {
+  const { patientAccountId, tenantId } = req.patient!;
+  const requestedLimit = Number.parseInt(String(req.query.limit || ''), 10);
+  const maxRecords = Number.isFinite(requestedLimit) ? requestedLimit : undefined;
+
+  try {
+    const bundle = await buildPatientSyncedRecords({
+      patientAccountId,
+      tenantId,
+      maxRecords,
+    });
+    const response = {
+      ...bundle,
+      growthLoop: {
+        source: 'patient-portal',
+        generatedAt: new Date().toISOString(),
+      },
+    };
+
+    if (tenantId) {
+      await recordAuditEvent({
+        action: 'list_synced_records',
+        eventType: 'read',
+        entityType: 'patient_record_bundle',
+        tenantId,
+        actorRole: 'patient',
+        actorUserId: null,
+        actorIpAddress: req.ip,
+        actorUserAgent: req.get('user-agent') || null,
+        complianceTags: ['hipaa'],
+        sensitivityLevel: 'phi',
+        requestId: req.requestId || null,
+        metadata: {
+          result_count: response.records.length,
+          counts: response.counts,
+        },
+      });
+    }
+
+    return res.json(response);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message || 'Failed to load synced records' });
   }
 });
 

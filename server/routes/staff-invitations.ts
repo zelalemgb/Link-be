@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
 import { requireUser, requireScopedUser } from '../middleware/auth';
+import { normalizeWorkspaceMetadata } from '../services/workspaceMetadata';
 
 const router = Router();
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://linkhc.org';
@@ -15,12 +16,50 @@ const isInvitationManager = (role: string | undefined) => {
   return invitationManagerRoles.has(normalizeRole(role));
 };
 
-const ensureInvitationManager = (role: string | undefined, res: any) => {
-  if (!isInvitationManager(role)) {
-    res.status(403).json({ error: 'Only clinic administrators can manage invitations' });
-    return false;
+type InvitationManagerContext = {
+  role?: string;
+  authUserId: string;
+  facilityId: string;
+  tenantId?: string;
+};
+
+const isFacilityOwnerManager = async ({
+  role,
+  authUserId,
+  facilityId,
+  tenantId,
+}: InvitationManagerContext) => {
+  if (normalizeRole(role || '') !== 'doctor') return false;
+
+  let query = supabaseAdmin
+    .from('facilities')
+    .select('id, admin_user_id, tenant_id')
+    .eq('id', facilityId);
+
+  if (tenantId) {
+    query = query.eq('tenant_id', tenantId);
   }
-  return true;
+
+  const { data, error } = await query.maybeSingle();
+  if (error || !data) return false;
+  return data.admin_user_id === authUserId;
+};
+
+const canManageInvitationsForFacility = async (context: InvitationManagerContext) => {
+  if (isInvitationManager(context.role)) return true;
+  return isFacilityOwnerManager(context);
+};
+
+const ensureInvitationManagerForFacility = async (
+  context: InvitationManagerContext,
+  res: any
+) => {
+  if (await canManageInvitationsForFacility(context)) {
+    return true;
+  }
+
+  res.status(403).json({ error: 'Only clinic administrators can manage invitations' });
+  return false;
 };
 
 const isRoleAssignable = (role: string) => !nonAssignableRoles.has(normalizeRole(role));
@@ -46,6 +85,15 @@ const invitationCreateSchema = z.object({
       })
     )
     .min(1),
+});
+
+const teamModeQuerySchema = z.object({
+  facilityId: z.string().uuid().optional(),
+});
+
+const teamModeUpdateSchema = z.object({
+  facilityId: z.string().uuid().optional(),
+  teamMode: z.enum(['solo', 'small_team', 'full_team']),
 });
 
 const invitationRegisterSchema = z.object({
@@ -103,6 +151,28 @@ const ensureFacilityAccess = async (authUserId: string, facilityId: string, role
   return !!data;
 };
 
+const resolveFacilityTenant = async (
+  facilityId: string,
+  role: string | undefined,
+  tenantId?: string
+) => {
+  let query = supabaseAdmin
+    .from('facilities')
+    .select('id, tenant_id')
+    .eq('id', facilityId);
+
+  if (role !== 'super_admin' && tenantId) {
+    query = query.eq('tenant_id', tenantId);
+  }
+
+  const { data, error } = await query.maybeSingle();
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return data;
+};
+
 const resolveInvitationById = async (id: string) => {
   const { data, error } = await supabaseAdmin
     .from('staff_invitations')
@@ -123,13 +193,14 @@ router.get('/', requireUser, requireScopedUser, async (req, res) => {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid query' });
   }
 
-  const { authUserId, facilityId: defaultFacilityId, role } = req.user!;
-  if (!ensureInvitationManager(role, res)) return;
+  const { authUserId, facilityId: defaultFacilityId, role, tenantId } = req.user!;
   const facilityId = parsed.data.facilityId || defaultFacilityId;
 
   if (!facilityId) {
     return res.status(400).json({ error: 'Missing facilityId' });
   }
+
+  if (!(await ensureInvitationManagerForFacility({ role, authUserId, facilityId, tenantId }, res))) return;
 
   const hasAccess = await ensureFacilityAccess(authUserId, facilityId, role);
   if (!hasAccess) {
@@ -166,9 +237,10 @@ router.post('/', requireUser, requireScopedUser, async (req, res) => {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
   }
 
-  const { authUserId, role } = req.user!;
-  if (!ensureInvitationManager(role, res)) return;
+  const { authUserId, role, tenantId } = req.user!;
   const { facilityId, invitations } = parsed.data;
+
+  if (!(await ensureInvitationManagerForFacility({ role, authUserId, facilityId, tenantId }, res))) return;
 
   const hasAccess = await ensureFacilityAccess(authUserId, facilityId, role);
   if (!hasAccess) {
@@ -289,9 +361,174 @@ router.post('/', requireUser, requireScopedUser, async (req, res) => {
       }
     }
 
+    if (facility.tenant_id && entries.length > 0) {
+      const { data: tenantRow, error: tenantLookupError } = await supabaseAdmin
+        .from('tenants')
+        .select('workspace_type, setup_mode, team_mode')
+        .eq('id', facility.tenant_id)
+        .maybeSingle();
+
+      if (tenantLookupError) {
+        console.warn('Failed to load tenant metadata after invitations:', tenantLookupError.message);
+      } else if (tenantRow) {
+        const tenantUpdatePayload: Record<string, string> = {
+          team_mode:
+            tenantRow.team_mode === 'full_team'
+              ? 'full_team'
+              : 'small_team',
+        };
+
+        if (tenantRow.workspace_type === 'provider') {
+          tenantUpdatePayload.workspace_type = 'clinic';
+          if (!tenantRow.setup_mode || tenantRow.setup_mode === 'legacy') {
+            tenantUpdatePayload.setup_mode = 'recommended';
+          }
+        }
+
+        const { error: teamModeError } = await supabaseAdmin
+          .from('tenants')
+          .update(tenantUpdatePayload)
+          .eq('id', facility.tenant_id);
+
+        if (teamModeError) {
+          console.warn('Failed to promote tenant team_mode after invitations:', teamModeError.message);
+        }
+      }
+    }
+
     return res.json({ sentCount, total: entries.length, failures });
   } catch (error: any) {
     console.error('Create staff invitations error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/team-mode', requireUser, requireScopedUser, async (req, res) => {
+  const parsed = teamModeQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid query' });
+  }
+
+  const { authUserId, role, facilityId: defaultFacilityId, tenantId } = req.user!;
+  const facilityId = parsed.data.facilityId || defaultFacilityId;
+
+  if (!facilityId) {
+    return res.status(400).json({ error: 'Missing facilityId' });
+  }
+
+  if (!(await ensureInvitationManagerForFacility({ role, authUserId, facilityId, tenantId }, res))) return;
+
+  const hasAccess = await ensureFacilityAccess(authUserId, facilityId, role);
+  if (!hasAccess) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  try {
+    const facility = await resolveFacilityTenant(facilityId, role, tenantId);
+    if (!facility) {
+      return res.status(404).json({ error: 'Facility not found' });
+    }
+
+    if (!facility.tenant_id) {
+      return res.json({
+        facilityId,
+        workspace: normalizeWorkspaceMetadata(null),
+      });
+    }
+
+    const { data: workspaceRow, error: workspaceError } = await supabaseAdmin
+      .from('tenants')
+      .select('workspace_type, setup_mode, team_mode, enabled_modules')
+      .eq('id', facility.tenant_id)
+      .maybeSingle();
+
+    if (workspaceError) {
+      return res.status(500).json({ error: workspaceError.message });
+    }
+
+    return res.json({
+      facilityId,
+      workspace: normalizeWorkspaceMetadata(workspaceRow as any),
+    });
+  } catch (error: any) {
+    console.error('Read staff team mode error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.put('/team-mode', requireUser, requireScopedUser, async (req, res) => {
+  const parsed = teamModeUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
+  }
+
+  const { authUserId, role, facilityId: defaultFacilityId, tenantId } = req.user!;
+  const facilityId = parsed.data.facilityId || defaultFacilityId;
+
+  if (!facilityId) {
+    return res.status(400).json({ error: 'Missing facilityId' });
+  }
+
+  if (!(await ensureInvitationManagerForFacility({ role, authUserId, facilityId, tenantId }, res))) return;
+
+  const hasAccess = await ensureFacilityAccess(authUserId, facilityId, role);
+  if (!hasAccess) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  try {
+    const facility = await resolveFacilityTenant(facilityId, role, tenantId);
+    if (!facility) {
+      return res.status(404).json({ error: 'Facility not found' });
+    }
+
+    if (!facility.tenant_id) {
+      return res.status(400).json({ error: 'Facility has no tenant association' });
+    }
+
+    const { data: currentTenantRow, error: currentTenantError } = await supabaseAdmin
+      .from('tenants')
+      .select('workspace_type, setup_mode, team_mode, enabled_modules')
+      .eq('id', facility.tenant_id)
+      .maybeSingle();
+
+    if (currentTenantError) {
+      return res.status(500).json({ error: currentTenantError.message });
+    }
+
+    if (!currentTenantRow) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const tenantUpdatePayload: Record<string, string> = {
+      team_mode: parsed.data.teamMode,
+    };
+    const shouldPromoteToClinic =
+      currentTenantRow.workspace_type === 'provider' && parsed.data.teamMode !== 'solo';
+    if (shouldPromoteToClinic) {
+      tenantUpdatePayload.workspace_type = 'clinic';
+      if (!currentTenantRow.setup_mode || currentTenantRow.setup_mode === 'legacy') {
+        tenantUpdatePayload.setup_mode = 'recommended';
+      }
+    }
+
+    const { data: tenantRow, error: tenantError } = await supabaseAdmin
+      .from('tenants')
+      .update(tenantUpdatePayload)
+      .eq('id', facility.tenant_id)
+      .select('workspace_type, setup_mode, team_mode, enabled_modules')
+      .single();
+
+    if (tenantError) {
+      return res.status(500).json({ error: tenantError.message });
+    }
+
+    return res.json({
+      facilityId,
+      workspace: normalizeWorkspaceMetadata(tenantRow as any),
+    });
+  } catch (error: any) {
+    console.error('Update staff team mode error:', error?.message || error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -503,14 +740,22 @@ router.post('/:token/register', async (req, res) => {
 });
 
 router.delete('/:id', requireUser, requireScopedUser, async (req, res) => {
-  const { authUserId, role } = req.user!;
-  if (!ensureInvitationManager(role, res)) return;
+  const { authUserId, role, tenantId } = req.user!;
   const { id } = req.params;
 
   try {
     const invitation = await resolveInvitationById(id);
     if (!invitation) {
       return res.status(404).json({ error: 'Invitation not found' });
+    }
+
+    if (
+      !(await ensureInvitationManagerForFacility(
+        { role, authUserId, facilityId: invitation.facility_id, tenantId },
+        res
+      ))
+    ) {
+      return;
     }
 
     const hasAccess = await ensureFacilityAccess(authUserId, invitation.facility_id, role);
@@ -531,14 +776,22 @@ router.delete('/:id', requireUser, requireScopedUser, async (req, res) => {
 });
 
 router.post('/:id/resend', requireUser, requireScopedUser, async (req, res) => {
-  const { authUserId, role } = req.user!;
-  if (!ensureInvitationManager(role, res)) return;
+  const { authUserId, role, tenantId } = req.user!;
   const { id } = req.params;
 
   try {
     const invitation = await resolveInvitationById(id);
     if (!invitation) {
       return res.status(404).json({ error: 'Invitation not found' });
+    }
+
+    if (
+      !(await ensureInvitationManagerForFacility(
+        { role, authUserId, facilityId: invitation.facility_id, tenantId },
+        res
+      ))
+    ) {
+      return;
     }
 
     const hasAccess = await ensureFacilityAccess(authUserId, invitation.facility_id, role);
@@ -593,6 +846,8 @@ export const __testables = {
   normalizeRole,
   isInvitationManager,
   isRoleAssignable,
+  isFacilityOwnerManager,
+  canManageInvitationsForFacility,
   ensureFacilityAccess,
   buildInvitationLink,
 };

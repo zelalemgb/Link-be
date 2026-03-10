@@ -81,6 +81,7 @@ CREATE TRIGGER trg_ckb_row_version
 -- RLS
 ALTER TABLE public.clinical_knowledge_base ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "tenant_isolation_ckb" ON public.clinical_knowledge_base;
 CREATE POLICY "tenant_isolation_ckb" ON public.clinical_knowledge_base
   USING (tenant_id = (
     SELECT tenant_id FROM public.users
@@ -112,6 +113,7 @@ CREATE TABLE IF NOT EXISTS public.ai_service_config (
 
 ALTER TABLE public.ai_service_config ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "tenant_isolation_ai_config" ON public.ai_service_config;
 CREATE POLICY "tenant_isolation_ai_config" ON public.ai_service_config
   USING (tenant_id = (
     SELECT tenant_id FROM public.users

@@ -5,6 +5,8 @@ import { requireUser, requireScopedUser } from '../middleware/auth';
 import { ensurePatientAccountLink } from '../services/patientAccountLinking';
 import { recordAuditEvent } from '../services/audit-log';
 import { JOURNEY_STAGES } from '../../shared/contracts/journey';
+import { provisionWorkspaceDefaults } from '../services/workspaceProvisioning';
+import { normalizeWorkspaceMetadata, type WorkspaceMetadata } from '../services/workspaceMetadata';
 import {
     updateVisitStatusMutation,
     visitStatusMutationSchema,
@@ -12,6 +14,7 @@ import {
 import {
     maybeAssertProviderPhiConsentForPatient,
 } from '../services/providerPhiConsentGuard';
+import { extractStructuredNoteFields } from '../services/hewStructuredNoteService';
 
 const router = Router();
 router.use(requireUser, requireScopedUser);
@@ -874,6 +877,141 @@ const registerIntakeSchema = z.object({
     requestedProfessionalId: z.string().optional()
 });
 
+type ConsultationServiceRow = {
+    id: string;
+    name: string | null;
+    price: number | null;
+};
+
+const consultationKeywordsByVisitType: Record<string, string[]> = {
+    New: ['new patient', 'new'],
+    'Follow-up': ['follow-up', 'follow up', 'followup', 'follow'],
+    Returning: ['returning patient', 'returning'],
+};
+
+const pickConsultationServiceForVisitType = (
+    services: ConsultationServiceRow[],
+    visitType: string
+) => {
+    if (!services.length) return null;
+    const normalizedType = (visitType || '').trim();
+    const keywords = consultationKeywordsByVisitType[normalizedType] || [];
+
+    if (keywords.length > 0) {
+        const keywordMatch = services.find((service) => {
+            const name = (service.name || '').toLowerCase();
+            return keywords.some((keyword) => name.includes(keyword));
+        });
+        if (keywordMatch) return keywordMatch;
+    }
+
+    return services[0];
+};
+
+const loadActiveConsultationServices = async (facilityId: string) => {
+    const { data, error } = await supabaseAdmin
+        .from('medical_services')
+        .select('id, name, price')
+        .eq('facility_id', facilityId)
+        .eq('category', 'Consultation')
+        .eq('is_active', true)
+        .order('created_at', { ascending: true });
+
+    if (error) throw error;
+    return (data || []) as ConsultationServiceRow[];
+};
+
+const loadTenantWorkspaceMetadata = async (tenantId: string): Promise<WorkspaceMetadata> => {
+    const { data: tenantRow, error: tenantLookupError } = await supabaseAdmin
+        .from('tenants')
+        .select('workspace_type, setup_mode, team_mode, enabled_modules')
+        .eq('id', tenantId)
+        .maybeSingle();
+
+    if (tenantLookupError) throw tenantLookupError;
+    return normalizeWorkspaceMetadata(tenantRow as any);
+};
+
+const shouldAutoRouteSoloProviderVisit = (workspaceMetadata: WorkspaceMetadata) =>
+    workspaceMetadata.workspaceType === 'provider' && workspaceMetadata.teamMode === 'solo';
+
+const autoRouteVisitToSoloProviderDoctorQueue = async ({
+    visitId,
+    facilityId,
+    userId,
+}: {
+    visitId: string;
+    facilityId: string;
+    userId: string;
+}) => {
+    const { error: assignError } = await supabaseAdmin
+        .from('visits')
+        .update({
+            assigned_doctor: userId,
+            updated_at: new Date().toISOString(),
+        })
+        .eq('id', visitId)
+        .eq('facility_id', facilityId);
+
+    if (assignError) throw assignError;
+
+    const { error: stageError } = await supabaseAdmin.rpc('append_journey_stage', {
+        p_visit_id: visitId,
+        p_stage: 'with_doctor',
+        p_user_id: userId,
+    });
+
+    if (stageError) throw stageError;
+};
+
+const resolveConsultationServiceId = async ({
+    tenantId,
+    facilityId,
+    userId,
+    visitType,
+    requestedServiceId,
+    workspaceMetadata,
+}: {
+    tenantId: string;
+    facilityId: string;
+    userId: string;
+    visitType: string;
+    requestedServiceId?: string | null;
+    workspaceMetadata?: WorkspaceMetadata | null;
+}) => {
+    if (requestedServiceId && requestedServiceId !== 'none') {
+        const { data: selectedService, error: selectedServiceError } = await supabaseAdmin
+            .from('medical_services')
+            .select('id')
+            .eq('id', requestedServiceId)
+            .eq('facility_id', facilityId)
+            .eq('category', 'Consultation')
+            .eq('is_active', true)
+            .maybeSingle();
+
+        if (selectedServiceError) throw selectedServiceError;
+        if (selectedService?.id) return selectedService.id;
+    }
+
+    let consultationServices = await loadActiveConsultationServices(facilityId);
+    if (consultationServices.length === 0) {
+        const workspace = workspaceMetadata || (await loadTenantWorkspaceMetadata(tenantId));
+        await provisionWorkspaceDefaults({
+            tenantId,
+            facilityId,
+            userId,
+            workspaceType: workspace.workspaceType,
+            setupMode: workspace.setupMode,
+            teamMode: workspace.teamMode,
+        });
+
+        consultationServices = await loadActiveConsultationServices(facilityId);
+    }
+
+    const picked = pickConsultationServiceForVisitType(consultationServices, visitType);
+    return picked?.id || null;
+};
+
 const routeVisitSchema = z.object({
     destinationStage: z.string(),
     force: z.boolean().optional(),
@@ -888,6 +1026,7 @@ router.post('/register-intake', async (req, res) => {
 
     try {
         const payload = registerIntakeSchema.parse(req.body);
+        const warnings: string[] = [];
         const normalizePaymentType = (value?: string) => {
             const normalized = (value || 'paying').trim().toLowerCase();
             if (normalized === 'digital') return 'paying';
@@ -898,6 +1037,27 @@ router.post('/register-intake', async (req, res) => {
         const allowedPaymentTypes = new Set(['paying', 'free', 'credit', 'insured']);
         if (!allowedPaymentTypes.has(consultationPaymentType)) {
             return res.status(400).json({ error: 'Invalid consultation payment type' });
+        }
+
+        if (!tenantId || !facilityId || !userId) {
+            return res.status(403).json({ error: 'Missing tenant, facility, or user context for intake registration' });
+        }
+
+        const workspaceMetadata = await loadTenantWorkspaceMetadata(tenantId);
+        const effectiveConsultationServiceId = await resolveConsultationServiceId({
+            tenantId,
+            facilityId,
+            userId,
+            visitType: payload.visitType,
+            requestedServiceId: payload.consultationServiceId || null,
+            workspaceMetadata,
+        });
+
+        if (!effectiveConsultationServiceId) {
+            return res.status(500).json({
+                error:
+                    'No matching consultation service found (e.g. New Patient Consultation). Please check your Services Directory.',
+            });
         }
 
         // 1. Duplicate Check (Fayida ID)
@@ -940,7 +1100,7 @@ router.post('/register-intake', async (req, res) => {
             p_creditor_id: payload.creditorId || null,
             p_insurer_id: payload.insuranceProviderId || null,
             p_insurance_policy_number: payload.insurancePolicyNumber || null,
-            p_consultation_service_id: payload.consultationServiceId || null,
+            p_consultation_service_id: effectiveConsultationServiceId,
             p_provider: payload.requestedProfessionalId || 'Reception Intake'
         });
 
@@ -1003,6 +1163,22 @@ router.post('/register-intake', async (req, res) => {
                 .eq('id', visitId);
         }
 
+        if (visitId && shouldAutoRouteSoloProviderVisit(workspaceMetadata)) {
+            try {
+                await autoRouteVisitToSoloProviderDoctorQueue({
+                    visitId,
+                    facilityId,
+                    userId,
+                });
+            } catch (soloRoutingError: any) {
+                console.error(
+                    'Solo provider auto-route failed after registration:',
+                    soloRoutingError?.message || soloRoutingError
+                );
+                warnings.push('Patient registered, but automatic doctor-queue routing failed. Please refresh queue.');
+            }
+        }
+
         if (tenantId) {
             await recordAuditEvent({
                 action: 'register_intake',
@@ -1018,11 +1194,19 @@ router.post('/register-intake', async (req, res) => {
                 complianceTags: ['hipaa'],
                 sensitivityLevel: 'phi',
                 requestId: req.requestId || null,
-                metadata: { visit_id: visitId || null },
+                metadata: {
+                    visit_id: visitId || null,
+                    auto_routed_to_doctor_queue: Boolean(
+                        visitId && shouldAutoRouteSoloProviderVisit(workspaceMetadata) && warnings.length === 0
+                    ),
+                },
             });
         }
 
-        res.json(result);
+        res.json({
+            ...(typeof result === 'object' && result !== null ? (result as Record<string, unknown>) : {}),
+            warnings,
+        });
 
     } catch (error: any) {
         if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues });
@@ -1197,7 +1381,7 @@ router.post('/visits/:id/stage', async (req, res) => {
  */
 router.get('/:patientId/pre-visit-context', async (req, res) => {
     const { patientId } = req.params;
-    const { tenantId, facilityId } = req.user!;
+    const { facilityId } = req.user!;
 
     try {
         // Fetch patient to get phone (needed for AT phone-match fallback)
@@ -1236,7 +1420,7 @@ router.get('/:patientId/pre-visit-context', async (req, res) => {
         const communityNotesQuery = supabaseAdmin
             .from('community_notes')
             .select(
-                'id, created_at, visit_type, text, danger_signs, follow_up_due, visit_id, hew_user_id'
+                'id, created_at, note_type, note_text, flags, follow_up_due, visit_id, author_id'
             )
             .eq('patient_id', patientId)
             .is('visit_id', null)
@@ -1249,7 +1433,30 @@ router.get('/:patientId/pre-visit-context', async (req, res) => {
         ]);
 
         const preTriage = preTriageResult.data?.[0] ?? null;
-        const communityNotes = communityNotesResult.data ?? [];
+        const communityNotes = (communityNotesResult.data ?? []).map((note: any) => {
+            const structured = extractStructuredNoteFields(note.note_text || '');
+            const derivedDangerSigns =
+                Object.keys(structured.dangerSigns || {}).length > 0
+                    ? structured.dangerSigns
+                    : Array.isArray(note.flags) && note.flags.includes('danger_sign')
+                        ? { danger_sign: true }
+                        : {};
+
+            return {
+                id: note.id,
+                created_at: note.created_at,
+                visit_type: note.note_type || 'general',
+                text: structured.noteText,
+                danger_signs: derivedDangerSigns,
+                follow_up_due: note.follow_up_due,
+                visit_id: note.visit_id,
+                hew_user_id: note.author_id,
+                referral_summary: structured.referralSummary || null,
+                guided_protocol: structured.guidedProtocol || null,
+                guided_answers: structured.guidedAnswers || {},
+                agent_guidance: structured.agentGuidance || null,
+            };
+        });
 
         return res.json({ preTriage, communityNotes });
     } catch (error: any) {

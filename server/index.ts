@@ -1,12 +1,18 @@
-// Load .env from link-be/ regardless of which directory the process is started from.
-// When launched via `tsx link-be/server/index.ts` from the repo root the CWD is the
-// root, not link-be/, so dotenv/config would silently miss the env file.
+// Load .env from link-be/ regardless of whether the server starts from link-be/
+// or from the repo root via `tsx link-be/server/index.ts`.
+import { existsSync } from 'fs';
 import { config as loadDotenv } from 'dotenv';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = dirname(__filename);
-loadDotenv({ path: resolve(__dirname, '../../.env') });
+import { resolve } from 'path';
+const dotenvCandidates = [
+  resolve(process.cwd(), '.env'),
+  resolve(process.cwd(), 'link-be/.env'),
+];
+for (const dotenvPath of dotenvCandidates) {
+  if (existsSync(dotenvPath)) {
+    loadDotenv({ path: dotenvPath });
+    break;
+  }
+}
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -50,6 +56,7 @@ import webhookRouter from './routes/webhook';
 import agentRouter from './routes/agent';
 import { subscriptionGuard } from './middleware/subscriptionGuard';
 import { recordResponseStatus } from './services/monitoring';
+import { normalizeWorkspaceMetadata } from './services/workspaceMetadata';
 
 export const app = express();
 const port = process.env.PORT || 4000;
@@ -111,6 +118,22 @@ if (isProduction && allowedOriginSet.size === 0) {
   process.exit(1);
 }
 
+const pickFirstForwarded = (value: string | undefined) => {
+  if (!value) return '';
+  return value.split(',')[0]?.trim() || '';
+};
+
+const resolveRequestOrigin = (req: express.Request) => {
+  const host = pickFirstForwarded(req.header('x-forwarded-host') || req.header('host') || '');
+  if (!host) return '';
+
+  const proto =
+    pickFirstForwarded(req.header('x-forwarded-proto') || '') ||
+    (req.secure ? 'https' : 'http');
+
+  return normalizeOrigin(`${proto}://${host}`);
+};
+
 const safePath = (url: string | undefined) => (url || '').split('?')[0];
 
 app.set('trust proxy', 1);
@@ -156,31 +179,41 @@ app.use((req, res, next) => {
 });
 
 app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin) {
-        return callback(null, true);
-      }
+  cors((req, callback) => {
+    const requestOrigin = resolveRequestOrigin(req);
 
-      if (!isProduction && (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1'))) {
-        return callback(null, true);
-      }
-
-      if (allowedOriginSet.size === 0) {
-        if (!isProduction) {
-          return callback(null, true);
+    callback(null, {
+      origin: (origin, originCallback) => {
+        if (!origin) {
+          return originCallback(null, true);
         }
-        return callback(new Error('CORS not configured'));
-      }
 
-      const normalizedOrigin = normalizeOrigin(origin);
-      if (allowedOriginSet.has(normalizedOrigin)) {
-        return callback(null, true);
-      }
+        const normalizedOrigin = normalizeOrigin(origin);
 
-      return callback(new Error('Origin not allowed by CORS'));
-    },
-    credentials: true
+        // Always allow same-origin browser calls, even if that host is not explicitly whitelisted.
+        if (requestOrigin && normalizedOrigin === requestOrigin) {
+          return originCallback(null, true);
+        }
+
+        if (!isProduction && (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1'))) {
+          return originCallback(null, true);
+        }
+
+        if (allowedOriginSet.size === 0) {
+          if (!isProduction) {
+            return originCallback(null, true);
+          }
+          return originCallback(new Error('CORS not configured'));
+        }
+
+        if (allowedOriginSet.has(normalizedOrigin)) {
+          return originCallback(null, true);
+        }
+
+        return originCallback(new Error('Origin not allowed by CORS'));
+      },
+      credentials: true,
+    });
   })
 );
 morgan.token('safe-url', (req) => safePath((req as express.Request).originalUrl));
@@ -297,7 +330,26 @@ const clinicRegistrationSchema = z.object({
     email: z.string().email(),
     phoneNumber: z.string().min(8).max(20),
   }),
+  workspace: z
+    .object({
+      setupMode: z.enum(['recommended', 'custom', 'full']),
+      enabledModules: z.array(z.string().trim().min(1).max(64)).optional(),
+    })
+    .optional(),
 });
+
+const normalizeRegistrationModules = (values: string[] | undefined) => {
+  const unique = new Set<string>();
+  for (const value of values || []) {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) continue;
+    unique.add(normalized);
+  }
+  return Array.from(unique);
+};
+
+const isWorkspacePreferenceColumnError = (message?: string) =>
+  Boolean(message && /(requested_setup_mode|requested_modules)/i.test(message));
 
 app.post(
   '/api/clinics',
@@ -308,24 +360,49 @@ app.post(
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
     }
 
-    const { clinic, admin } = parsed.data;
+    const { clinic, admin, workspace } = parsed.data;
+    const requestedSetupMode = workspace?.setupMode || 'recommended';
+    const requestedModules =
+      requestedSetupMode === 'custom'
+        ? normalizeRegistrationModules(workspace?.enabledModules)
+        : [];
 
     try {
-      const { data, error } = await supabaseAdmin
+      const baseInsertPayload = {
+        clinic_name: clinic.name.trim(),
+        country: clinic.country.trim(),
+        location: clinic.location.trim(),
+        address: clinic.address.trim(),
+        phone_number: clinic.phoneNumber.replace(/\s+/g, ''),
+        email: clinic.email ? clinic.email.trim().toLowerCase() : null,
+        admin_name: admin.name.trim(),
+        admin_email: admin.email.trim().toLowerCase(),
+        admin_phone: admin.phoneNumber.replace(/\s+/g, ''),
+      };
+      const workspaceInsertPayload = {
+        ...baseInsertPayload,
+        requested_setup_mode: requestedSetupMode,
+        requested_modules: requestedModules,
+      };
+
+      let insertQuery = supabaseAdmin
         .from('clinic_registrations')
-        .insert({
-          clinic_name: clinic.name.trim(),
-          country: clinic.country.trim(),
-          location: clinic.location.trim(),
-          address: clinic.address.trim(),
-          phone_number: clinic.phoneNumber.replace(/\s+/g, ''),
-          email: clinic.email ? clinic.email.trim().toLowerCase() : null,
-          admin_name: admin.name.trim(),
-          admin_email: admin.email.trim().toLowerCase(),
-          admin_phone: admin.phoneNumber.replace(/\s+/g, ''),
-        })
+        .insert(workspaceInsertPayload)
         .select('id')
         .single();
+
+      let { data, error } = await insertQuery;
+
+      // Backward compatibility for environments where FEAT-31 migration has not run yet.
+      if (error && isWorkspacePreferenceColumnError(error.message)) {
+        const fallbackResult = await supabaseAdmin
+          .from('clinic_registrations')
+          .insert(baseInsertPayload)
+          .select('id')
+          .single();
+        data = fallbackResult.data;
+        error = fallbackResult.error;
+      }
 
       if (error || !data?.id) {
         return res.status(500).json({ error: error?.message || 'Unable to submit registration' });
@@ -1047,9 +1124,6 @@ app.delete('/api/feature-requests/:id', requireUser, async (req, res) => {
 // Clinic Admin overview (BFF for dashboard)
 app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
   const { authUserId, facilityId: userFacilityId, tenantId: userTenantId, role } = req.user!;
-  if (!clinicAdminOverviewRoles.has(role)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
 
   const facilityId = (req.query.facilityId as string | undefined) || userFacilityId;
 
@@ -1086,6 +1160,15 @@ app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
 
     if (facilityErr || !facility) {
       return res.status(404).json({ error: 'Facility not found' });
+    }
+
+    const isFacilityOwnerDoctor =
+      role === 'doctor' &&
+      typeof facility.admin_user_id === 'string' &&
+      facility.admin_user_id === authUserId;
+
+    if (!clinicAdminOverviewRoles.has(role) && !isFacilityOwnerDoctor) {
+      return res.status(403).json({ error: 'Forbidden' });
     }
 
     const today = new Date().toISOString().split('T')[0];
@@ -1143,11 +1226,27 @@ app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
     const hasDepartment = (departmentsCount.count ?? 0) > 0;
     const hasConsultationService = (consultationServiceCount.count ?? 0) > 0;
     const systemSetupComplete = hasDepartment && hasConsultationService;
+    let workspace = normalizeWorkspaceMetadata(null);
+
+    if (facility.tenant_id) {
+      const { data: workspaceRow, error: workspaceError } = await supabaseAdmin
+        .from('tenants')
+        .select('workspace_type, setup_mode, team_mode, enabled_modules')
+        .eq('id', facility.tenant_id)
+        .maybeSingle();
+
+      if (workspaceError) {
+        console.warn('clinic-admin/overview workspace metadata lookup failed:', workspaceError.message);
+      } else {
+        workspace = normalizeWorkspaceMetadata(workspaceRow as any);
+      }
+    }
 
     return res.json({
       facility,
       facilityId,
       tenantId: facility.tenant_id,
+      workspace,
       staffCount: staffCount.count ?? 0,
       pendingRequestsCount: pendingRequestsCount.count ?? 0,
       todayPatients: todayPatients.count ?? 0,
