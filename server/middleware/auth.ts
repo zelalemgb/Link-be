@@ -4,6 +4,7 @@ import { recordAuthFailure } from '../services/monitoring';
 
 const { ADMIN_API_SECRET, AUTH_DEBUG } = process.env;
 const isAuthDebug = AUTH_DEBUG === 'true';
+const isTestEnv = process.env.NODE_ENV === 'test';
 
 // In-memory LRU cache for user profiles (60-second TTL, max 500 entries)
 interface CacheEntry {
@@ -110,7 +111,7 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
         }
 
         // Check cache first
-        let profile = userProfileCache.get(authUserId);
+        let profile = isTestEnv ? null : userProfileCache.get(authUserId);
         let fromCache = !!profile;
 
         // If not in cache, fetch user profile to get role and facility context
@@ -133,7 +134,7 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
             profile = fetchedProfile;
 
             // Cache the profile (even if null, for 60 seconds)
-            if (profile) {
+            if (profile && !isTestEnv) {
                 userProfileCache.set(authUserId, profile);
             }
         }
@@ -151,7 +152,7 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
         }
 
         // Periodically clean up expired cache entries
-        if (Math.random() < 0.01) {
+        if (!isTestEnv && Math.random() < 0.01) {
             userProfileCache.cleanup();
         }
 

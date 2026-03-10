@@ -5,6 +5,7 @@ import { getSubscriptionStatus, activateSubscription, provisionTrial } from '../
 import { issueLicense, activateHubLicense, getPublicKey } from '../services/licenseService';
 import { invalidateSubscriptionCache } from '../middleware/subscriptionGuard';
 import { recordAuditEvent } from '../services/audit-log';
+import { normalizeWorkspaceMetadata } from '../services/workspaceMetadata';
 
 const router = express.Router();
 
@@ -13,7 +14,21 @@ router.get('/status', requireUser, requireScopedUser, async (req, res) => {
   try {
     const { tenantId } = req.user as any;
     const status = await getSubscriptionStatus(tenantId);
-    res.json({ success: true, subscription: status });
+    const { data: workspaceRow, error: workspaceError } = await supabaseAdmin
+      .from('tenants')
+      .select('workspace_type, setup_mode, team_mode, enabled_modules')
+      .eq('id', tenantId)
+      .maybeSingle();
+
+    if (workspaceError) {
+      console.warn('Subscription workspace metadata lookup failed:', workspaceError.message);
+    }
+
+    res.json({
+      success: true,
+      subscription: status,
+      workspace: normalizeWorkspaceMetadata(workspaceRow as any),
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

@@ -3,9 +3,12 @@ import crypto from 'crypto';
 import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
 import { requireUser } from '../middleware/auth';
+import { normalizeWorkspaceMetadata } from '../services/workspaceMetadata';
+import { provisionWorkspaceDefaults } from '../services/workspaceProvisioning';
 
 const router = Router();
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://linkhc.org';
+const LEGACY_DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000001';
 const VERIFICATION_CODE_TTL_MINUTES = 15;
 const verificationCodeSecret = process.env.EMAIL_VERIFICATION_CODE_SECRET?.trim();
 if (!verificationCodeSecret && process.env.NODE_ENV !== 'development') {
@@ -102,6 +105,12 @@ const completeClinicAdminOnboardingSchema = z.object({
     name: z.string().min(2).max(120).optional(),
 });
 
+const completeProviderOnboardingSchema = z.object({
+    fullName: z.string().min(2).max(120).optional(),
+    phoneNumber: z.string().min(8).max(24).optional().nullable(),
+    workspaceName: z.string().min(2).max(160).optional(),
+});
+
 /**
  * GET /api/auth/profile
  * Returns the current user's profile and status checks
@@ -182,10 +191,28 @@ router.get('/profile', requireUser, async (req, res) => { // User is already aut
             }
         }
 
+        let workspace = normalizeWorkspaceMetadata(null);
+        if (userData.tenant_id) {
+            const { data: tenantMetadata, error: tenantMetadataError } = await supabaseAdmin
+                .from('tenants')
+                .select('workspace_type, setup_mode, team_mode, enabled_modules')
+                .eq('id', userData.tenant_id)
+                .maybeSingle();
+
+            if (tenantMetadataError) {
+                console.warn('Profile workspace metadata lookup failed:', tenantMetadataError.message);
+            } else {
+                workspace = normalizeWorkspaceMetadata(tenantMetadata as any);
+            }
+        }
+
         // 7. Success
         return res.json({
             status: 'active',
-            user: userData,
+            user: {
+                ...userData,
+                workspace,
+            },
             isFirstLogin
         });
 
@@ -229,7 +256,27 @@ router.get('/user', requireUser, async (req, res) => {
             return res.status(404).json({ error: 'User not found' });
         }
 
-        return res.json({ user: data });
+        let workspace = normalizeWorkspaceMetadata(null);
+        if (data.tenant_id) {
+            const { data: tenantMetadata, error: tenantMetadataError } = await supabaseAdmin
+                .from('tenants')
+                .select('workspace_type, setup_mode, team_mode, enabled_modules')
+                .eq('id', data.tenant_id)
+                .maybeSingle();
+
+            if (tenantMetadataError) {
+                console.warn('User workspace metadata lookup failed:', tenantMetadataError.message);
+            } else {
+                workspace = normalizeWorkspaceMetadata(tenantMetadata as any);
+            }
+        }
+
+        return res.json({
+            user: {
+                ...data,
+                workspace,
+            },
+        });
     } catch (err: any) {
         console.error('User fetch error:', err?.message || err);
         return res.status(500).json({ error: 'Internal server error' });
@@ -285,6 +332,34 @@ router.get('/facilities', requireUser, async (req, res) => {
             roleNamesByUser.set(ur.user_id, existing);
         });
 
+        const tenantIds = Array.from(
+            new Set((userRows || []).map((row: any) => row.tenant_id).filter(Boolean))
+        );
+        const workspaceByTenantId = new Map<string, ReturnType<typeof normalizeWorkspaceMetadata>>();
+        if (tenantIds.length > 0) {
+            const { data: tenantRows, error: tenantRowsError } = await supabaseAdmin
+                .from('tenants')
+                .select('id, workspace_type, setup_mode, team_mode, enabled_modules')
+                .in('id', tenantIds);
+
+            if (tenantRowsError) {
+                console.warn('Facilities workspace metadata lookup failed:', tenantRowsError.message);
+            } else {
+                (tenantRows || []).forEach((tenant: any) => {
+                    if (!tenant?.id) return;
+                    workspaceByTenantId.set(
+                        String(tenant.id),
+                        normalizeWorkspaceMetadata({
+                            workspace_type: tenant.workspace_type,
+                            setup_mode: tenant.setup_mode,
+                            team_mode: tenant.team_mode,
+                            enabled_modules: tenant.enabled_modules,
+                        })
+                    );
+                });
+            }
+        }
+
         const facilities = (userRows || []).map((row: any) => ({
             id: row.id,
             facility_id: row.facility_id,
@@ -292,6 +367,9 @@ router.get('/facilities', requireUser, async (req, res) => {
             user_role: row.user_role || roleNamesByUser.get(row.id)?.[0] || 'user',
             user_roles: roleNamesByUser.get(row.id) || undefined,
             tenant_id: row.tenant_id,
+            workspace: row.tenant_id
+                ? workspaceByTenantId.get(row.tenant_id) || normalizeWorkspaceMetadata(null)
+                : normalizeWorkspaceMetadata(null),
         }));
 
         return res.json({ facilities });
@@ -359,13 +437,11 @@ router.post('/clinic-admin-onboarding/complete', requireUser, async (req, res) =
                     auth_user_id: authUserId,
                     name: userName,
                     full_name: userName,
-                    email: normalizedEmail,
                     facility_id: facility.id,
                     tenant_id: facility.tenant_id,
                     user_role: 'admin',
                     verified: true,
                     email_verified: true,
-                    is_active: true,
                 })
                 .select('id')
                 .single();
@@ -380,13 +456,11 @@ router.post('/clinic-admin-onboarding/complete', requireUser, async (req, res) =
                 .update({
                     name: userName,
                     full_name: userName,
-                    email: normalizedEmail,
                     facility_id: facility.id,
                     tenant_id: facility.tenant_id,
                     user_role: 'admin',
                     verified: true,
                     email_verified: true,
-                    is_active: true,
                 })
                 .eq('id', userProfile.id);
 
@@ -441,13 +515,354 @@ router.post('/clinic-admin-onboarding/complete', requireUser, async (req, res) =
             }
         }
 
+        let provisioning: Awaited<ReturnType<typeof provisionWorkspaceDefaults>> | null = null;
+        try {
+            provisioning = await provisionWorkspaceDefaults({
+                tenantId: facility.tenant_id,
+                facilityId: facility.id,
+                userId: userProfile.id,
+                workspaceType: 'clinic',
+                setupMode: 'recommended',
+                teamMode: 'solo',
+            });
+        } catch (provisioningError: any) {
+            console.error(
+                'Workspace provisioning failed during clinic admin onboarding:',
+                provisioningError?.message || provisioningError
+            );
+        }
+
         return res.json({
             success: true,
             facilityId: facility.id,
             facilityName: facility.name,
+            provisioning,
         });
     } catch (err: any) {
         console.error('Clinic admin onboarding completion error:', err?.message || err);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * POST /api/auth/provider-onboarding/complete
+ * Creates or finalizes a solo provider workspace for the authenticated user.
+ */
+router.post('/provider-onboarding/complete', requireUser, async (req, res) => {
+    const parsed = completeProviderOnboardingSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+        return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
+    }
+
+    try {
+        const { authUserId } = req.user!;
+        const { data: authUserData, error: authUserError } = await supabaseAdmin.auth.admin.getUserById(authUserId);
+
+        if (authUserError || !authUserData.user) {
+            return res.status(401).json({ error: 'Invalid user context' });
+        }
+
+        const normalizedEmail = authUserData.user.email?.trim().toLowerCase();
+        if (!normalizedEmail) {
+            return res.status(400).json({ error: 'Authenticated user email is required' });
+        }
+
+        const userMetadata = (authUserData.user.user_metadata || {}) as Record<string, unknown>;
+        const resolvedFullName =
+            parsed.data.fullName?.trim() ||
+            (typeof userMetadata.full_name === 'string' ? userMetadata.full_name : null) ||
+            (typeof userMetadata.name === 'string' ? userMetadata.name : null) ||
+            normalizedEmail.split('@')[0];
+        const normalizedPhoneNumber = parsed.data.phoneNumber
+            ? parsed.data.phoneNumber.replace(/\s+/g, '')
+            : null;
+        const workspaceName = (parsed.data.workspaceName || `${resolvedFullName} Solo Practice`).trim();
+
+        const { data: existingUser, error: existingUserError } = await supabaseAdmin
+            .from('users')
+            .select('id, tenant_id, facility_id')
+            .eq('auth_user_id', authUserId)
+            .maybeSingle();
+
+        if (existingUserError) {
+            return res.status(500).json({ error: existingUserError.message });
+        }
+
+        let tenantId = existingUser?.tenant_id ?? null;
+        let facilityId = existingUser?.facility_id ?? null;
+        let clinicCode: string | null = null;
+
+        // Recovery path for partially provisioned provider accounts:
+        // if a facility was already created in a previous failed run,
+        // re-use it instead of creating duplicates.
+        if (!facilityId) {
+            const { data: ownedFacility, error: ownedFacilityError } = await supabaseAdmin
+                .from('facilities')
+                .select('id, tenant_id, clinic_code')
+                .eq('admin_user_id', authUserId)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+
+            if (ownedFacilityError) {
+                return res.status(500).json({ error: ownedFacilityError.message });
+            }
+
+            if (ownedFacility?.id) {
+                facilityId = ownedFacility.id;
+                clinicCode = (ownedFacility.clinic_code as string | null) ?? null;
+                tenantId = ownedFacility.tenant_id || tenantId;
+            }
+        }
+
+        // New auth records may carry the legacy placeholder tenant from trigger defaults.
+        // Treat it as "no tenant assigned yet" when onboarding a solo provider workspace.
+        if (tenantId === LEGACY_DEFAULT_TENANT_ID && !facilityId) {
+            tenantId = null;
+        }
+
+        if (!tenantId) {
+            const { data: tenantInsert, error: tenantInsertError } = await supabaseAdmin
+                .from('tenants')
+                .insert({
+                    name: workspaceName,
+                    is_active: true,
+                    workspace_type: 'provider',
+                    setup_mode: 'recommended',
+                    team_mode: 'solo',
+                    enabled_modules: [],
+                })
+                .select('id')
+                .single();
+
+            if (tenantInsertError || !tenantInsert?.id) {
+                return res.status(500).json({ error: tenantInsertError?.message || 'Failed to create provider tenant' });
+            }
+
+            tenantId = tenantInsert.id;
+        }
+
+        if (!facilityId) {
+            const { data: codeData, error: codeError } = await supabaseAdmin.rpc('generate_clinic_code', {
+                clinic_name_input: workspaceName,
+            });
+
+            if (codeError) {
+                return res.status(500).json({ error: codeError.message });
+            }
+
+            clinicCode = (codeData as string) || null;
+
+            const { data: facilityInsert, error: facilityInsertError } = await supabaseAdmin
+                .from('facilities')
+                .insert({
+                    tenant_id: tenantId,
+                    name: workspaceName,
+                    facility_type: 'clinic',
+                    location: null,
+                    address: null,
+                    phone_number: normalizedPhoneNumber,
+                    email: normalizedEmail,
+                    clinic_code: clinicCode,
+                    verification_status: 'approved',
+                    verified: true,
+                    activation_status: 'active',
+                    admin_user_id: authUserId,
+                    notes: JSON.stringify({
+                        source: 'provider_self_serve',
+                        provider_name: resolvedFullName,
+                    }),
+                })
+                .select('id, clinic_code')
+                .single();
+
+            if (facilityInsertError || !facilityInsert?.id) {
+                const { data: existingFacilityByName, error: existingFacilityByNameError } = await supabaseAdmin
+                    .from('facilities')
+                    .select('id, clinic_code')
+                    .eq('tenant_id', tenantId)
+                    .eq('name', workspaceName)
+                    .order('created_at', { ascending: true })
+                    .limit(1)
+                    .maybeSingle();
+
+                if (existingFacilityByNameError || !existingFacilityByName?.id) {
+                    return res.status(500).json({
+                        error:
+                            facilityInsertError?.message ||
+                            existingFacilityByNameError?.message ||
+                            'Failed to create provider facility',
+                    });
+                }
+
+                facilityId = existingFacilityByName.id;
+                clinicCode = (existingFacilityByName.clinic_code as string | null) ?? clinicCode;
+            } else {
+                facilityId = facilityInsert.id;
+                clinicCode = (facilityInsert.clinic_code as string | null) ?? clinicCode;
+            }
+        } else {
+            const { data: existingFacility, error: existingFacilityError } = await supabaseAdmin
+                .from('facilities')
+                .select('id, tenant_id, clinic_code, admin_user_id')
+                .eq('id', facilityId)
+                .maybeSingle();
+
+            if (existingFacilityError || !existingFacility) {
+                return res.status(500).json({ error: existingFacilityError?.message || 'Failed to load provider facility' });
+            }
+
+            clinicCode = existingFacility.clinic_code || null;
+            if (!tenantId) {
+                tenantId = existingFacility.tenant_id || null;
+            }
+
+            if (!existingFacility.admin_user_id) {
+                await supabaseAdmin
+                    .from('facilities')
+                    .update({ admin_user_id: authUserId })
+                    .eq('id', facilityId);
+            }
+        }
+
+        if (!tenantId || !facilityId) {
+            return res.status(500).json({ error: 'Provider workspace context is incomplete' });
+        }
+
+        let userProfileId = existingUser?.id || null;
+        if (!existingUser) {
+            const { data: insertedUser, error: insertUserError } = await supabaseAdmin
+                .from('users')
+                .insert({
+                    auth_user_id: authUserId,
+                    name: resolvedFullName,
+                    full_name: resolvedFullName,
+                    phone_number: normalizedPhoneNumber,
+                    facility_id: facilityId,
+                    tenant_id: tenantId,
+                    role: 'provider',
+                    user_role: 'doctor',
+                    verified: true,
+                    email_verified: true,
+                })
+                .select('id')
+                .single();
+
+            if (insertUserError || !insertedUser?.id) {
+                return res.status(500).json({ error: insertUserError?.message || 'Failed to create provider profile' });
+            }
+
+            userProfileId = insertedUser.id;
+        } else {
+            const providerUserUpdatePayload: Record<string, unknown> = {
+                name: resolvedFullName,
+                full_name: resolvedFullName,
+                facility_id: facilityId,
+                tenant_id: tenantId,
+                role: 'provider',
+                user_role: 'doctor',
+                verified: true,
+                email_verified: true,
+            };
+            if (normalizedPhoneNumber) {
+                providerUserUpdatePayload.phone_number = normalizedPhoneNumber;
+            }
+
+            const { error: updateUserError } = await supabaseAdmin
+                .from('users')
+                .update(providerUserUpdatePayload)
+                .eq('id', existingUser.id);
+
+            if (updateUserError) {
+                return res.status(500).json({ error: updateUserError.message });
+            }
+            userProfileId = existingUser.id;
+        }
+
+        const { data: doctorRole, error: doctorRoleError } = await supabaseAdmin
+            .from('roles')
+            .select('id')
+            .or('slug.eq.doctor,name.eq.doctor')
+            .maybeSingle();
+
+        if (doctorRoleError) {
+            return res.status(500).json({ error: doctorRoleError.message });
+        }
+
+        if (doctorRole?.id && userProfileId) {
+            const { data: existingRoleLink, error: existingRoleError } = await supabaseAdmin
+                .from('user_roles')
+                .select('id')
+                .eq('user_id', userProfileId)
+                .eq('role_id', doctorRole.id)
+                .eq('facility_id', facilityId)
+                .maybeSingle();
+
+            if (existingRoleError) {
+                return res.status(500).json({ error: existingRoleError.message });
+            }
+
+            if (!existingRoleLink) {
+                const { error: roleInsertError } = await supabaseAdmin
+                    .from('user_roles')
+                    .insert({
+                        user_id: userProfileId,
+                        role_id: doctorRole.id,
+                        facility_id: facilityId,
+                        tenant_id: tenantId,
+                        is_active: true,
+                        assigned_by: userProfileId,
+                    });
+
+                if (roleInsertError) {
+                    return res.status(500).json({ error: roleInsertError.message });
+                }
+            }
+        }
+
+        let provisioning: Awaited<ReturnType<typeof provisionWorkspaceDefaults>> | null = null;
+        try {
+            provisioning = await provisionWorkspaceDefaults({
+                tenantId,
+                facilityId,
+                userId: userProfileId!,
+                workspaceType: 'provider',
+                setupMode: 'recommended',
+                teamMode: 'solo',
+            });
+        } catch (provisioningError: any) {
+            console.error(
+                'Workspace provisioning failed during provider onboarding:',
+                provisioningError?.message || provisioningError
+            );
+        }
+
+        try {
+            await supabaseAdmin.auth.admin.updateUserById(authUserId, {
+                user_metadata: {
+                    ...userMetadata,
+                    name: resolvedFullName,
+                    full_name: resolvedFullName,
+                    user_role: 'doctor',
+                    facility_id: facilityId,
+                    tenant_id: tenantId,
+                    workspace_type: 'provider',
+                },
+            });
+        } catch (authMetadataError: any) {
+            console.warn('Provider onboarding metadata update failed:', authMetadataError?.message || authMetadataError);
+        }
+
+        return res.json({
+            success: true,
+            profileId: userProfileId,
+            tenantId,
+            facilityId,
+            clinicCode,
+            provisioning,
+        });
+    } catch (err: any) {
+        console.error('Provider onboarding completion error:', err?.message || err);
         return res.status(500).json({ error: 'Internal server error' });
     }
 });

@@ -4,6 +4,7 @@ import { supabaseAdmin } from '../config/supabase';
 import { requirePatientSession } from '../middleware/patient-auth';
 import { responseCache } from '../middleware/cache';
 import { recordAuditEvent } from '../services/audit-log';
+import { buildPatientSyncedRecords } from '../services/patientRecordsSyncService';
 
 const router = Router();
 router.use(requirePatientSession);
@@ -306,6 +307,56 @@ router.get('/patient/visit-history', patientPortalLimiter, responseCache(60), as
         return res.json(visits || []);
     } catch (error: any) {
         return res.status(500).json({ error: error.message || 'Failed to fetch visit history' });
+    }
+});
+
+/**
+ * GET /api/mobile/patient/records
+ * Get synced health record bundle for the authenticated patient
+ */
+router.get('/patient/records', patientPortalLimiter, responseCache(30), async (req, res) => {
+    const { patientAccountId, tenantId } = req.patient!;
+    const requestedLimit = Number.parseInt(String(req.query.limit || ''), 10);
+    const maxRecords = Number.isFinite(requestedLimit) ? requestedLimit : undefined;
+
+    try {
+        const bundle = await buildPatientSyncedRecords({
+            patientAccountId,
+            tenantId,
+            maxRecords,
+        });
+        const response = {
+            ...bundle,
+            growthLoop: {
+                source: 'mobile-patient-records',
+                generatedAt: new Date().toISOString(),
+            },
+        };
+
+        if (tenantId) {
+            await recordAuditEvent({
+                action: 'view_synced_records',
+                eventType: 'read',
+                entityType: 'patient_record_bundle',
+                entityId: patientAccountId,
+                tenantId,
+                actorRole: 'patient',
+                actorUserId: null,
+                actorIpAddress: req.ip,
+                actorUserAgent: req.get('user-agent') || null,
+                complianceTags: ['hipaa'],
+                sensitivityLevel: 'phi',
+                requestId: req.requestId || null,
+                metadata: {
+                    result_count: response.records.length,
+                    counts: response.counts,
+                },
+            });
+        }
+
+        return res.json(response);
+    } catch (error: any) {
+        return res.status(500).json({ error: error.message || 'Failed to fetch synced records' });
     }
 });
 

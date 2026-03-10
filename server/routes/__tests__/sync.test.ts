@@ -26,6 +26,18 @@ const ensureEnv = () => {
   process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-service-role-key';
 };
 
+const UUIDS = {
+  tenant1: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  tenant2: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+  facility1: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  facility2: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+  profile1: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+  entity1: '11111111-1111-4111-8111-111111111111',
+  entity2: '22222222-2222-4222-8222-222222222222',
+  op1: '33333333-3333-4333-8333-333333333333',
+  op2: '44444444-4444-4444-8444-444444444444',
+};
+
 const loadSyncService = async () => {
   ensureEnv();
   const [syncMod, configMod] = await Promise.all([
@@ -41,12 +53,12 @@ const loadSyncService = async () => {
 
 /** Build a minimal valid push payload */
 const makePushPayload = (overrides: Record<string, unknown> = {}) => ({
-  facilityId: 'fac-001',
+  facilityId: UUIDS.facility1,
   deviceId:   'device-abc',
   ops: [{
-    opId:           'op-uuid-0001-0001-0001-000000000001',
+    opId:           UUIDS.op1,
     entityType:     'patients',
-    entityId:       'ent-uuid-0001-0001-0001-000000000001',
+    entityId:       UUIDS.entity1,
     opType:         'upsert',
     data: {
       full_name:   'Alem Tesfaye',
@@ -62,9 +74,9 @@ const makePushPayload = (overrides: Record<string, unknown> = {}) => ({
 /** A minimal scoped actor */
 const makeActor = (overrides: Record<string, unknown> = {}) => ({
   authUserId: 'auth-user-001',
-  profileId:  'profile-001',
-  tenantId:   'tenant-001',
-  facilityId: 'fac-001',
+  profileId:  UUIDS.profile1,
+  tenantId:   UUIDS.tenant1,
+  facilityId: UUIDS.facility1,
   role:       'nurse',
   requestId:  'req-001',
   ipAddress:  '127.0.0.1',
@@ -119,8 +131,8 @@ test('push: rejects actor missing tenantId', async () => {
 // ── 2. Facility scope violation ─────────────────────────────────────────────
 test('push: rejects when payload facilityId differs from actor facilityId', async () => {
   const { ingestSyncPush } = await loadSyncService();
-  const actor = makeActor({ facilityId: 'fac-OTHER' });
-  const result = await ingestSyncPush({ actor, payload: makePushPayload({ facilityId: 'fac-001' }) });
+  const actor = makeActor({ facilityId: UUIDS.facility2 });
+  const result = await ingestSyncPush({ actor, payload: makePushPayload({ facilityId: UUIDS.facility1 }) });
   assert.equal(result.ok, false);
   assert.equal((result as any).code, 'TENANT_RESOURCE_SCOPE_VIOLATION');
 });
@@ -130,9 +142,9 @@ test('push: rejects payload with ops missing opId', async () => {
   const { ingestSyncPush } = await loadSyncService();
   const actor = makeActor();
   const badPayload = {
-    facilityId: 'fac-001',
+    facilityId: UUIDS.facility1,
     deviceId: 'device-abc',
-    ops: [{ entityType: 'patients', entityId: 'ent-001', opType: 'upsert', clientCreatedAt: '2026-03-04T10:00:00.000Z' }],
+    ops: [{ entityType: 'patients', entityId: UUIDS.entity1, opType: 'upsert', clientCreatedAt: '2026-03-04T10:00:00.000Z' }],
   };
   const result = await ingestSyncPush({ actor, payload: badPayload });
   assert.equal(result.ok, false);
@@ -150,7 +162,7 @@ test('push: duplicate op_id with same payload hash returns duplicate status', as
   try {
     supabaseAdmin.from = buildFromStub({
       facilities: {
-        maybeSingle: async () => ({ data: { id: 'fac-001', tenant_id: 'tenant-001' }, error: null }),
+        maybeSingle: async () => ({ data: { id: UUIDS.facility1, tenant_id: UUIDS.tenant1 }, error: null }),
       },
       sync_op_ledger: {
         // Return an existing row — same hash means duplicate
@@ -215,7 +227,7 @@ test('push LWW: client wins when clientUpdatedAt is newer than server', async ()
         order:       (..._: any[]) => chain,
         limit:       (..._: any[]) => chain,
         maybeSingle: async () => {
-          if (table === 'facilities')  return { data: { id: 'fac-001', tenant_id: 'tenant-001' }, error: null };
+          if (table === 'facilities')  return { data: { id: UUIDS.facility1, tenant_id: UUIDS.tenant1 }, error: null };
           if (table === 'patients')    return { data: { id: payload.ops[0].entityId, row_version: 1, updated_at: serverTs, deleted_at: null }, error: null };
           return { data: null, error: null };
         },
@@ -266,7 +278,7 @@ test('push LWW: server wins when serverUpdatedAt is newer → conflict result', 
         order:       (..._: any[]) => chain,
         limit:       (..._: any[]) => chain,
         maybeSingle: async () => {
-          if (table === 'facilities') return { data: { id: 'fac-001', tenant_id: 'tenant-001' }, error: null };
+          if (table === 'facilities') return { data: { id: UUIDS.facility1, tenant_id: UUIDS.tenant1 }, error: null };
           if (table === 'patients')   return { data: { id: payload.ops[0].entityId, row_version: 99, updated_at: serverTs, deleted_at: null }, error: null };
           return { data: null, error: null };
         },
@@ -297,9 +309,9 @@ test('push: delete opType calls update with deleted_at', async () => {
 
   const payload = makePushPayload({
     ops: [{
-      opId:            'op-uuid-del-0001-0001-0001-000000000002',
+      opId:            UUIDS.op2,
       entityType:      'patients',
-      entityId:        'ent-uuid-del-0001-0001-0001-000000000002',
+      entityId:        UUIDS.entity2,
       opType:          'delete',
       data:            { updated_at: '2026-03-04T11:00:00.000Z' },
       clientCreatedAt: '2026-03-04T11:00:00.000Z',
@@ -321,7 +333,7 @@ test('push: delete opType calls update with deleted_at', async () => {
         order:       (..._: any[]) => chain,
         limit:       (..._: any[]) => chain,
         maybeSingle: async () => {
-          if (table === 'facilities') return { data: { id: 'fac-001', tenant_id: 'tenant-001' }, error: null };
+          if (table === 'facilities') return { data: { id: UUIDS.facility1, tenant_id: UUIDS.tenant1 }, error: null };
           if (table === 'patients')   return { data: null, error: null }; // not found → fresh delete is idempotent
           return { data: null, error: null };
         },
@@ -351,8 +363,8 @@ test('pull: no cursor returns all ops from ledger', async () => {
   const actor = makeActor();
 
   const fakeOps = [
-    { seq: 1, op_id: 'op-001', device_id: 'dev-1', payload: { entityType: 'patients', entityId: 'ent-001', opType: 'upsert', data: {}, clientCreatedAt: '2026-03-04T09:00:00.000Z' }, created_at: '2026-03-04T09:00:01.000Z' },
-    { seq: 2, op_id: 'op-002', device_id: 'dev-1', payload: { entityType: 'visits',   entityId: 'vis-001', opType: 'upsert', data: {}, clientCreatedAt: '2026-03-04T09:01:00.000Z' }, created_at: '2026-03-04T09:01:01.000Z' },
+    { seq: 1, op_id: UUIDS.op1, device_id: 'dev-1', payload: { entityType: 'patients', entityId: UUIDS.entity1, opType: 'upsert', data: {}, clientCreatedAt: '2026-03-04T09:00:00.000Z' }, created_at: '2026-03-04T09:00:01.000Z' },
+    { seq: 2, op_id: UUIDS.op2, device_id: 'dev-1', payload: { entityType: 'visits',   entityId: UUIDS.entity2, opType: 'upsert', data: {}, clientCreatedAt: '2026-03-04T09:01:00.000Z' }, created_at: '2026-03-04T09:01:01.000Z' },
   ];
 
   const original = supabaseAdmin.from;
@@ -366,7 +378,7 @@ test('pull: no cursor returns all ops from ledger', async () => {
         order:       (..._: any[]) => chain,
         limit:       (..._: any[]) => chain,
         maybeSingle: async () => {
-          if (table === 'facilities') return { data: { id: 'fac-001', tenant_id: 'tenant-001' }, error: null };
+          if (table === 'facilities') return { data: { id: UUIDS.facility1, tenant_id: UUIDS.tenant1 }, error: null };
           return { data: null, error: null };
         },
         then: ((res: any) => {
@@ -379,7 +391,7 @@ test('pull: no cursor returns all ops from ledger', async () => {
       return chain;
     };
 
-    const result = await loadSyncPull({ actor, query: { facilityId: 'fac-001' } });
+    const result = await loadSyncPull({ actor, query: { facilityId: UUIDS.facility1 } });
     assert.equal(result.ok, true, JSON.stringify(result));
     if (result.ok) {
       assert.equal(result.data.ops.length, 2);
@@ -408,13 +420,13 @@ test('pull: cursor=1 returns only ops with seq > 1', async () => {
         order:       (..._: any[]) => chain,
         limit:       (..._: any[]) => chain,
         maybeSingle: async () => {
-          if (table === 'facilities') return { data: { id: 'fac-001', tenant_id: 'tenant-001' }, error: null };
+          if (table === 'facilities') return { data: { id: UUIDS.facility1, tenant_id: UUIDS.tenant1 }, error: null };
           return { data: null, error: null };
         },
         then: ((res: any) => {
           // Simulate server returning only seq=2 when cursor=1 (gt filter applied by DB)
           const data = table === 'sync_op_ledger'
-            ? [{ seq: 2, op_id: 'op-002', device_id: 'dev-1', payload: { entityType: 'patients', entityId: 'ent-001', opType: 'upsert', data: {}, clientCreatedAt: '2026-03-04T10:00:00.000Z' }, created_at: '2026-03-04T10:00:01.000Z' }]
+            ? [{ seq: 2, op_id: UUIDS.op2, device_id: 'dev-1', payload: { entityType: 'patients', entityId: UUIDS.entity1, opType: 'upsert', data: {}, clientCreatedAt: '2026-03-04T10:00:00.000Z' }, created_at: '2026-03-04T10:00:01.000Z' }]
             : [];
           return Promise.resolve({ data, error: null }).then(res);
         }) as any,
@@ -422,7 +434,7 @@ test('pull: cursor=1 returns only ops with seq > 1', async () => {
       return chain;
     };
 
-    const result = await loadSyncPull({ actor, query: { facilityId: 'fac-001', cursor: '1' } });
+    const result = await loadSyncPull({ actor, query: { facilityId: UUIDS.facility1, cursor: '1' } });
     assert.equal(result.ok, true);
     if (result.ok) {
       assert.equal(result.data.ops.length, 1);
@@ -441,7 +453,7 @@ test('pull: tombstones are included in pull response', async () => {
   const actor = makeActor();
 
   const fakeTombstones = [
-    { entity_type: 'patients', entity_id: 'deleted-pat-001', deleted_at: '2026-03-04T10:30:00.000Z', deleted_revision: 5 },
+    { entity_type: 'patients', entity_id: UUIDS.entity2, deleted_at: '2026-03-04T10:30:00.000Z', deleted_revision: 5 },
   ];
 
   const original = supabaseAdmin.from;
@@ -455,7 +467,7 @@ test('pull: tombstones are included in pull response', async () => {
         order:       (..._: any[]) => chain,
         limit:       (..._: any[]) => chain,
         maybeSingle: async () => {
-          if (table === 'facilities') return { data: { id: 'fac-001', tenant_id: 'tenant-001' }, error: null };
+          if (table === 'facilities') return { data: { id: UUIDS.facility1, tenant_id: UUIDS.tenant1 }, error: null };
           return { data: null, error: null };
         },
         then: ((res: any) => {
@@ -466,13 +478,13 @@ test('pull: tombstones are included in pull response', async () => {
       return chain;
     };
 
-    const result = await loadSyncPull({ actor, query: { facilityId: 'fac-001' } });
+    const result = await loadSyncPull({ actor, query: { facilityId: UUIDS.facility1 } });
     assert.equal(result.ok, true);
     if (result.ok) {
       assert.ok(Array.isArray(result.data.tombstones));
       assert.equal(result.data.tombstones.length, 1);
       assert.equal(result.data.tombstones[0].entityType, 'patients');
-      assert.equal(result.data.tombstones[0].entityId, 'deleted-pat-001');
+      assert.equal(result.data.tombstones[0].entityId, UUIDS.entity2);
       assert.equal(result.data.tombstones[0].deletedRevision, 5);
     }
   } finally {

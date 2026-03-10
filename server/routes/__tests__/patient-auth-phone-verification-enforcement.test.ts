@@ -205,3 +205,204 @@ test('verify-otp persists durable verification state even when patient account i
   }
 });
 
+test('verify-otp returns sessionToken for existing patient accounts', async () => {
+  const { patientAuthRouter, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    const otpRow = {
+      id: 'otp-1',
+      code_hash: hashOtp('123456'),
+      attempts: 0,
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const patientAccount = {
+      id: 'patient-account-1',
+      tenant_id: process.env.PATIENT_DEFAULT_TENANT_ID,
+      phone_number: '+251911111111',
+      name: 'Existing Patient',
+      date_of_birth: null,
+      gender: null,
+      emergency_contact_name: null,
+      emergency_contact_phone: null,
+      profile_photo_url: null,
+    };
+
+    (supabaseAdmin as any).from = (table: string) => {
+      const state: any = { operation: 'select', filters: {}, payload: null };
+      const query: any = {
+        select() {
+          state.operation = 'select';
+          return query;
+        },
+        insert(payload: any) {
+          state.operation = 'insert';
+          state.payload = payload;
+          return query;
+        },
+        update(payload: any) {
+          state.operation = 'update';
+          state.payload = payload;
+          return query;
+        },
+        delete() {
+          state.operation = 'delete';
+          return query;
+        },
+        upsert(payload: any) {
+          state.operation = 'upsert';
+          state.payload = payload;
+          return query;
+        },
+        eq(column: string, value: any) {
+          state.filters[column] = value;
+          return query;
+        },
+        gt() {
+          return query;
+        },
+        order() {
+          return query;
+        },
+        limit() {
+          return query;
+        },
+        is() {
+          return query;
+        },
+        maybeSingle: async () => {
+          if (table === 'patient_auth_otps') return { data: otpRow, error: null };
+          if (table === 'patient_accounts') return { data: patientAccount, error: null };
+          if (table === 'patient_portal_phone_verifications') return { data: null, error: null };
+          return { data: null, error: null };
+        },
+        single: async () => ({ data: null, error: null }),
+        then: (onFulfilled: any, onRejected: any) =>
+          Promise.resolve({ data: null, error: null }).then(onFulfilled, onRejected),
+      };
+      return query;
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/patient-auth', patientAuthRouter);
+
+    const response = await request(app).post('/api/patient-auth/verify-otp').send({
+      phoneNumber: '+251 911 111 111',
+      otp: '123456',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.success, true);
+    assert.equal(response.body.patient.id, patientAccount.id);
+    assert.equal(typeof response.body.sessionToken, 'string');
+    assert.equal(response.body.sessionToken.split('.').length, 3);
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('register returns sessionToken for newly created patient accounts', async () => {
+  const { patientAuthRouter, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    const otpRow = {
+      id: 'otp-1',
+      code_hash: hashOtp('123456'),
+      attempts: 0,
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const createdPatient = {
+      id: 'patient-account-created-1',
+      phone_number: '+251911111111',
+      name: 'Created Patient',
+      date_of_birth: null,
+      gender: null,
+      emergency_contact_name: null,
+      emergency_contact_phone: null,
+      profile_photo_url: null,
+    };
+
+    (supabaseAdmin as any).from = (table: string) => {
+      const state: any = { operation: 'select', filters: {}, payload: null };
+      const query: any = {
+        select() {
+          if (state.operation !== 'insert') {
+            state.operation = 'select';
+          }
+          return query;
+        },
+        insert(payload: any) {
+          state.operation = 'insert';
+          state.payload = payload;
+          return query;
+        },
+        update(payload: any) {
+          state.operation = 'update';
+          state.payload = payload;
+          return query;
+        },
+        delete() {
+          state.operation = 'delete';
+          return query;
+        },
+        upsert(payload: any) {
+          state.operation = 'upsert';
+          state.payload = payload;
+          return query;
+        },
+        eq(column: string, value: any) {
+          state.filters[column] = value;
+          return query;
+        },
+        gt() {
+          return query;
+        },
+        order() {
+          return query;
+        },
+        limit() {
+          return query;
+        },
+        is() {
+          return query;
+        },
+        maybeSingle: async () => {
+          if (table === 'patient_auth_otps') return { data: otpRow, error: null };
+          if (table === 'patient_accounts' && state.operation === 'select') return { data: null, error: null };
+          if (table === 'patient_portal_phone_verifications') {
+            return { data: { id: 'verification-1', is_verified: true }, error: null };
+          }
+          return { data: null, error: null };
+        },
+        single: async () => {
+          if (table === 'patient_accounts' && state.operation === 'insert') {
+            return { data: createdPatient, error: null };
+          }
+          return { data: null, error: null };
+        },
+        then: (onFulfilled: any, onRejected: any) =>
+          Promise.resolve({ data: null, error: null }).then(onFulfilled, onRejected),
+      };
+      return query;
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/patient-auth', patientAuthRouter);
+
+    const response = await request(app).post('/api/patient-auth/register').send({
+      phoneNumber: '+251 911 111 111',
+      otp: '123456',
+      name: 'Created Patient',
+    });
+
+    assert.equal(response.status, 201);
+    assert.equal(response.body.patient.id, createdPatient.id);
+    assert.equal(typeof response.body.sessionToken, 'string');
+    assert.equal(response.body.sessionToken.split('.').length, 3);
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});

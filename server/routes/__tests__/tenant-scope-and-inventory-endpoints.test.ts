@@ -7,6 +7,7 @@ const patientPortalPath = path.resolve(__dirname, '../patient-portal.ts');
 const inventoryPath = path.resolve(__dirname, '../inventory.ts');
 const inventoryControllerPath = path.resolve(__dirname, '../../controllers/inventory.ts');
 const inventoryMutationServicePath = path.resolve(__dirname, '../../services/inventoryMutationService.ts');
+const workspaceProvisioningPath = path.resolve(__dirname, '../../services/workspaceProvisioning.ts');
 const receivingManagementPath = path.resolve(__dirname, '../../../../src/components/inventory/ReceivingManagement.tsx');
 
 const read = (filePath: string) => fs.readFileSync(filePath, 'utf8');
@@ -93,4 +94,12 @@ test('inventory draft and receiving/stock writes enforce strict audit durability
   assert.match(serviceSource, /action:\s*'delete_issue_order_item'[\s\S]*strict:\s*true/);
   assert.match(serviceSource, /action:\s*'create_loss_adjustment'[\s\S]*strict:\s*true/);
   assert.match(serviceSource, /action:\s*'update_loss_adjustment'[\s\S]*strict:\s*true/);
+});
+
+test('workspace provisioning seeds data with explicit tenant/facility scoping', () => {
+  const source = read(workspaceProvisioningPath);
+
+  assert.match(source, /from\('departments'\)[\s\S]*?\.eq\('tenant_id', tenantId\)[\s\S]*?\.eq\('facility_id', facilityId\)/);
+  assert.match(source, /from\('insurers'\)[\s\S]*?\.eq\('tenant_id', tenantId\)[\s\S]*?\.eq\('facility_id', facilityId\)/);
+  assert.match(source, /from\('medical_services'\)[\s\S]*?\.eq\('tenant_id', tenantId\)[\s\S]*?\.eq\('facility_id', facilityId\)/);
 });
