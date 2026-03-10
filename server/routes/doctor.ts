@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import multer from 'multer';
 import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
 import { requireUser, requireScopedUser } from '../middleware/auth';
@@ -13,8 +14,41 @@ const router = Router();
 router.use(requireUser, requireScopedUser);
 
 const visitIdParamSchema = z.string().uuid();
+const externalResultsBucket = process.env.PATIENT_DOCUMENTS_BUCKET || 'patient-health-records';
+const externalResultSignedTtlSeconds = Number(process.env.EXTERNAL_RESULT_SIGNED_TTL || 7_200);
+const externalResultUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: Number(process.env.EXTERNAL_RESULT_MAX_BYTES || 10_000_000),
+  },
+});
+const externalResultAllowedMimeTypes = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/webp',
+]);
+
 const sendContractError = (res: any, status: number, code: string, message: string) =>
   res.status(status).json({ code, message });
+
+const sanitizeFileSegment = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+
+const buildExternalResultSignedUrl = async (path: string) => {
+  const { data, error } = await supabaseAdmin.storage
+    .from(externalResultsBucket)
+    .createSignedUrl(path, externalResultSignedTtlSeconds);
+  if (error || !data?.signedUrl) {
+    return null;
+  }
+  return data.signedUrl;
+};
 
 const historyValidationOutcomeMap = {
   HS_001: {
@@ -141,6 +175,165 @@ router.post('/cdss/evaluate', async (req, res) => {
       500,
       'CONFLICT_CDSS_EVALUATION_FAILED',
       error?.message || 'Failed to evaluate CDSS rules'
+    );
+  }
+});
+
+const externalResultUploadSchema = z.object({
+  patientId: z.string().uuid(),
+  visitId: z.string().uuid(),
+  orderId: z.string().uuid(),
+  itemType: z.enum(['lab_test', 'imaging']),
+  aiExtractedText: z.string().max(20_000).optional().nullable(),
+});
+
+router.post('/external-results/upload', externalResultUpload.single('file'), async (req, res) => {
+  const { tenantId, facilityId, profileId, role } = req.user!;
+  if (!tenantId) {
+    return sendContractError(res, 400, 'VALIDATION_MISSING_TENANT', 'Tenant context is required');
+  }
+
+  try {
+    if (!req.file) {
+      return sendContractError(res, 400, 'VALIDATION_MISSING_FILE', 'Result file is required');
+    }
+    if (!externalResultAllowedMimeTypes.has(req.file.mimetype)) {
+      return sendContractError(
+        res,
+        415,
+        'VALIDATION_UNSUPPORTED_FILE_TYPE',
+        'Unsupported file type. Upload PDF, JPG, PNG, or WEBP.'
+      );
+    }
+
+    const parsed = externalResultUploadSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return sendContractError(
+        res,
+        400,
+        'VALIDATION_INVALID_EXTERNAL_RESULT_UPLOAD',
+        parsed.error.issues[0]?.message || 'Invalid external result payload'
+      );
+    }
+
+    const { patientId, visitId, orderId, itemType, aiExtractedText } = parsed.data;
+    const orderTable = itemType === 'lab_test' ? 'lab_orders' : 'imaging_orders';
+
+    const { data: order, error: orderError } = await supabaseAdmin
+      .from(orderTable)
+      .select('id, visit_id, patient_id, tenant_id')
+      .eq('id', orderId)
+      .eq('tenant_id', tenantId)
+      .maybeSingle();
+
+    if (orderError || !order) {
+      return sendContractError(res, 404, 'NOT_FOUND_ORDER', 'Diagnostic order not found');
+    }
+    if (order.visit_id !== visitId || order.patient_id !== patientId) {
+      return sendContractError(
+        res,
+        400,
+        'VALIDATION_ORDER_MISMATCH',
+        'Uploaded result does not match selected patient visit order'
+      );
+    }
+
+    const fileExt = (req.file.originalname.split('.').pop() || 'dat').toLowerCase();
+    const safeName = sanitizeFileSegment(req.file.originalname.replace(/\.[^.]+$/, '')) || 'result';
+    const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}-${safeName}.${fileExt}`;
+    const storagePath = `external-results/${tenantId}/${patientId}/${visitId}/${itemType}/${orderId}/${fileName}`;
+
+    const { error: uploadError } = await supabaseAdmin.storage
+      .from(externalResultsBucket)
+      .upload(storagePath, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false,
+      });
+    if (uploadError) {
+      return sendContractError(
+        res,
+        500,
+        'CONFLICT_UPLOAD_FAILED',
+        uploadError.message || 'Failed to upload result document'
+      );
+    }
+
+    const { data: inserted, error: insertError } = await supabaseAdmin
+      .from('external_diagnostic_documents')
+      .insert({
+        tenant_id: tenantId,
+        facility_id: facilityId || null,
+        patient_id: patientId,
+        visit_id: visitId,
+        order_type: itemType,
+        order_id: orderId,
+        storage_bucket: externalResultsBucket,
+        storage_path: storagePath,
+        file_url: storagePath,
+        original_filename: req.file.originalname,
+        mime_type: req.file.mimetype,
+        file_size_bytes: req.file.size,
+        ai_extracted_text: aiExtractedText || null,
+        uploaded_by: profileId || null,
+      })
+      .select('*')
+      .single();
+
+    if (insertError || !inserted) {
+      return sendContractError(
+        res,
+        500,
+        'CONFLICT_METADATA_SAVE_FAILED',
+        insertError?.message || 'Failed to save external result metadata'
+      );
+    }
+
+    if (tenantId) {
+      await recordAuditEvent({
+        action: 'upload_external_diagnostic_result',
+        eventType: 'create',
+        entityType: 'external_diagnostic_document',
+        entityId: inserted.id,
+        tenantId,
+        facilityId: facilityId || null,
+        actorUserId: profileId || null,
+        actorRole: role || null,
+        actorIpAddress: req.ip,
+        actorUserAgent: req.get('user-agent') || null,
+        complianceTags: ['hipaa'],
+        sensitivityLevel: 'phi',
+        requestId: req.requestId || null,
+        metadata: {
+          patient_id: patientId,
+          visit_id: visitId,
+          order_id: orderId,
+          order_type: itemType,
+          storage_path: storagePath,
+        },
+      });
+    }
+
+    const signedUrl = await buildExternalResultSignedUrl(storagePath);
+    return res.status(201).json({
+      success: true,
+      document: {
+        id: inserted.id,
+        orderId: inserted.order_id,
+        itemType: inserted.order_type,
+        storagePath,
+        fileName: inserted.original_filename,
+        mimeType: inserted.mime_type,
+        sizeBytes: inserted.file_size_bytes,
+        fileUrl: signedUrl || null,
+        uploadedAt: inserted.created_at,
+      },
+    });
+  } catch (error: any) {
+    return sendContractError(
+      res,
+      500,
+      'CONFLICT_EXTERNAL_RESULT_UPLOAD_FAILED',
+      error?.message || 'Failed to upload external diagnostic result'
     );
   }
 });
@@ -1127,4 +1320,3 @@ router.patch('/visits/:visitId/cdss-recommendations/:recId', async (req, res) =>
 });
 
 export default router;
-
