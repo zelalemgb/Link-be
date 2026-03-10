@@ -1,12 +1,45 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
-import { requireUser } from '../middleware/auth';
+import { requireUser, requireScopedUser } from '../middleware/auth';
 
 const router = Router();
-router.use(requireUser);
+router.use(requireUser, requireScopedUser);
 
 // --- Validations ---
+
+const masterDataAdminRoles = new Set([
+    'admin',
+    'clinic_admin',
+    'super_admin',
+    'hospital_ceo',
+    'medical_director',
+    'nursing_head',
+]);
+
+const ensureMasterDataAdmin = (req: any, res: any) => {
+    const role = req.user?.role;
+    if (!role || !masterDataAdminRoles.has(role)) {
+        res.status(403).json({ error: 'You do not have permission to manage master data.' });
+        return false;
+    }
+    return true;
+};
+
+const requireMasterDataScope = (req: any, res: any) => {
+    const { tenantId, facilityId } = req.user || {};
+    if (!tenantId) {
+        res.status(403).json({ error: 'Missing tenant context' });
+        return null;
+    }
+    return {
+        tenantId,
+        facilityId: facilityId || null,
+    };
+};
+
+const facilityScopeFilter = (facilityId: string | null) =>
+    facilityId ? `facility_id.is.null,facility_id.eq.${facilityId}` : 'facility_id.is.null';
 
 const serviceSchema = z.object({
     name: z.string().min(1),
@@ -14,6 +47,12 @@ const serviceSchema = z.object({
     description: z.string().optional().nullable(),
     price: z.number().nullable().optional(),
     category: z.string().optional(),
+    is_active: z.boolean().default(true),
+});
+
+const programSchema = z.object({
+    name: z.string().min(1),
+    code: z.string().optional().nullable(),
     is_active: z.boolean().default(true),
 });
 
@@ -40,7 +79,9 @@ const medicationSchema = z.object({
  * We will support filtration by tenant_id (from user session) and optional facility_id.
  */
 router.get('/services', async (req, res) => {
-    const { tenantId, facilityId } = req.user!;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId } = scope;
     const { category } = req.query;
 
     try {
@@ -71,42 +112,22 @@ router.get('/services', async (req, res) => {
 
         if (error) throw error;
 
-        // Emulate the frontend fallback logic? 
-        // The frontend logic was explicit: "If I have my own list, I use it. If not, I use the master list".
-        // It implies if I have even ONE item, I ignore the master list? 
-        // "If facility has lab tests, return them. Fallback: fetch tenant-wide lab tests."
-        // Yes, that sounds like an override mode.
-
-        // We can do this:
-        if (facilityId) {
-            const facilitySpecific = data.filter((d: any) => d.facility_id === facilityId);
-            if (facilitySpecific.length > 0) {
-                return res.json(facilitySpecific);
-            }
-        }
-
-        // Fallback to items where facility_id matches OR is null (if the schema supports null for master list).
-        // The previous code queried: .eq('facility_id', facilityId!) then .eq('facility_id', tenantId!)??
-        // Wait, the previous code queried:
-        // 1. .eq('tenant_id', tenantId).eq('facility_id', facilityId)
-        // 2. .eq('tenant_id', tenantId)  <-- without facility_id filter? Or implied facility_id is null?
-        // Looking at the view_file output:
-        // line 85: .eq('tenant_id', tenantId!)
-        // line 86: .eq('category', 'Laboratory')
-        // It didn't filter by facility_id in the fallback. So it returned ALL tenant items?
-        // But `facility_id` is likely a column.
-
-        // Let's just return what matched the tenant query (including facility-specific ones).
+        // Return all found services. The frontend will receive both tenant-level (master) 
+        // and facility-specific override services.
+        // The frontend UI should handle rendering these appropriately (e.g. showing facility overrides if present).
         return res.json(data);
 
     } catch (error: any) {
-        console.error('Fetch services error:', error);
+        console.error('Fetch services error:', error?.message || error);
         res.status(500).json({ error: error.message });
     }
 });
 
 router.post('/services', async (req, res) => {
-    const { tenantId, facilityId } = req.user!;
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
     try {
         const payload = serviceSchema.parse(req.body);
         const { data, error } = await supabaseAdmin
@@ -129,15 +150,20 @@ router.post('/services', async (req, res) => {
 });
 
 router.put('/services/:id', async (req, res) => {
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
     try {
-        const payload = serviceSchema.parse(req.body); // Using partial? No, schema is strict but we can make partial.
-        // For now assume full payload or use .partial()
-        const { data, error } = await supabaseAdmin
+        const payload = serviceSchema.partial().parse(req.body);
+        let query = supabaseAdmin
             .from('medical_services')
             .update(payload)
+            .eq('tenant_id', tenantId)
             .eq('id', req.params.id)
-            .select()
-            .single();
+            .select();
+        query = query.or(facilityScopeFilter(facilityId));
+        const { data, error } = await query.single();
 
         if (error) throw error;
         res.json(data);
@@ -147,11 +173,109 @@ router.put('/services/:id', async (req, res) => {
 });
 
 router.delete('/services/:id', async (req, res) => {
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
     try {
-        const { error } = await supabaseAdmin
+        let query = supabaseAdmin
             .from('medical_services')
             .delete()
+            .eq('tenant_id', tenantId)
             .eq('id', req.params.id);
+        query = query.or(facilityScopeFilter(facilityId));
+        const { error } = await query;
+
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- Programs (Free Service Programs) ---
+
+router.get('/programs', async (req, res) => {
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
+    try {
+        const { data, error } = await supabaseAdmin
+            .from('programs')
+            .select('*')
+            .eq('tenant_id', tenantId)
+            .or(facilityScopeFilter(facilityId))
+            .order('name');
+
+        if (error) throw error;
+        res.json(data || []);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.post('/programs', async (req, res) => {
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
+    try {
+        const payload = programSchema.parse(req.body);
+        const { data, error } = await supabaseAdmin
+            .from('programs')
+            .insert({
+                ...payload,
+                tenant_id: tenantId,
+                facility_id: facilityId,
+            })
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues });
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.put('/programs/:id', async (req, res) => {
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
+    try {
+        const payload = programSchema.parse(req.body);
+        let query = supabaseAdmin
+            .from('programs')
+            .update(payload)
+            .eq('tenant_id', tenantId)
+            .eq('id', req.params.id)
+            .select();
+        query = query.or(facilityScopeFilter(facilityId));
+        const { data, error } = await query.single();
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues });
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.delete('/programs/:id', async (req, res) => {
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
+    try {
+        let query = supabaseAdmin
+            .from('programs')
+            .delete()
+            .eq('tenant_id', tenantId)
+            .eq('id', req.params.id);
+        query = query.or(facilityScopeFilter(facilityId));
+        const { error } = await query;
 
         if (error) throw error;
         res.json({ success: true });
@@ -164,7 +288,9 @@ router.delete('/services/:id', async (req, res) => {
 // --- Medications ---
 
 router.get('/medications', async (req, res) => {
-    const { tenantId } = req.user!;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId } = scope;
     try {
         const { data, error } = await supabaseAdmin
             .from('medication_master')
@@ -180,7 +306,10 @@ router.get('/medications', async (req, res) => {
 });
 
 router.post('/medications', async (req, res) => {
-    const { tenantId } = req.user!;
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId } = scope;
     try {
         const payload = medicationSchema.parse(req.body);
         const { data, error } = await supabaseAdmin
@@ -201,11 +330,16 @@ router.post('/medications', async (req, res) => {
 });
 
 router.put('/medications/:id', async (req, res) => {
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId } = scope;
     try {
         const payload = medicationSchema.parse(req.body);
         const { data, error } = await supabaseAdmin
             .from('medication_master')
             .update(payload)
+            .eq('tenant_id', tenantId)
             .eq('id', req.params.id)
             .select()
             .single();
@@ -218,10 +352,15 @@ router.put('/medications/:id', async (req, res) => {
 });
 
 router.delete('/medications/:id', async (req, res) => {
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId } = scope;
     try {
         const { error } = await supabaseAdmin
             .from('medication_master')
             .delete()
+            .eq('tenant_id', tenantId)
             .eq('id', req.params.id);
         if (error) throw error;
         res.json({ success: true });
@@ -260,14 +399,16 @@ const imagingSchema = z.object({
 });
 
 router.get('/imaging', async (req, res) => {
-    const { tenantId, facilityId } = req.user!;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
     try {
         const { data, error } = await supabaseAdmin
             .from('imaging_study_catalog')
             .select('*')
             .eq('tenant_id', tenantId)
             // fetch both master (facility_id is null) and facility specific
-            .or(`facility_id.is.null,facility_id.eq.${facilityId}`)
+            .or(facilityScopeFilter(facilityId))
             .order('modality')
             .order('study_name');
 
@@ -279,7 +420,10 @@ router.get('/imaging', async (req, res) => {
 });
 
 router.post('/imaging', async (req, res) => {
-    const { tenantId, facilityId } = req.user!;
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
     try {
         const payload = imagingSchema.parse(req.body);
         const { data, error } = await supabaseAdmin
@@ -301,14 +445,20 @@ router.post('/imaging', async (req, res) => {
 });
 
 router.put('/imaging/:id', async (req, res) => {
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
     try {
         const payload = imagingSchema.parse(req.body);
-        const { data, error } = await supabaseAdmin
+        let query = supabaseAdmin
             .from('imaging_study_catalog')
             .update(payload)
+            .eq('tenant_id', tenantId)
             .eq('id', req.params.id)
-            .select()
-            .single();
+            .select();
+        query = query.or(facilityScopeFilter(facilityId));
+        const { data, error } = await query.single();
 
         if (error) throw error;
         res.json(data);
@@ -318,11 +468,18 @@ router.put('/imaging/:id', async (req, res) => {
 });
 
 router.delete('/imaging/:id', async (req, res) => {
+    if (!ensureMasterDataAdmin(req, res)) return;
+    const scope = requireMasterDataScope(req, res);
+    if (!scope) return;
+    const { tenantId, facilityId } = scope;
     try {
-        const { error } = await supabaseAdmin
+        let query = supabaseAdmin
             .from('imaging_study_catalog')
             .delete()
+            .eq('tenant_id', tenantId)
             .eq('id', req.params.id);
+        query = query.or(facilityScopeFilter(facilityId));
+        const { error } = await query;
 
         if (error) throw error;
         res.json({ success: true });

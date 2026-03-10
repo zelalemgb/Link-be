@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
-import { requireUser } from '../middleware/auth';
+import { requireUser, requireScopedUser } from '../middleware/auth';
+import { recordAuditEvent } from '../services/audit-log';
 
 const router = Router();
-router.use(requireUser);
+router.use(requireUser, requireScopedUser);
 
 const visitsQuerySchema = z.object({
   dateFilter: z.string().optional(),
@@ -52,7 +53,7 @@ const visitSelection = `
 `;
 
 router.get('/visits', async (req, res) => {
-  const { facilityId } = req.user!;
+  const { facilityId, tenantId, profileId, role } = req.user!;
   const parsed = visitsQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid query' });
@@ -93,6 +94,24 @@ router.get('/visits', async (req, res) => {
     const { data, error, count } = await query;
     if (error) throw error;
 
+    if (tenantId) {
+      await recordAuditEvent({
+        action: 'view_reception_visits',
+        eventType: 'read',
+        entityType: 'visit_list',
+        tenantId,
+        facilityId: facilityId || null,
+        actorUserId: profileId || null,
+        actorRole: role || null,
+        actorIpAddress: req.ip,
+        actorUserAgent: req.get('user-agent') || null,
+        complianceTags: ['hipaa'],
+        sensitivityLevel: 'phi',
+        requestId: req.requestId || null,
+        metadata: { result_count: (data || []).length, total_count: count ?? 0 },
+      });
+    }
+
     return res.json({
       visits: data || [],
       totalCount: count ?? 0,
@@ -103,7 +122,7 @@ router.get('/visits', async (req, res) => {
 });
 
 router.get('/visits/weekly', async (req, res) => {
-  const { facilityId } = req.user!;
+  const { facilityId, tenantId, profileId, role } = req.user!;
   const limit = Number(req.query.limit) || 100;
   try {
     const weekStart = new Date();
@@ -119,6 +138,24 @@ router.get('/visits/weekly', async (req, res) => {
       .limit(limit);
 
     if (error) throw error;
+    if (tenantId) {
+      await recordAuditEvent({
+        action: 'view_reception_weekly_visits',
+        eventType: 'read',
+        entityType: 'visit_list',
+        tenantId,
+        facilityId: facilityId || null,
+        actorUserId: profileId || null,
+        actorRole: role || null,
+        actorIpAddress: req.ip,
+        actorUserAgent: req.get('user-agent') || null,
+        complianceTags: ['hipaa'],
+        sensitivityLevel: 'phi',
+        requestId: req.requestId || null,
+        metadata: { result_count: (data || []).length },
+      });
+    }
+
     return res.json({ visits: data || [] });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Failed to load weekly visits' });
@@ -126,7 +163,7 @@ router.get('/visits/weekly', async (req, res) => {
 });
 
 router.get('/metrics/today', async (req, res) => {
-  const { facilityId } = req.user!;
+  const { facilityId, tenantId, profileId, role } = req.user!;
   try {
     const todayDate = new Date().toISOString().split('T')[0];
 
@@ -168,6 +205,23 @@ router.get('/metrics/today', async (req, res) => {
 
     const averageWait = activeRows.length > 0 ? Math.round(totalWaitMinutes / activeRows.length) : 0;
 
+    if (tenantId) {
+      await recordAuditEvent({
+        action: 'view_reception_metrics',
+        eventType: 'read',
+        entityType: 'visit_metrics',
+        tenantId,
+        facilityId: facilityId || null,
+        actorUserId: profileId || null,
+        actorRole: role || null,
+        actorIpAddress: req.ip,
+        actorUserAgent: req.get('user-agent') || null,
+        complianceTags: ['hipaa'],
+        sensitivityLevel: 'phi',
+        requestId: req.requestId || null,
+      });
+    }
+
     return res.json({
       visitCount: countResult.count || 0,
       averageWait,
@@ -178,7 +232,7 @@ router.get('/metrics/today', async (req, res) => {
 });
 
 router.get('/search', async (req, res) => {
-  const { facilityId } = req.user!;
+  const { facilityId, tenantId, profileId, role } = req.user!;
   const parsed = searchSchema.safeParse(req.query);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid query' });
@@ -237,6 +291,24 @@ router.get('/search', async (req, res) => {
       };
     });
 
+    if (tenantId) {
+      await recordAuditEvent({
+        action: 'search_patients',
+        eventType: 'read',
+        entityType: 'patient',
+        tenantId,
+        facilityId: facilityId || null,
+        actorUserId: profileId || null,
+        actorRole: role || null,
+        actorIpAddress: req.ip,
+        actorUserAgent: req.get('user-agent') || null,
+        complianceTags: ['hipaa'],
+        sensitivityLevel: 'phi',
+        requestId: req.requestId || null,
+        metadata: { result_count: latestVisits.length },
+      });
+    }
+
     return res.json({ visits: latestVisits });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Failed to search patients' });
@@ -244,7 +316,7 @@ router.get('/search', async (req, res) => {
 });
 
 router.post('/visits/:id/status', async (req, res) => {
-  const { facilityId } = req.user!;
+  const { facilityId, tenantId, profileId, role } = req.user!;
   const parsed = statusUpdateSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
@@ -258,6 +330,24 @@ router.post('/visits/:id/status', async (req, res) => {
       .eq('facility_id', facilityId);
 
     if (error) throw error;
+    if (tenantId) {
+      await recordAuditEvent({
+        action: 'update_visit_status',
+        eventType: 'update',
+        entityType: 'visit',
+        entityId: req.params.id,
+        tenantId,
+        facilityId: facilityId || null,
+        actorUserId: profileId || null,
+        actorRole: role || null,
+        actorIpAddress: req.ip,
+        actorUserAgent: req.get('user-agent') || null,
+        complianceTags: ['hipaa'],
+        sensitivityLevel: 'phi',
+        requestId: req.requestId || null,
+      });
+    }
+
     return res.json({ success: true });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Failed to update status' });
@@ -265,7 +355,7 @@ router.post('/visits/:id/status', async (req, res) => {
 });
 
 router.post('/visits/:id/fee', async (req, res) => {
-  const { facilityId } = req.user!;
+  const { facilityId, tenantId, profileId, role } = req.user!;
   const parsed = feeUpdateSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
@@ -279,6 +369,24 @@ router.post('/visits/:id/fee', async (req, res) => {
       .eq('facility_id', facilityId);
 
     if (error) throw error;
+    if (tenantId) {
+      await recordAuditEvent({
+        action: 'update_visit_fee',
+        eventType: 'update',
+        entityType: 'visit',
+        entityId: req.params.id,
+        tenantId,
+        facilityId: facilityId || null,
+        actorUserId: profileId || null,
+        actorRole: role || null,
+        actorIpAddress: req.ip,
+        actorUserAgent: req.get('user-agent') || null,
+        complianceTags: ['hipaa'],
+        sensitivityLevel: 'phi',
+        requestId: req.requestId || null,
+      });
+    }
+
     return res.json({ success: true });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Failed to update fee' });
@@ -286,6 +394,7 @@ router.post('/visits/:id/fee', async (req, res) => {
 });
 
 router.post('/appointments/:id/status', async (req, res) => {
+  const { tenantId, facilityId, profileId, role } = req.user!;
   const parsed = appointmentUpdateSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
@@ -298,6 +407,24 @@ router.post('/appointments/:id/status', async (req, res) => {
       .eq('id', req.params.id);
 
     if (error) throw error;
+    if (tenantId) {
+      await recordAuditEvent({
+        action: 'update_appointment_status',
+        eventType: 'update',
+        entityType: 'appointment',
+        entityId: req.params.id,
+        tenantId,
+        facilityId: facilityId || null,
+        actorUserId: profileId || null,
+        actorRole: role || null,
+        actorIpAddress: req.ip,
+        actorUserAgent: req.get('user-agent') || null,
+        complianceTags: ['hipaa'],
+        sensitivityLevel: 'phi',
+        requestId: req.requestId || null,
+      });
+    }
+
     return res.json({ success: true });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Failed to update appointment' });

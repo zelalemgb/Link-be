@@ -1,14 +1,25 @@
-import 'dotenv/config';
+// Load .env from link-be/ regardless of which directory the process is started from.
+// When launched via `tsx link-be/server/index.ts` from the repo root the CWD is the
+// root, not link-be/, so dotenv/config would silently miss the env file.
+import { config as loadDotenv } from 'dotenv';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = dirname(__filename);
+loadDotenv({ path: resolve(__dirname, '../../.env') });
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
+import cookieParser from 'cookie-parser';
+import crypto from 'crypto';
 
 // Config & Middleware
 import { supabaseAdmin } from './config/supabase';
-import { requireUser, adminKeyGuard } from './middleware/auth';
+import { requireUser, superAdminGuard } from './middleware/auth';
+import { csrfProtection } from './middleware/csrf';
 
 // Routes
 import authRouter from './routes/auth';
@@ -20,27 +31,166 @@ import inventoryRouter from './routes/inventory';
 import aiRouter from './routes/ai';
 import receptionRouter from './routes/reception';
 import ordersRouter from './routes/orders';
+import patientAuthRouter from './routes/patient-auth';
+import patientPortalRouter from './routes/patient-portal';
+import facilitiesRouter from './routes/facilities';
+import staffInvitationsRouter from './routes/staff-invitations';
+import adminDataRouter from './routes/admin-data';
+import doctorRouter from './routes/doctor';
+import mobileRouter from './routes/mobile';
+import monitoringRouter from './routes/monitoring';
+import inpatientRouter from './routes/inpatient';
+import nursingRouter from './routes/nursing';
+import pharmacyRouter from './routes/pharmacy';
+import syncRouter from './routes/sync';
+import hewRouter from './routes/hew';
+import smsRouter from './routes/sms';
+import subscriptionRouter from './routes/subscription';
+import webhookRouter from './routes/webhook';
+import agentRouter from './routes/agent';
+import { subscriptionGuard } from './middleware/subscriptionGuard';
+import { recordResponseStatus } from './services/monitoring';
 
-const app = express();
+export const app = express();
 const port = process.env.PORT || 4000;
 
-app.use(helmet());
-app.use(express.json());
+const isProduction = process.env.NODE_ENV === 'production';
+const corsOriginsRaw = process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || '';
+const normalizeOrigin = (origin: string) => {
+  const trimmed = origin.trim();
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    return `${parsed.protocol}//${parsed.host}`.toLowerCase();
+  } catch {
+    return trimmed.replace(/\/+$/, '').toLowerCase();
+  }
+};
+
+const expandOriginVariants = (origin: string) => {
+  const normalized = normalizeOrigin(origin);
+  if (!normalized) return [];
+
+  const variants = new Set<string>([normalized]);
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'linkhc.org' || host === 'www.linkhc.org') {
+      const port = parsed.port ? `:${parsed.port}` : '';
+      variants.add(`${parsed.protocol}//linkhc.org${port}`);
+      variants.add(`${parsed.protocol}//www.linkhc.org${port}`);
+    }
+  } catch {
+    // Ignore non-URL values; normalized raw string variant is already included.
+  }
+
+  return Array.from(variants);
+};
+
+const allowedOriginSet = new Set<string>();
+for (const configuredOrigin of corsOriginsRaw.split(',').map((origin) => origin.trim()).filter(Boolean)) {
+  for (const variant of expandOriginVariants(configuredOrigin)) {
+    allowedOriginSet.add(variant);
+  }
+}
+for (const firstPartyOrigin of ['https://linkhc.org', 'https://www.linkhc.org']) {
+  for (const variant of expandOriginVariants(firstPartyOrigin)) {
+    allowedOriginSet.add(variant);
+  }
+}
+
+// LOW-4: Warn loudly at startup if CORS is misconfigured in production.
+// The runtime CORS handler already rejects requests when allowedOriginSet is empty,
+// but catching it here gives an actionable message in deployment logs.
+if (isProduction && allowedOriginSet.size === 0) {
+  console.error(
+    '[CORS] FATAL: No CORS origins configured for production. ' +
+    'Set the CORS_ORIGINS environment variable (comma-separated HTTPS origins) ' +
+    'before starting the server, otherwise all browser requests will be rejected.'
+  );
+  process.exit(1);
+}
+
+const safePath = (url: string | undefined) => (url || '').split('?')[0];
+
+app.set('trust proxy', 1);
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+        // API responses are JSON; no scripts, styles, or media are served.
+      },
+    },
+    // Prevent this API server from being embedded in frames anywhere.
+    frameguard: { action: 'deny' },
+    // Enforce HTTPS in supported browsers for 1 year.
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+    // Disable MIME-type sniffing.
+    noSniff: true,
+    // Block cross-origin resource access from untrusted embedders.
+    crossOriginEmbedderPolicy: true,
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    crossOriginResourcePolicy: { policy: 'same-origin' },
+    referrerPolicy: { policy: 'no-referrer' },
+  })
+);
+// Capture raw body via verify callbacks — needed for AT webhook signature verification
+app.use(express.json({
+  verify: (req: any, _res, buf) => { req.rawBody = buf; },
+}));
+// Africa's Talking sends webhooks as application/x-www-form-urlencoded
+app.use(express.urlencoded({
+  extended: true,
+  verify: (req: any, _res, buf) => { req.rawBody = req.rawBody ?? buf; },
+}));
+app.use(cookieParser());
+app.use(csrfProtection);
 app.use((req, res, next) => {
-  console.log(`[Incoming Request] ${req.method} ${req.url} from ${req.headers.origin}`);
+  const headerRequestId = req.header('x-request-id');
+  const requestId = headerRequestId?.trim() || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
   next();
 });
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow any origin for now to rule out CORS issues
-      callback(null, true);
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (!isProduction && (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1'))) {
+        return callback(null, true);
+      }
+
+      if (allowedOriginSet.size === 0) {
+        if (!isProduction) {
+          return callback(null, true);
+        }
+        return callback(new Error('CORS not configured'));
+      }
+
+      const normalizedOrigin = normalizeOrigin(origin);
+      if (allowedOriginSet.has(normalizedOrigin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error('Origin not allowed by CORS'));
     },
     credentials: true
   })
 );
-app.use(morgan('combined'));
+morgan.token('safe-url', (req) => safePath((req as express.Request).originalUrl));
+app.use(morgan(':res[x-request-id] :method :safe-url :status :res[content-length] - :response-time ms'));
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    recordResponseStatus(res.statusCode, req.requestId);
+  });
+  next();
+});
 
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -65,12 +215,43 @@ const findAuthUserByEmail = async (email: string) => {
   return null;
 };
 
+const clinicAdminOverviewRoles = new Set([
+  'clinic_admin',
+  'admin',
+  'super_admin',
+  'hospital_ceo',
+  'medical_director',
+  'nursing_head',
+]);
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
+// Keep a health alias under /api so staging probes can use a single API base URL.
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, timestamp: new Date().toISOString() });
+});
+
+// Rate limiters for authentication routes
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  limit: 15, // 15 attempts per 15 minutes
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Please try again later.' },
+  keyGenerator: (req) => req.ip || req.header('x-forwarded-for') || 'unknown',
+});
+
+const patientAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  message: { error: 'Too many login attempts. Please try again later.' },
+  keyGenerator: (req) => req.ip || req.header('x-forwarded-for') || 'unknown',
+});
+
 // Mount Routes
-app.use('/api/auth', authRouter);
+app.use('/api/auth', authLimiter, authRouter);
 app.use('/api/master-data', masterDataRouter);
 app.use('/api/patients', patientsRouter);
 app.use('/api/staff', staffRouter);
@@ -79,6 +260,28 @@ app.use('/api/inventory', inventoryRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/reception', receptionRouter);
 app.use('/api/orders', ordersRouter);
+app.use('/api/patient-auth', patientAuthLimiter, patientAuthRouter);
+app.use('/api/patient-portal', patientPortalRouter);
+app.use('/api/monitoring', monitoringRouter);
+app.use('/api/facilities', facilitiesRouter);
+app.use('/api/staff-invitations', staffInvitationsRouter);
+app.use('/api/admin-data', adminDataRouter);
+app.use('/api/doctor', doctorRouter);
+app.use('/api/mobile', mobileRouter);
+app.use('/api/inpatient', inpatientRouter);
+app.use('/api/nursing', nursingRouter);
+app.use('/api/pharmacy', pharmacyRouter);
+app.use('/api/sync', syncRouter);
+app.use('/api/hew', hewRouter);
+app.use('/api/sms', smsRouter);
+// ── Subscription, billing and licensing ────────────────────────────────────
+app.use('/api/subscription', subscriptionRouter);
+app.use('/api/webhook', webhookRouter);      // Chapa + Stripe webhooks (no auth)
+app.use('/api/agent', agentRouter);          // Regional agent portal
+// Subscription enforcement — must be registered AFTER auth routes
+// and AFTER /api/subscription, /api/webhook, /api/agent (which handle their own auth)
+app.use(subscriptionGuard);
+
 
 const clinicRegistrationSchema = z.object({
   clinic: z.object({
@@ -158,7 +361,7 @@ const betaRegistrationSchema = z.object({
   status: z.string().optional(),
 });
 
-app.post('/api/admin/super-admin', adminKeyGuard, async (req, res) => {
+app.post('/api/admin/super-admin', requireUser, superAdminGuard, async (req, res) => {
   const parsed = superAdminSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
@@ -336,6 +539,50 @@ const getAuthUserProfileIds = async (authUserId: string) => {
   return (data || []).map((row) => row.id).filter(Boolean) as string[];
 };
 
+type FeatureRequestAuthorRow = {
+  id: string;
+  facility_id?: string | null;
+  user_role?: string | null;
+};
+
+// Resolve a stable author context for feature-request writes even when middleware
+// profile selection is ambiguous (multi-facility users).
+const resolveFeatureRequestAuthor = async (
+  req: express.Request
+): Promise<{ profileId: string; facilityId?: string; role: string } | null> => {
+  const authUserId = req.user?.authUserId;
+  if (!authUserId) return null;
+
+  const preferredFacilityId =
+    typeof req.body?.facility_id === 'string' && req.body.facility_id.trim().length > 0
+      ? req.body.facility_id.trim()
+      : req.user?.facilityId;
+
+  const { data, error } = await supabaseAdmin
+    .from('users')
+    .select('id, facility_id, user_role')
+    .eq('auth_user_id', authUserId)
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+  const profiles = (data || []) as FeatureRequestAuthorRow[];
+  if (!profiles.length) return null;
+
+  const byFacility = preferredFacilityId
+    ? profiles.find((profile) => profile.facility_id === preferredFacilityId)
+    : undefined;
+  const byMiddlewareProfile = req.user?.profileId
+    ? profiles.find((profile) => profile.id === req.user?.profileId)
+    : undefined;
+  const firstWithFacility = profiles.find((profile) => !!profile.facility_id);
+  const selected = byFacility || byMiddlewareProfile || firstWithFacility || profiles[0];
+
+  return {
+    profileId: selected.id,
+    facilityId: selected.facility_id || undefined,
+    role: (selected.user_role as string | null) || req.user?.role || 'staff',
+  };
+};
 // Backward compatible ownership resolution:
 // - modern rows use users.id (profile id)
 // - some legacy rows used auth.users id directly in feature_requests.user_id
@@ -457,19 +704,23 @@ app.post('/api/feature-requests', requireUser, async (req, res) => {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
   }
 
-  // Access user from request (populated by middleware)
-  const scope = getFeatureRequestScope(req, res);
-  if (!scope) return;
-  const { profileId, facilityId } = scope;
-  const body = parsed.data;
-
   try {
+    const author = await resolveFeatureRequestAuthor(req);
+    if (!author?.profileId) {
+      return res.status(403).json({ error: 'User profile required' });
+    }
+    if (author.role !== 'super_admin' && !author.facilityId) {
+      return res.status(403).json({ error: 'Facility context required' });
+    }
+
+    const body = parsed.data;
     const { data, error } = await supabaseAdmin
       .from('feature_requests')
       .insert({
         ...body,
-        user_id: profileId,
-        facility_id: facilityId,
+        status: 'submitted',
+        user_id: author.profileId,
+        facility_id: author.facilityId || null,
       })
       .select()
       .single();
@@ -794,17 +1045,43 @@ app.delete('/api/feature-requests/:id', requireUser, async (req, res) => {
 
 // Clinic Admin overview (BFF for dashboard)
 app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
-  const { facilityId: userFacilityId } = req.user!;
+  const { authUserId, facilityId: userFacilityId, tenantId: userTenantId, role } = req.user!;
+  if (!clinicAdminOverviewRoles.has(role)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
   const facilityId = (req.query.facilityId as string | undefined) || userFacilityId;
 
   if (!facilityId) return res.status(400).json({ error: 'Missing facilityId' });
 
   try {
-    const { data: facility, error: facilityErr } = await supabaseAdmin
+    if (role !== 'super_admin' && facilityId !== userFacilityId) {
+      const { data: membership, error: membershipError } = await supabaseAdmin
+        .from('users')
+        .select('id, tenant_id')
+        .eq('auth_user_id', authUserId)
+        .eq('facility_id', facilityId)
+        .maybeSingle();
+
+      if (membershipError || !membership) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+
+      if (userTenantId && membership.tenant_id && membership.tenant_id !== userTenantId) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+
+    let facilityQuery = supabaseAdmin
       .from('facilities')
       .select('*')
-      .eq('id', facilityId)
-      .single();
+      .eq('id', facilityId);
+
+    if (role !== 'super_admin' && userTenantId) {
+      facilityQuery = facilityQuery.eq('tenant_id', userTenantId);
+    }
+
+    const { data: facility, error: facilityErr } = await facilityQuery.single();
 
     if (facilityErr || !facility) {
       return res.status(404).json({ error: 'Facility not found' });
@@ -812,6 +1089,7 @@ app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
 
     const today = new Date().toISOString().split('T')[0];
 
+    const nowIso = new Date().toISOString();
     const [
       staffCount,
       pendingRequestsCount,
@@ -856,7 +1134,9 @@ app.get('/api/clinic-admin/overview', requireUser, async (req, res) => {
       supabaseAdmin
         .from('staff_invitations')
         .select('*', { count: 'exact', head: true })
-        .match({ facility_id: facilityId, status: 'pending' }),
+        .eq('facility_id', facilityId)
+        .eq('accepted', false)
+        .gte('expires_at', nowIso),
     ]);
 
     const hasDepartment = (departmentsCount.count ?? 0) > 0;
@@ -985,6 +1265,8 @@ app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-app.listen(port, () => {
-  console.log(`API server listening on :${port}`);
-});
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log(`API server listening on :${port}`);
+  });
+}

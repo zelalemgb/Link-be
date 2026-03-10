@@ -1,7 +1,21 @@
 \set ON_ERROR_STOP on
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
-\i supabase/database/schemas/status_enums.sql
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_type t
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE n.nspname = 'public'
+      AND t.typname = 'payment_status_enum'
+  ) THEN
+    CREATE TYPE public.payment_status_enum AS ENUM (
+      'pending', 'unpaid', 'partial', 'paid', 'cancelled', 'refunded', 'waived', 'disputed'
+    );
+  END IF;
+END;
+$$;
 
 -- Reset objects for repeatable test runs
 DROP TABLE IF EXISTS public.stock_movements CASCADE;
@@ -125,8 +139,8 @@ CREATE TABLE public.stock_movements (
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Apply constraint migration under test
-\i supabase/migrations/20251130120000_enforce_finance_inventory_constraints.sql
+-- Apply canonical constraint migration under test
+\ir ../migrations/20260215101000_enforce_finance_inventory_constraints.sql
 
 -- Seed reference data
 INSERT INTO public.facilities DEFAULT VALUES RETURNING id AS facility_id \gset
