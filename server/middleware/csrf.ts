@@ -4,6 +4,10 @@ import type { Request, Response, NextFunction } from 'express';
 const CSRF_COOKIE = 'csrf_token';
 const CSRF_HEADER = 'x-csrf-token';
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+const PUBLIC_CSRF_EXEMPT_PATHS = [
+  /^\/api\/auth\/(initiate-registration|verify-registration-code|register-staff|request-password-reset)$/,
+  /^\/api\/staff-invitations\/[^/]+\/register$/,
+];
 
 /**
  * CSRF protection middleware using double-submit cookie pattern.
@@ -27,6 +31,11 @@ export const csrfProtection = (req: Request, res: Response, next: NextFunction) 
 
   // Safe methods don't need CSRF validation
   if (SAFE_METHODS.has(req.method)) {
+    return next();
+  }
+
+  const requestPath = req.path || req.originalUrl || '';
+  if (PUBLIC_CSRF_EXEMPT_PATHS.some((matcher) => matcher.test(requestPath))) {
     return next();
   }
 

@@ -102,7 +102,7 @@ test('W2-QA-020-001 sync push is idempotent by opId and rejects opId collisions'
         if (table === 'users') {
           return {
             data: {
-              id: 'profile-1',
+              id: '99999999-9999-4999-8999-999999999999',
               tenant_id: tenantId,
               facility_id: facilityId,
               user_role: 'doctor',
@@ -171,7 +171,7 @@ test('W2-QA-020-001 sync push is idempotent by opId and rejects opId collisions'
   try {
     (supabaseAdmin as any).auth = {
       getUser: async () => ({
-        data: { user: { id: '11111111-1111-1111-1111-111111111111' } },
+        data: { user: { id: '11111111-1111-4111-8111-111111111111' } },
         error: null,
       }),
     };
@@ -248,7 +248,7 @@ test('W2-QA-020-002 sync push rejects facilityId outside actor facility scope', 
   try {
     (supabaseAdmin as any).auth = {
       getUser: async () => ({
-        data: { user: { id: '11111111-1111-1111-1111-111111111111' } },
+        data: { user: { id: '11111111-1111-4111-8111-111111111111' } },
         error: null,
       }),
     };
@@ -267,7 +267,7 @@ test('W2-QA-020-002 sync push rejects facilityId outside actor facility scope', 
           if (table === 'users') {
             return {
               data: {
-                id: 'profile-1',
+                id: '99999999-9999-4999-8999-999999999999',
                 tenant_id: tenantId,
                 facility_id: actorFacilityId,
                 user_role: 'doctor',
@@ -334,7 +334,7 @@ test('W2-QA-020-003 sync push rejects facilityId outside actor tenant scope', { 
   try {
     (supabaseAdmin as any).auth = {
       getUser: async () => ({
-        data: { user: { id: '11111111-1111-1111-1111-111111111111' } },
+        data: { user: { id: '11111111-1111-4111-8111-111111111111' } },
         error: null,
       }),
     };
@@ -353,7 +353,7 @@ test('W2-QA-020-003 sync push rejects facilityId outside actor tenant scope', { 
           if (table === 'users') {
             return {
               data: {
-                id: 'profile-1',
+                id: '99999999-9999-4999-8999-999999999999',
                 tenant_id: tenantId,
                 facility_id: facilityId,
                 user_role: 'doctor',
@@ -425,7 +425,7 @@ test('W2-QA-020-004 sync pull rejects invalid cursor with stable validation code
   try {
     (supabaseAdmin as any).auth = {
       getUser: async () => ({
-        data: { user: { id: '11111111-1111-1111-1111-111111111111' } },
+        data: { user: { id: '11111111-1111-4111-8111-111111111111' } },
         error: null,
       }),
     };
@@ -444,7 +444,7 @@ test('W2-QA-020-004 sync pull rejects invalid cursor with stable validation code
           if (table === 'users') {
             return {
               data: {
-                id: 'profile-1',
+                id: '99999999-9999-4999-8999-999999999999',
                 tenant_id: tenantId,
                 facility_id: facilityId,
                 user_role: 'doctor',
@@ -547,7 +547,7 @@ test('W2-QA-020-005 sync pull is stably ordered and advances cursor/hasMore corr
   try {
     (supabaseAdmin as any).auth = {
       getUser: async () => ({
-        data: { user: { id: '11111111-1111-1111-1111-111111111111' } },
+        data: { user: { id: '11111111-1111-4111-8111-111111111111' } },
         error: null,
       }),
     };
@@ -573,7 +573,7 @@ test('W2-QA-020-005 sync pull is stably ordered and advances cursor/hasMore corr
           if (table === 'users') {
             return {
               data: {
-                id: 'profile-1',
+                id: '99999999-9999-4999-8999-999999999999',
                 tenant_id: tenantId,
                 facility_id: facilityId,
                 user_role: 'doctor',
@@ -681,4 +681,3 @@ test('W2-QA-020-006 sync routes fail closed with stable AUTH_* contract when bea
   assert.equal(response.status, 401);
   assert.equal(response.body.code, 'AUTH_MISSING_BEARER_TOKEN');
 });
-

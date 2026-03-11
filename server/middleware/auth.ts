@@ -83,6 +83,43 @@ declare global {
     }
 }
 
+const classifyAuthProviderFailure = (error: any) => {
+    const status = typeof error?.status === 'number' ? error.status : null;
+    const message = String(error?.message || '').toLowerCase();
+
+    if (
+        status === 401 ||
+        status === 403 ||
+        message.includes('invalid token') ||
+        message.includes('jwt') ||
+        message.includes('token')
+    ) {
+        return {
+            status: 401,
+            error: 'Invalid token',
+            authFailure: true,
+        };
+    }
+
+    if (
+        status === 429 ||
+        message.includes('rate limit') ||
+        message.includes('too many')
+    ) {
+        return {
+            status: 429,
+            error: 'Auth service rate limit reached. Please try again later.',
+            authFailure: false,
+        };
+    }
+
+    return {
+        status: 503,
+        error: 'Authentication service temporarily unavailable. Please retry.',
+        authFailure: false,
+    };
+};
+
 export const requireUser = async (req: Request, res: Response, next: NextFunction) => {
     const authHeader = req.header('authorization') || '';
     const token = authHeader.toLowerCase().startsWith('bearer ')
@@ -100,8 +137,16 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
             if (isAuthDebug) {
                 console.error('[AUTH DEBUG] getUser error:', error?.message || 'No user data');
             }
-            recordAuthFailure(req.requestId);
-            return res.status(401).json({ error: 'Invalid token' });
+            if (!data?.user && !error) {
+                recordAuthFailure(req.requestId);
+                return res.status(401).json({ error: 'Invalid token' });
+            }
+
+            const classified = classifyAuthProviderFailure(error);
+            if (classified.authFailure) {
+                recordAuthFailure(req.requestId);
+            }
+            return res.status(classified.status).json({ error: classified.error });
         }
 
         const authUserId = data.user.id;

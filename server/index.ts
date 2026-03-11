@@ -1,18 +1,4 @@
-// Load .env from link-be/ regardless of whether the server starts from link-be/
-// or from the repo root via `tsx link-be/server/index.ts`.
-import { existsSync } from 'fs';
-import { config as loadDotenv } from 'dotenv';
-import { resolve } from 'path';
-const dotenvCandidates = [
-  resolve(process.cwd(), '.env'),
-  resolve(process.cwd(), 'link-be/.env'),
-];
-for (const dotenvPath of dotenvCandidates) {
-  if (existsSync(dotenvPath)) {
-    loadDotenv({ path: dotenvPath });
-    break;
-  }
-}
+import './config/loadEnv';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -135,6 +121,11 @@ const resolveRequestOrigin = (req: express.Request) => {
 };
 
 const safePath = (url: string | undefined) => (url || '').split('?')[0];
+const resolveClientIp = (req: express.Request) =>
+  pickFirstForwarded(req.header('x-forwarded-for') || '') ||
+  req.ip ||
+  req.socket.remoteAddress ||
+  '0.0.0.0';
 
 app.set('trust proxy', 1);
 app.use(
@@ -225,9 +216,42 @@ app.use((req, res, next) => {
   next();
 });
 
+const decodeJwtSubject = (authorizationHeader: string | undefined) => {
+  const header = (authorizationHeader || '').trim();
+  if (!header.toLowerCase().startsWith('bearer ')) return null;
+
+  const token = header.slice(7).trim();
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    const sub = typeof payload?.sub === 'string' ? payload.sub.trim() : '';
+    return sub || null;
+  } catch {
+    return null;
+  }
+};
+
+const globalRateLimitWindowMs = Number(process.env.GLOBAL_RATE_LIMIT_WINDOW_MS || 60 * 1000);
+const globalRateLimitPerWindow = Number(process.env.GLOBAL_RATE_LIMIT_MAX_PER_WINDOW || 240);
+
 const globalLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 100,
+  windowMs: Number.isFinite(globalRateLimitWindowMs) && globalRateLimitWindowMs > 0
+    ? globalRateLimitWindowMs
+    : 60 * 1000,
+  limit: Number.isFinite(globalRateLimitPerWindow) && globalRateLimitPerWindow > 0
+    ? globalRateLimitPerWindow
+    : 240,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+  keyGenerator: (req) => {
+    const authSubject = decodeJwtSubject(req.header('authorization'));
+    if (authSubject) return `auth:${authSubject}`;
+
+    return `ip:${resolveClientIp(req)}`;
+  },
 });
 
 app.use(globalLimiter);
@@ -267,6 +291,13 @@ app.get('/api/health', (_req, res) => {
 });
 
 // Rate limiters for authentication routes
+const AUTH_PUBLIC_RATE_LIMIT_PATHS = new Set([
+  '/request-password-reset',
+  '/initiate-registration',
+  '/verify-registration-code',
+  '/register-staff',
+]);
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   limit: 15, // 15 attempts per 15 minutes
@@ -274,6 +305,9 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many authentication attempts. Please try again later.' },
   keyGenerator: (req) => req.ip || req.header('x-forwarded-for') || 'unknown',
+  // Only throttle anonymous auth attempts (registration/reset/verification).
+  // Authenticated profile and onboarding calls should not be blocked by this limiter.
+  skip: (req) => !AUTH_PUBLIC_RATE_LIMIT_PATHS.has(req.path),
 });
 
 const patientAuthLimiter = rateLimit({

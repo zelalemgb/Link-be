@@ -295,6 +295,7 @@ export const ingestSyncPush = async ({
       if (opsToApply.length > 0) {
         const applyResults = await applyOpsToDatabase(opsToApply, {
           authUserId: scopedActor.authUserId,
+          profileId:  scopedActor.profileId,
           tenantId:   scopedActor.tenantId,
           facilityId: scopedActor.facilityId,
           role:       scopedActor.role,
@@ -303,9 +304,14 @@ export const ingestSyncPush = async ({
         // Update results with apply outcomes (conflict overrides ingested)
         for (const ar of applyResults) {
           const existing = results.find((r) => r.opId === ar.opId);
-          if (existing && ar.status === 'conflict') {
+          const skippedWithApplyError =
+            ar.status === 'skipped' &&
+            typeof ar.conflictReason === 'string' &&
+            ar.conflictReason.startsWith('Apply error:');
+
+          if (existing && (ar.status === 'conflict' || skippedWithApplyError)) {
             existing.status = 'conflict';
-            existing.conflictReason = ar.conflictReason;
+            existing.conflictReason = ar.conflictReason || 'APPLY_SKIPPED';
           }
           // 'skipped' (unknown entity type) stays as 'ingested' — op is in ledger
         }
@@ -491,4 +497,3 @@ export const loadSyncPull = async ({
     return contractError(500, 'CONFLICT_SYNC_PULL_FAILED', 'Failed to load sync deltas');
   }
 };
-

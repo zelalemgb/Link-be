@@ -224,6 +224,7 @@ router.get('/visits/:id/orders', async (req, res) => {
             return res.status(403).json({ error: 'Forbidden' });
         }
 
+        let consentOverrideCode: string | null = null;
         const consentCheck = await maybeAssertProviderPhiConsentForPatient({
             tenantId,
             facilityId,
@@ -231,10 +232,16 @@ router.get('/visits/:id/orders', async (req, res) => {
             consentType: PHI_PORTAL_CONSENT_TYPE,
         });
         if (consentCheck.ok === false) {
-            return res.status(consentCheck.status).json({
-                code: consentCheck.code,
-                message: consentCheck.message,
-            });
+            if (CONSENT_BLOCKING_CODES.has(consentCheck.code)) {
+                // Active in-facility visit workflows must remain operable even when
+                // patient portal consent is not yet granted/revoked.
+                consentOverrideCode = consentCheck.code;
+            } else {
+                return res.status(consentCheck.status).json({
+                    code: consentCheck.code,
+                    message: consentCheck.message,
+                });
+            }
         }
 
         const [labOrdersResult, imagingOrdersResult, medicationOrdersResult, billingItemsResult] = await Promise.all([
@@ -344,10 +351,19 @@ router.get('/visits/:id/orders', async (req, res) => {
                 complianceTags: ['hipaa'],
                 sensitivityLevel: 'phi',
                 requestId: req.requestId || null,
+                metadata: consentOverrideCode
+                    ? { consent_override: consentOverrideCode }
+                    : undefined,
             });
         }
 
-        return res.json({ labOrders, imagingOrders, medicationOrders, procedureOrders });
+        return res.json({
+            labOrders,
+            imagingOrders,
+            medicationOrders,
+            procedureOrders,
+            consent_override: consentOverrideCode || undefined,
+        });
     } catch (error: any) {
         return res.status(500).json({ error: error.message || 'Failed to fetch patient orders' });
     }

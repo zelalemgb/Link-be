@@ -2,7 +2,7 @@ import express from 'express';
 import { requireUser, requireScopedUser } from '../middleware/auth';
 import { supabaseAdmin } from '../config/supabase';
 import { getSubscriptionStatus, activateSubscription, provisionTrial } from '../services/subscriptionService';
-import { issueLicense, activateHubLicense, getPublicKey } from '../services/licenseService';
+import { issueHubSessionToken, issueLicense, activateHubLicense, getPublicKey } from '../services/licenseService';
 import { invalidateSubscriptionCache } from '../middleware/subscriptionGuard';
 import { recordAuditEvent } from '../services/audit-log';
 import { normalizeWorkspaceMetadata } from '../services/workspaceMetadata';
@@ -189,32 +189,109 @@ router.post('/activate-hub', async (req, res) => {
 // Called when a hub first comes online (or re-registers after moving)
 router.post('/register-hub', requireUser, requireScopedUser, async (req, res) => {
   try {
-    const { tenantId } = req.user as any;
+    const { tenantId, facilityId: actorFacilityId, role } = req.user as any;
     const { hubFingerprint, facilityId, localIp, hubVersion, osPlatform } = req.body;
     if (!hubFingerprint) return res.status(400).json({ error: 'hubFingerprint required' });
+    const resolvedFacilityId = (facilityId || actorFacilityId || '').trim();
+    if (!resolvedFacilityId) {
+      return res.status(400).json({ error: 'facilityId is required to register a hub' });
+    }
+    if (role !== 'super_admin' && actorFacilityId && resolvedFacilityId !== actorFacilityId) {
+      return res.status(403).json({ error: 'Facility is outside your scope' });
+    }
 
     const { data: existing } = await supabaseAdmin
       .from('hub_registrations')
-      .select('id')
+      .select('id, tenant_id, facility_id')
       .eq('hub_fingerprint', hubFingerprint)
       .single();
 
     if (existing) {
+      if (existing.tenant_id !== tenantId) {
+        return res.status(403).json({ error: 'Hub fingerprint belongs to another tenant' });
+      }
       // Update last seen
       await supabaseAdmin.from('hub_registrations').update({
-        local_ip: localIp, hub_version: hubVersion, last_seen_at: new Date().toISOString(),
+        facility_id: existing.facility_id || resolvedFacilityId,
+        local_ip: localIp,
+        hub_version: hubVersion,
+        os_platform: osPlatform,
+        last_seen_at: new Date().toISOString(),
       }).eq('id', existing.id);
       return res.json({ success: true, hubId: existing.id, isNew: false });
     }
 
     const { data: hub, error } = await supabaseAdmin
       .from('hub_registrations')
-      .insert({ tenant_id: tenantId, facility_id: facilityId || null, hub_fingerprint: hubFingerprint, local_ip: localIp, hub_version: hubVersion, os_platform: osPlatform, last_seen_at: new Date().toISOString() })
+      .insert({
+        tenant_id: tenantId,
+        facility_id: resolvedFacilityId,
+        hub_fingerprint: hubFingerprint,
+        local_ip: localIp,
+        hub_version: hubVersion,
+        os_platform: osPlatform,
+        last_seen_at: new Date().toISOString(),
+      })
       .select()
       .single();
     if (error) throw error;
 
     res.json({ success: true, hubId: hub.id, isNew: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/subscription/hub-session-token ─────────────────────────────
+// Issue a short-lived signed token used by LAN clients/devices to sync
+// against the local hub while internet to cloud auth is unavailable.
+router.post('/hub-session-token', requireUser, requireScopedUser, async (req, res) => {
+  try {
+    const { tenantId, facilityId: actorFacilityId, role, profileId } = req.user as any;
+    const { hubId, hubFingerprint, ttlHours } = req.body || {};
+    if (!hubId && !hubFingerprint) {
+      return res.status(400).json({ error: 'hubId or hubFingerprint is required' });
+    }
+
+    let query = supabaseAdmin
+      .from('hub_registrations')
+      .select('id, tenant_id, facility_id, is_active')
+      .eq('tenant_id', tenantId)
+      .limit(1);
+
+    if (hubId) {
+      query = query.eq('id', hubId);
+    } else {
+      query = query.eq('hub_fingerprint', String(hubFingerprint));
+    }
+
+    const { data: hub, error } = await query.maybeSingle();
+    if (error) throw error;
+    if (!hub) return res.status(404).json({ error: 'Hub registration not found' });
+    if (hub.is_active === false) return res.status(403).json({ error: 'Hub is inactive' });
+    if (!hub.facility_id) {
+      return res.status(409).json({ error: 'Hub registration is missing facility scope' });
+    }
+    if (role !== 'super_admin' && actorFacilityId && hub.facility_id !== actorFacilityId) {
+      return res.status(403).json({ error: 'Hub is outside your facility scope' });
+    }
+
+    const issued = issueHubSessionToken({
+      hubId: hub.id,
+      tenantId: hub.tenant_id,
+      facilityId: hub.facility_id,
+      profileId,
+      ttlHours,
+    });
+
+    res.json({
+      success: true,
+      hubId: hub.id,
+      facilityId: hub.facility_id,
+      tenantId: hub.tenant_id,
+      hubSessionToken: issued.token,
+      expiresAt: issued.expiresAt,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

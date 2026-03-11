@@ -87,6 +87,58 @@ export type IssuedLicense = {
   hubId: string;
 };
 
+export type HubSessionPayload = {
+  sub: string; // hub_id
+  tid: string; // tenant_id
+  fid: string; // facility_id
+  pid?: string; // public.users.id who issued the token
+  typ: 'hub_sync';
+  iat: number;
+  exp: number;
+};
+
+export type IssuedHubSessionToken = {
+  token: string;
+  expiresAt: string;
+  hubId: string;
+  facilityId: string;
+  tenantId: string;
+};
+
+/**
+ * Issue a short-lived hub session token used by LAN clients/devices to sync
+ * against a local Link Hub when upstream internet is unavailable.
+ */
+export const issueHubSessionToken = (params: {
+  hubId: string;
+  tenantId: string;
+  facilityId: string;
+  profileId?: string;
+  ttlHours?: number;
+}): IssuedHubSessionToken => {
+  const ttlHoursRaw = Number(params.ttlHours ?? 24 * 7);
+  const ttlHours = Number.isFinite(ttlHoursRaw) ? Math.min(Math.max(ttlHoursRaw, 1), 24 * 30) : 24 * 7;
+  const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
+  const payload: HubSessionPayload = {
+    sub: params.hubId,
+    tid: params.tenantId,
+    fid: params.facilityId,
+    ...(params.profileId ? { pid: params.profileId } : {}),
+    typ: 'hub_sync',
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(expiresAt.getTime() / 1000),
+  };
+
+  const token = signJwt(payload, getPrivateKey());
+  return {
+    token,
+    expiresAt: expiresAt.toISOString(),
+    hubId: params.hubId,
+    facilityId: params.facilityId,
+    tenantId: params.tenantId,
+  };
+};
+
 // ── Issue a license key ───────────────────────────────────────────────────
 
 export async function issueLicense(params: {

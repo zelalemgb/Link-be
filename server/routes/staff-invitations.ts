@@ -7,7 +7,7 @@ import { normalizeWorkspaceMetadata } from '../services/workspaceMetadata';
 
 const router = Router();
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://linkhc.org';
-const invitationManagerRoles = new Set(['clinic_admin', 'super_admin']);
+const invitationManagerRoles = new Set(['clinic_admin', 'admin', 'super_admin']);
 const nonAssignableRoles = new Set(['super_admin']);
 
 const normalizeRole = (role: string) => role.trim().toLowerCase();

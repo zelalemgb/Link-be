@@ -2,11 +2,28 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
 import request from 'supertest';
+import * as crypto from 'node:crypto';
 
 const ensureSupabaseEnv = () => {
   process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'http://127.0.0.1';
   process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'test-service-role-key';
   process.env.AUDIT_LOG_ENABLED = 'false';
+};
+
+const toBase64Url = (value: Buffer | string) => {
+  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+};
+
+const signHubSessionToken = (payload: Record<string, unknown>, privateKeyPem: string) => {
+  const header = toBase64Url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const body = toBase64Url(JSON.stringify(payload));
+  const signingInput = `${header}.${body}`;
+  const signature = crypto.sign('sha256', Buffer.from(signingInput), {
+    key: privateKeyPem,
+    padding: crypto.constants.RSA_PKCS1_PADDING,
+  });
+  return `${signingInput}.${toBase64Url(signature)}`;
 };
 
 type QueryState = {
@@ -39,6 +56,7 @@ test('W2-BE-020 sync push ingests ops idempotently by opId', async () => {
 
   const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   const facilityId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const profileId = '99999999-9999-4999-8999-999999999999';
 
   let seqCounter = 0;
   const ledger: any[] = [];
@@ -89,7 +107,7 @@ test('W2-BE-020 sync push ingests ops idempotently by opId', async () => {
         if (table === 'users') {
           return {
             data: {
-              id: 'profile-1',
+              id: profileId,
               tenant_id: tenantId,
               facility_id: facilityId,
               user_role: 'doctor',
@@ -184,7 +202,7 @@ test('W2-BE-020 sync push ingests ops idempotently by opId', async () => {
   try {
     (supabaseAdmin as any).auth = {
       getUser: async () => ({
-        data: { user: { id: '11111111-1111-1111-1111-111111111111' } },
+        data: { user: { id: '11111111-1111-4111-8111-111111111111' } },
         error: null,
       }),
     };
@@ -255,6 +273,153 @@ test('W2-BE-020 sync push ingests ops idempotently by opId', async () => {
   }
 });
 
+test('W2-BE-020 sync push accepts offline hub session JWT when cloud auth is unavailable', async () => {
+  const { syncRouter, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+  const originalAuth = (supabaseAdmin as any).auth;
+  const originalPublicKey = process.env.LICENSE_RSA_PUBLIC_KEY;
+
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const facilityId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const hubId = '66666666-6666-4666-8666-666666666666';
+  const profileId = '99999999-9999-4999-8999-999999999999';
+  let ledgerWrites = 0;
+
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  process.env.LICENSE_RSA_PUBLIC_KEY = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+
+  const token = signHubSessionToken(
+    {
+      sub: hubId,
+      tid: tenantId,
+      fid: facilityId,
+      pid: profileId,
+      typ: 'hub_sync',
+      iat: Math.floor(Date.now() / 1000) - 30,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    },
+    privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
+  );
+
+  try {
+    (supabaseAdmin as any).auth = {
+      getUser: async () => ({
+        data: { user: null },
+        error: { status: 503, message: 'auth provider unavailable' },
+      }),
+    };
+
+    (supabaseAdmin as any).from = (table: string) => {
+      const state: QueryState = {
+        table,
+        operation: 'select',
+        filters: {},
+        inFilters: {},
+        gtFilters: {},
+      };
+
+      const query: any = {
+        select() {
+          state.operation = 'select';
+          return query;
+        },
+        eq(column: string, value: any) {
+          state.filters[column] = value;
+          return query;
+        },
+        in() {
+          return query;
+        },
+        limit() {
+          return query;
+        },
+        upsert() {
+          state.operation = 'upsert';
+          if (table === 'sync_op_ledger') {
+            ledgerWrites += 1;
+          }
+          return query;
+        },
+        maybeSingle: async () => {
+          if (table === 'hub_registrations') {
+            return {
+              data: {
+                id: hubId,
+                tenant_id: tenantId,
+                facility_id: facilityId,
+                is_active: true,
+              },
+              error: null,
+            };
+          }
+          if (table === 'users') {
+            return {
+              data: {
+                id: profileId,
+                tenant_id: tenantId,
+                facility_id: facilityId,
+              },
+              error: null,
+            };
+          }
+          if (table === 'facilities') {
+            return {
+              data: { id: facilityId, tenant_id: tenantId },
+              error: null,
+            };
+          }
+          if (table === 'sync_op_ledger') {
+            return { data: null, error: null };
+          }
+          return { data: null, error: null };
+        },
+        then: (onFulfilled: any, onRejected: any) => {
+          if (table === 'sync_op_ledger' && state.operation === 'select') {
+            return Promise.resolve({ data: [], error: null }).then(onFulfilled, onRejected);
+          }
+          if (table === 'sync_op_ledger' && state.operation === 'upsert') {
+            return Promise.resolve({ data: [], error: null }).then(onFulfilled, onRejected);
+          }
+          return Promise.resolve({ data: [], error: null }).then(onFulfilled, onRejected);
+        },
+      };
+
+      return query;
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api/sync', syncRouter);
+
+    const response = await request(app)
+      .post('/api/sync/push')
+      .set('authorization', `Bearer ${token}`)
+      .send({
+        facilityId,
+        deviceId: 'hub-lan-device-1',
+        ops: [
+          {
+            opId: '77777777-7777-4777-8777-777777777777',
+            entityType: 'patients',
+            entityId: '88888888-8888-4888-8888-888888888888',
+            opType: 'upsert',
+            data: { full_name: 'Hub Offline Patient', updated_at: new Date().toISOString() },
+            clientCreatedAt: new Date().toISOString(),
+          },
+        ],
+      });
+
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(Array.isArray(response.body.results), true);
+    assert.equal(response.body.results[0]?.status, 'ingested');
+    assert.equal(ledgerWrites, 1);
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+    (supabaseAdmin as any).auth = originalAuth;
+    process.env.LICENSE_RSA_PUBLIC_KEY = originalPublicKey;
+  }
+});
+
 test('W2-BE-020 sync push rejects cross-tenant facility access', async () => {
   const { syncRouter, supabaseAdmin } = await loadModules();
   const originalFrom = (supabaseAdmin as any).from;
@@ -268,7 +433,7 @@ test('W2-BE-020 sync push rejects cross-tenant facility access', async () => {
   try {
     (supabaseAdmin as any).auth = {
       getUser: async () => ({
-        data: { user: { id: '11111111-1111-1111-1111-111111111111' } },
+        data: { user: { id: '11111111-1111-4111-8111-111111111111' } },
         error: null,
       }),
     };
@@ -288,7 +453,7 @@ test('W2-BE-020 sync push rejects cross-tenant facility access', async () => {
           if (table === 'users') {
             return {
               data: {
-                id: 'profile-1',
+                id: '99999999-9999-4999-8999-999999999999',
                 tenant_id: tenantId,
                 facility_id: facilityId,
                 user_role: 'doctor',
@@ -396,7 +561,7 @@ test('W2-BE-021 sync pull returns stable delta feed with cursor ordering', async
   try {
     (supabaseAdmin as any).auth = {
       getUser: async () => ({
-        data: { user: { id: '11111111-1111-1111-1111-111111111111' } },
+        data: { user: { id: '11111111-1111-4111-8111-111111111111' } },
         error: null,
       }),
     };
@@ -422,7 +587,7 @@ test('W2-BE-021 sync pull returns stable delta feed with cursor ordering', async
           if (table === 'users') {
             return {
               data: {
-                id: 'profile-1',
+                id: '99999999-9999-4999-8999-999999999999',
                 tenant_id: tenantId,
                 facility_id: facilityId,
                 user_role: 'doctor',
@@ -501,4 +666,3 @@ test('W2-BE-021 sync pull returns stable delta feed with cursor ordering', async
     (supabaseAdmin as any).auth = originalAuth;
   }
 });
-

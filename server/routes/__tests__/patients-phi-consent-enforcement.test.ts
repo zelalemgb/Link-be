@@ -254,3 +254,155 @@ test('provider patient search is consent-filtered for portal-linked PHI records 
     (supabaseAdmin as any).auth = originalAuth;
   }
 });
+
+test('provider active-visit order read remains available with consent override marker', async () => {
+  const { patientsRouter, supabaseAdmin } = await loadModules();
+  const originalFrom = (supabaseAdmin as any).from;
+  const originalAuth = (supabaseAdmin as any).auth;
+
+  const tenantId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const facilityId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const visitId = '11111111-1111-4111-8111-111111111111';
+  const patientId = '22222222-2222-4222-8222-222222222222';
+  const patientAccountId = '33333333-3333-4333-8333-333333333333';
+
+  try {
+    (supabaseAdmin as any).auth = {
+      getUser: async () => ({
+        data: { user: { id: 'auth-user-1' } },
+        error: null,
+      }),
+    };
+
+    (supabaseAdmin as any).from = (table: string) => {
+      const state: any = { filters: {} };
+      const query: any = {
+        select() {
+          return query;
+        },
+        eq(column: string, value: any) {
+          state.filters[column] = value;
+          return query;
+        },
+        limit() {
+          return query;
+        },
+        maybeSingle: async () => {
+          if (table === 'users') {
+            return {
+              data: { id: 'profile-1', tenant_id: tenantId, facility_id: facilityId, user_role: 'doctor' },
+              error: null,
+            };
+          }
+          if (table === 'visits') {
+            return {
+              data: { id: visitId, tenant_id: tenantId, facility_id: facilityId, patient_id: patientId },
+              error: null,
+            };
+          }
+          if (table === 'patients') {
+            return { data: { id: patientId, patient_account_id: patientAccountId }, error: null };
+          }
+          if (table === 'facilities') {
+            return { data: { id: facilityId, tenant_id: tenantId }, error: null };
+          }
+          if (table === 'patient_portal_consents') {
+            // Missing consent should map to PERM_PHI_CONSENT_REQUIRED.
+            return { data: null, error: null };
+          }
+          return { data: null, error: null };
+        },
+        then: (onFulfilled: any, onRejected: any) => {
+          if (table === 'lab_orders') {
+            return Promise.resolve({
+              data: [
+                {
+                  id: 'lab-1',
+                  test_name: 'CBC',
+                  test_code: 'CBC',
+                  urgency: 'routine',
+                  status: 'pending',
+                  result: null,
+                  result_value: null,
+                  reference_range: null,
+                  ordered_at: '2026-02-15T00:00:00.000Z',
+                  collected_at: null,
+                  completed_at: null,
+                  payment_status: 'unpaid',
+                  payment_mode: null,
+                  amount: 100,
+                  paid_at: null,
+                  notes: null,
+                  sent_outside: false,
+                },
+              ],
+              error: null,
+            }).then(onFulfilled, onRejected);
+          }
+          if (table === 'imaging_orders') {
+            return Promise.resolve({ data: [], error: null }).then(onFulfilled, onRejected);
+          }
+          if (table === 'medication_orders') {
+            return Promise.resolve({
+              data: [
+                {
+                  id: 'med-1',
+                  medication_name: 'Paracetamol',
+                  generic_name: null,
+                  dosage: '500 mg',
+                  frequency: 'TID',
+                  route: 'oral',
+                  duration: '3 days',
+                  quantity: 9,
+                  refills: 0,
+                  status: 'pending',
+                  notes: null,
+                  ordered_at: '2026-02-15T00:00:00.000Z',
+                  dispensed_at: null,
+                  payment_status: 'unpaid',
+                  payment_mode: null,
+                  amount: 80,
+                  paid_at: null,
+                  sent_outside: false,
+                },
+              ],
+              error: null,
+            }).then(onFulfilled, onRejected);
+          }
+          if (table === 'billing_items') {
+            return Promise.resolve({
+              data: [
+                {
+                  id: 'bill-1',
+                  payment_status: 'unpaid',
+                  medical_services: { name: 'Procedure A', category: 'Procedures' },
+                },
+              ],
+              error: null,
+            }).then(onFulfilled, onRejected);
+          }
+          return Promise.resolve({ data: [], error: null }).then(onFulfilled, onRejected);
+        },
+      };
+      return query;
+    };
+
+    const app = buildApp(patientsRouter);
+
+    const response = await request(app)
+      .get(`/api/patients/visits/${visitId}/orders`)
+      .set('authorization', 'Bearer valid-token');
+
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(response.body?.consent_override, 'PERM_PHI_CONSENT_REQUIRED');
+    assert.equal(Array.isArray(response.body?.labOrders), true);
+    assert.equal(response.body.labOrders.length, 1);
+    assert.equal(Array.isArray(response.body?.medicationOrders), true);
+    assert.equal(response.body.medicationOrders.length, 1);
+    assert.equal(Array.isArray(response.body?.procedureOrders), true);
+    assert.equal(response.body.procedureOrders.length, 1);
+  } finally {
+    (supabaseAdmin as any).from = originalFrom;
+    (supabaseAdmin as any).auth = originalAuth;
+  }
+});

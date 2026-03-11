@@ -43,8 +43,7 @@ export interface NormalizedOp {
   clientCreatedAt: string;
 }
 
-type ScopedActor = Required<Pick<SyncActor, 'tenantId' | 'facilityId' | 'authUserId'>> &
-  SyncActor;
+type ScopedActor = Required<Pick<SyncActor, 'tenantId' | 'facilityId'>> & SyncActor;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -74,6 +73,23 @@ const ageFromDob = (dob: unknown): number | null => {
   const ageMsec = Date.now() - birth.getTime();
   return Math.max(1, Math.floor(ageMsec / (365.25 * 24 * 60 * 60 * 1000)));
 };
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const asUuid = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return UUID_RE.test(normalized) ? normalized : null;
+};
+
+const resolveActorUserId = (
+  actor: ScopedActor,
+  opData?: Record<string, unknown> | null
+): string | null =>
+  asUuid(actor.profileId) ||
+  asUuid(actor.authUserId) ||
+  asUuid(opData?.created_by) ||
+  asUuid(opData?.clinician_id);
 
 // ─── Conflict audit ───────────────────────────────────────────────────────────
 
@@ -154,6 +170,7 @@ const applyPatientOp = async (
   }
 
   const d = op.data || {};
+  const actorUserId = resolveActorUserId(actor, d);
 
   // ── 3a. Soft-delete ───────────────────────────────────────────────────────
   if (op.opType === 'delete') {
@@ -179,12 +196,6 @@ const applyPatientOp = async (
     full_name:    String(d.full_name || (current as any)?.full_name || 'Unknown'),
     phone:        d.phone   != null ? String(d.phone)   : null,
     date_of_birth: d.date_of_birth != null ? String(d.date_of_birth) : null,
-    sex:          d.sex     != null ? String(d.sex)     : null,
-    village:      d.village != null ? String(d.village) : null,
-    kebele:       d.kebele  != null ? String(d.kebele)  : null,
-    woreda:       d.woreda  != null ? String(d.woreda)  : null,
-    language:     d.language != null ? String(d.language) : 'am',
-    hew_user_id:  d.hew_user_id != null ? String(d.hew_user_id) : null,
     deleted_at:   d.deleted_at  != null ? String(d.deleted_at)  : null,
   };
 
@@ -192,7 +203,10 @@ const applyPatientOp = async (
   if (!current) {
     if (gender) upsertRow.gender   = gender;
     if (age)    upsertRow.age      = age;
-    upsertRow.created_by = actor.authUserId;
+    if (!actorUserId) {
+      throw new Error('Unable to resolve users.id for patients.created_by');
+    }
+    upsertRow.created_by = actorUserId;
   } else {
     // On update, also keep gender in sync with sex
     if (gender) upsertRow.gender = gender;
@@ -251,6 +265,7 @@ const applyVisitOp = async (
   }
 
   const d = op.data || {};
+  const actorUserId = resolveActorUserId(actor, d);
 
   // ── 3a. Soft-delete ───────────────────────────────────────────────────────
   if (op.opType === 'delete') {
@@ -289,12 +304,17 @@ const applyVisitOp = async (
   // Legacy compat: set reason + provider on insert if not already set
   if (!current) {
     upsertRow.reason     = d.chief_complaint != null ? String(d.chief_complaint) : null;
-    upsertRow.provider   = actor.authUserId; // clinician user id as provider
-    upsertRow.clinician_id = actor.authUserId;
-    upsertRow.created_by   = actor.authUserId;
+    upsertRow.provider   = d.provider != null ? String(d.provider) : String(actor.authUserId || actorUserId || 'hub-device');
+    if (!actorUserId) {
+      throw new Error('Unable to resolve users.id for visits.created_by/clinician_id');
+    }
+    upsertRow.clinician_id = actorUserId;
+    upsertRow.created_by   = actorUserId;
     upsertRow.fee_paid     = 0;
   } else {
-    upsertRow.clinician_id = actor.authUserId;
+    if (actorUserId) {
+      upsertRow.clinician_id = actorUserId;
+    }
   }
 
   // Remove undefined keys (Supabase rejects undefined values)

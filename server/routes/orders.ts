@@ -117,6 +117,43 @@ const parseCollector = (note?: string | null) => {
   return match?.[1]?.trim() || null;
 };
 
+const normalizeOrderUrgency = (urgency?: string | null): 'routine' | 'urgent' | 'stat' => {
+  const value = (urgency || '').trim().toLowerCase();
+  if (value === 'stat' || value === 'emergency' || value === 'critical') return 'stat';
+  if (value === 'urgent' || value === 'high') return 'urgent';
+  return 'routine';
+};
+
+type ScopedOrderTable = 'lab_orders' | 'imaging_orders';
+
+const getScopedOrderIds = async (
+  table: ScopedOrderTable,
+  ids: string[],
+  tenantId?: string | null,
+  facilityId?: string | null
+) => {
+  if (!ids.length) return { foundCount: 0, scopedIds: [] as string[] };
+
+  const { data, error } = await supabaseAdmin
+    .from(table)
+    .select('id, tenant_id, visits!inner(facility_id)')
+    .in('id', ids);
+
+  if (error) throw error;
+
+  const rows = data || [];
+  const scopedIds = rows
+    .filter((row: any) => {
+      const visit = Array.isArray(row.visits) ? row.visits[0] : row.visits;
+      const tenantOk = !tenantId || row.tenant_id === tenantId;
+      const facilityOk = !facilityId || visit?.facility_id === facilityId;
+      return tenantOk && facilityOk;
+    })
+    .map((row: any) => row.id);
+
+  return { foundCount: rows.length, scopedIds };
+};
+
 router.get('/counts', async (req, res) => {
   const { tenantId, facilityId, profileId, role } = req.user!;
   const parsed = countsQuerySchema.safeParse(req.query);
@@ -255,7 +292,6 @@ router.get('/lab', async (req, res) => {
             created_at,
             routing_status,
             journey_timeline,
-            current_journey_stage,
             patients (
               id,
               full_name,
@@ -300,7 +336,7 @@ router.get('/lab', async (req, res) => {
           status: 'Not Collected',
           tests: [],
           uncollectedCount: 0,
-          current_journey_stage: visit.current_journey_stage || null,
+          current_journey_stage: null,
           routing_status: visit.routing_status || null,
           journey_timeline: visit.journey_timeline || null,
           created_at: visit.created_at || null,
@@ -480,7 +516,6 @@ router.get('/medications', async (req, res) => {
             created_at,
             routing_status,
             journey_timeline,
-            current_journey_stage,
             patients (
               full_name,
               age,
@@ -571,7 +606,7 @@ router.get('/medications', async (req, res) => {
         prescriber_name: userMap.get(row.ordered_by) || null,
         stock_on_hand: stock?.current_quantity ?? null,
         reorder_level: stock?.reorder_level ?? null,
-        current_journey_stage: row.visits?.current_journey_stage || null,
+        current_journey_stage: null,
         routing_status: row.visits?.routing_status || null,
         journey_timeline: row.visits?.journey_timeline || null,
         created_at: row.visits?.created_at || null,
@@ -641,11 +676,10 @@ router.post('/lab', async (req, res) => {
       patient_id: patientId,
       ordered_by: profileId,
       tenant_id: tenantId,
-      facility_id: facilityId,
       test_name: order.test_name,
       test_code: order.test_code || null,
       reference_range: order.reference_range || null,
-      urgency: order.urgency || 'routine',
+      urgency: normalizeOrderUrgency(order.urgency),
       status: 'pending',
       payment_status: 'unpaid',
       amount: order.amount || null,
@@ -718,11 +752,10 @@ router.post('/imaging', async (req, res) => {
       patient_id: patientId,
       ordered_by: profileId,
       tenant_id: tenantId,
-      facility_id: facilityId,
       study_name: order.study_name,
       study_code: order.study_code || null,
       body_part: order.body_part || null,
-      urgency: order.urgency || 'routine',
+      urgency: normalizeOrderUrgency(order.urgency),
       status: 'pending',
       payment_status: 'unpaid',
       amount: order.amount || null,
@@ -914,11 +947,15 @@ router.post('/lab/bulk', async (req, res) => {
   const { ids, updates } = parsed.data;
 
   try {
-    let query = supabaseAdmin.from('lab_orders').update(updates).in('id', ids);
-    if (facilityId) {
-      query = query.eq('facility_id', facilityId);
+    const { foundCount, scopedIds } = await getScopedOrderIds('lab_orders', ids, tenantId, facilityId);
+    if (foundCount === 0) {
+      return res.status(404).json({ error: 'Lab orders not found' });
     }
-    const { error } = await query;
+    if (scopedIds.length !== ids.length) {
+      return res.status(403).json({ error: 'One or more lab orders are outside your scope' });
+    }
+
+    const { error } = await supabaseAdmin.from('lab_orders').update(updates).in('id', scopedIds);
     if (error) throw error;
 
     if (tenantId) {
@@ -939,7 +976,7 @@ router.post('/lab/bulk', async (req, res) => {
       });
     }
 
-    return res.json({ success: true, updated: ids.length });
+    return res.json({ success: true, updated: scopedIds.length });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Failed to update lab orders' });
   }
@@ -955,11 +992,12 @@ router.patch('/lab/:id', async (req, res) => {
   }
 
   try {
-    let query = supabaseAdmin.from('lab_orders').update(updates).eq('id', id);
-    if (facilityId) {
-      query = query.eq('facility_id', facilityId);
+    const { foundCount, scopedIds } = await getScopedOrderIds('lab_orders', [id], tenantId, facilityId);
+    if (scopedIds.length === 0) {
+      return res.status(foundCount > 0 ? 403 : 404).json({ error: foundCount > 0 ? 'Forbidden' : 'Lab order not found' });
     }
-    const { error } = await query;
+
+    const { error } = await supabaseAdmin.from('lab_orders').update(updates).eq('id', id);
     if (error) throw error;
 
     if (tenantId) {
@@ -992,16 +1030,10 @@ router.delete('/lab/:id', async (req, res) => {
   const id = req.params.id;
 
   try {
-    const { data: order, error: fetchError } = await supabaseAdmin
-      .from('lab_orders')
-      .select('id, facility_id, tenant_id')
-      .eq('id', id)
-      .maybeSingle();
-
-    if (fetchError) throw fetchError;
-    if (!order) return res.status(404).json({ error: 'Lab order not found' });
-    if (facilityId && order.facility_id !== facilityId) return res.status(403).json({ error: 'Forbidden' });
-    if (tenantId && order.tenant_id !== tenantId) return res.status(403).json({ error: 'Forbidden' });
+    const { foundCount, scopedIds } = await getScopedOrderIds('lab_orders', [id], tenantId, facilityId);
+    if (scopedIds.length === 0) {
+      return res.status(foundCount > 0 ? 403 : 404).json({ error: foundCount > 0 ? 'Forbidden' : 'Lab order not found' });
+    }
 
     const { error } = await supabaseAdmin.from('lab_orders').delete().eq('id', id);
     if (error) throw error;
@@ -1040,11 +1072,14 @@ router.patch('/imaging/:id', async (req, res) => {
   }
 
   try {
-    let query = supabaseAdmin.from('imaging_orders').update(updates).eq('id', id);
-    if (facilityId) {
-      query = query.eq('facility_id', facilityId);
+    const { foundCount, scopedIds } = await getScopedOrderIds('imaging_orders', [id], tenantId, facilityId);
+    if (scopedIds.length === 0) {
+      return res
+        .status(foundCount > 0 ? 403 : 404)
+        .json({ error: foundCount > 0 ? 'Forbidden' : 'Imaging order not found' });
     }
-    const { error } = await query;
+
+    const { error } = await supabaseAdmin.from('imaging_orders').update(updates).eq('id', id);
     if (error) throw error;
 
     if (tenantId) {
@@ -1077,16 +1112,12 @@ router.delete('/imaging/:id', async (req, res) => {
   const id = req.params.id;
 
   try {
-    const { data: order, error: fetchError } = await supabaseAdmin
-      .from('imaging_orders')
-      .select('id, facility_id, tenant_id')
-      .eq('id', id)
-      .maybeSingle();
-
-    if (fetchError) throw fetchError;
-    if (!order) return res.status(404).json({ error: 'Imaging order not found' });
-    if (facilityId && order.facility_id !== facilityId) return res.status(403).json({ error: 'Forbidden' });
-    if (tenantId && order.tenant_id !== tenantId) return res.status(403).json({ error: 'Forbidden' });
+    const { foundCount, scopedIds } = await getScopedOrderIds('imaging_orders', [id], tenantId, facilityId);
+    if (scopedIds.length === 0) {
+      return res
+        .status(foundCount > 0 ? 403 : 404)
+        .json({ error: foundCount > 0 ? 'Forbidden' : 'Imaging order not found' });
+    }
 
     const { error } = await supabaseAdmin.from('imaging_orders').delete().eq('id', id);
     if (error) throw error;
@@ -1301,7 +1332,6 @@ router.get('/imaging', async (req, res) => {
           routing_status,
           journey_timeline,
           notes,
-          current_journey_stage,
           patients (
             id,
             full_name,
