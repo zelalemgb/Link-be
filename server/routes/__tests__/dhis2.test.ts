@@ -241,6 +241,168 @@ test('DHIS2 metadata route returns dataset metadata from the live client abstrac
   }
 });
 
+test('DHIS2 report-data route aggregates facility rows with service-role access', async () => {
+  const { dhis2Router, supabaseAdmin } = await loadModules();
+  const app = buildApp(dhis2Router);
+  const originalAuth = (supabaseAdmin as any).auth;
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    (supabaseAdmin as any).auth = {
+      getUser: async () => ({
+        data: { user: { id: 'auth-user-1' } },
+        error: null,
+      }),
+    };
+
+    (supabaseAdmin as any).from = (table: string) => {
+      if (table === 'users') {
+        let authUserId = '';
+        let facilityId = '';
+        return {
+          select() {
+            return this;
+          },
+          eq(column: string, value: string) {
+            if (column === 'auth_user_id') authUserId = value;
+            if (column === 'facility_id') facilityId = value;
+            return this;
+          },
+          limit() {
+            return this;
+          },
+          maybeSingle: async () => ({
+            data:
+              authUserId === 'auth-user-1' && (!facilityId || facilityId === FACILITY_ID)
+                ? {
+                    id: 'profile-1',
+                    tenant_id: 'tenant-1',
+                    facility_id: FACILITY_ID,
+                    user_role: 'medical_director',
+                  }
+                : null,
+            error: null,
+          }),
+        };
+      }
+
+      if (table === 'facilities') {
+        const state: Record<string, string> = {};
+        return {
+          select() {
+            return this;
+          },
+          eq(column: string, value: string) {
+            state[column] = value;
+            return this;
+          },
+          maybeSingle: async () => ({
+            data:
+              state.id === FACILITY_ID
+                ? {
+                    id: FACILITY_ID,
+                    tenant_id: 'tenant-1',
+                    dhis2_org_unit_uid: 'IWp9dQGM0bS',
+                  }
+                : null,
+            error: null,
+          }),
+        };
+      }
+
+      if (table === 'visits') {
+        return {
+          select() {
+            return this;
+          },
+          eq() {
+            return this;
+          },
+          gte() {
+            return this;
+          },
+          lte() {
+            return this;
+          },
+          range: async () => ({
+            data: [
+              {
+                id: 'visit-1',
+                patient_id: 'patient-1',
+                visit_date: '2026-02-11',
+                reason: 'Antenatal care',
+                clinical_notes: 'Routine ANC follow-up',
+                admitted_at: null,
+                blood_pressure: '118/76',
+                patients: { age: 26 },
+              },
+            ],
+            error: null,
+          }),
+        };
+      }
+
+      if (table === 'anc_assessments') {
+        return {
+          select() {
+            return this;
+          },
+          in: async () => ({
+            data: [
+              {
+                visit_id: 'visit-1',
+                patient_id: 'patient-1',
+                anc_visit_number: 1,
+                iptp_given: false,
+              },
+            ],
+            error: null,
+          }),
+        };
+      }
+
+      if (
+        table === 'delivery_records' ||
+        table === 'lab_orders' ||
+        table === 'medication_orders' ||
+        table === 'pediatric_assessments' ||
+        table === 'immunization_records'
+      ) {
+        return {
+          select() {
+            return this;
+          },
+          in: async () => ({
+            data: [],
+            error: null,
+          }),
+        };
+      }
+
+      throw new Error(`Unexpected table ${table}`);
+    };
+
+    const response = await request(app)
+      .get('/api/dhis2/report-data')
+      .set('authorization', 'Bearer valid-token')
+      .query({
+        facilityId: FACILITY_ID,
+        program: 'RMNCH',
+        from: '2026-02-01',
+        to: '2026-02-28',
+      });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.program, 'RMNCH');
+    assert.equal(response.body.values.ANC1, 1);
+    assert.equal(response.body.sourceCounts.visits, 1);
+    assert.equal(response.body.sourceCounts.ancAssessments, 1);
+  } finally {
+    (supabaseAdmin as any).auth = originalAuth;
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
 test('DHIS2 submit route sends mapped data values and persists the submission batch', async () => {
   const { dhis2Router, supabaseAdmin } = await loadModules();
   const app = buildApp(dhis2Router);

@@ -15,6 +15,7 @@ import {
   testDhis2Connection,
   updateFacilityDhis2OrgUnit,
 } from '../services/dhis2';
+import { buildFacilityDhis2ReportData } from '../services/dhis2ReportData';
 
 const router = Router();
 
@@ -193,6 +194,24 @@ const toIndicatorMappings = (
 
 const dhis2ConfigQuerySchema = z.object({
   facilityId: uuidSchema.optional(),
+});
+
+const dhis2ReportDataQuerySchema = z.object({
+  facilityId: uuidSchema.optional(),
+  program: z
+    .string()
+    .trim()
+    .min(1)
+    .max(32)
+    .refine(
+      (value) =>
+        ['RMNCH', 'EPI', 'HIV', 'TB', 'NUT', 'NCD', 'MALARIA', 'ALL', '__ALL_PROGRAMS__'].includes(
+          value.toUpperCase()
+        ) || value === '__ALL_PROGRAMS__',
+      'Unsupported DHIS2 program'
+    ),
+  from: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/),
+  to: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/),
 });
 
 const dhis2ConfigUpdateSchema = z.object({
@@ -498,6 +517,31 @@ router.get('/config', requireUser, requireScopedUser, async (req, res) => {
       connection: toPublicConnection(storedSettings.connection),
       mappingsByProgram: storedSettings.mappingsByProgram,
     });
+  } catch (error) {
+    return sendDhis2Error(res, error);
+  }
+});
+
+router.get('/report-data', requireUser, requireScopedUser, async (req, res) => {
+  const parsed = dhis2ReportDataQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid query' });
+  }
+
+  try {
+    const { facilityId } = await resolveFacilityContext(req, parsed.data.facilityId);
+    if (!facilityId) {
+      return res.status(400).json({ error: 'Facility workspace is required for DHIS2 reporting' });
+    }
+
+    const reportData = await buildFacilityDhis2ReportData({
+      facilityId,
+      program: parsed.data.program,
+      from: parsed.data.from,
+      to: parsed.data.to,
+    });
+
+    return res.json(reportData);
   } catch (error) {
     return sendDhis2Error(res, error);
   }
