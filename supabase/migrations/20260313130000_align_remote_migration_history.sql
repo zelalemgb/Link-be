@@ -1,0 +1,2 @@
+-- Align local migration history with the remote Supabase project.
+-- This version already exists remotely; no schema change is required here.
