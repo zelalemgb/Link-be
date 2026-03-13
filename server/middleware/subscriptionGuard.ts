@@ -33,6 +33,12 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const cache = new Map<string, { status: any; cachedAt: number }>();
 const CACHE_TTL_MS = 60_000;
 
+const sanitizeHeaderValue = (value: unknown) =>
+  String(value ?? '')
+    .replace(/[^\t\x20-\x7e]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
 export async function subscriptionGuard(req: Request, res: Response, next: NextFunction) {
   // Skip unauthenticated requests (auth middleware handles them separately)
   if (!req.user) return next();
@@ -64,7 +70,10 @@ export async function subscriptionGuard(req: Request, res: Response, next: NextF
       res.setHeader('X-Subscription-Status', subscriptionStatus.status);
       res.setHeader('X-Subscription-Days-Remaining', String(subscriptionStatus.daysRemaining ?? ''));
       if (subscriptionStatus.message) {
-        res.setHeader('X-Subscription-Message', subscriptionStatus.message);
+        const safeMessage = sanitizeHeaderValue(subscriptionStatus.message);
+        if (safeMessage) {
+          res.setHeader('X-Subscription-Message', safeMessage);
+        }
       }
       return next();
     }

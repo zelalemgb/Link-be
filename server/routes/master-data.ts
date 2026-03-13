@@ -27,12 +27,14 @@ const serviceSchema = z.object({
   price: z.number().nullable().optional(),
   category: z.string().optional(),
   is_active: z.boolean().default(true),
+  scope: masterCatalogScopeSchema.default('tenant'),
 });
 
 const programSchema = z.object({
   name: z.string().min(1),
   code: z.string().optional().nullable(),
   is_active: z.boolean().default(true),
+  scope: masterCatalogScopeSchema.default('tenant'),
 });
 
 const medicationSchema = z.object({
@@ -75,6 +77,7 @@ const imagingSchema = z.object({
   estimated_duration_minutes: z.number().nullable().optional(),
   price: z.number().nullable().optional(),
   is_active: z.boolean().default(true),
+  scope: masterCatalogScopeSchema.default('tenant'),
 });
 
 const equipmentSchema = z.object({
@@ -230,6 +233,15 @@ const medicationIdentity = (row: any) =>
 const labCatalogIdentity = (row: any) =>
   buildScopedCatalogKey([row.test_code || row.test_name]);
 
+const serviceIdentity = (row: any) =>
+  buildScopedCatalogKey([row.code || row.name, row.category]);
+
+const programIdentity = (row: any) =>
+  buildScopedCatalogKey([row.code || row.name]);
+
+const imagingIdentity = (row: any) =>
+  buildScopedCatalogKey([row.study_code || row.study_name, row.modality, row.body_part]);
+
 const equipmentIdentity = (row: any) =>
   buildScopedCatalogKey([row.equipment_code || row.equipment_name, row.category]);
 
@@ -255,7 +267,12 @@ router.get('/services', async (req, res) => {
     const { data, error } = await query.order('category').order('name');
 
     if (error) throw error;
-    res.json(data || []);
+    const resolved = preferFacilityScopedRows(data || [], serviceIdentity).sort((left, right) => {
+      const categoryCompare = String(left.category || '').localeCompare(String(right.category || ''));
+      if (categoryCompare !== 0) return categoryCompare;
+      return String(left.name || '').localeCompare(String(right.name || ''));
+    });
+    res.json(resolved);
   } catch (error: any) {
     console.error('Fetch services error:', error?.message || error);
     res.status(500).json({ error: error.message });
@@ -271,12 +288,13 @@ router.post('/services', async (req, res) => {
 
   try {
     const payload = serviceSchema.parse(req.body);
+    const { scope: recordScope, ...dataFields } = payload;
     const { data, error } = await supabaseAdmin
       .from('medical_services')
       .insert({
-        ...payload,
+        ...dataFields,
         tenant_id: tenantId,
-        facility_id: resolveScopedFacilityId(undefined, facilityId, 'facility'),
+        facility_id: resolveScopedFacilityId(recordScope, facilityId, 'tenant'),
         created_by: profileId,
       })
       .select()
@@ -301,9 +319,16 @@ router.put('/services/:id', async (req, res) => {
 
   try {
     const payload = serviceSchema.partial().parse(req.body);
+    const { scope: recordScope, ...dataFields } = payload;
     let query = supabaseAdmin
       .from('medical_services')
-      .update(payload)
+      .update({
+        ...dataFields,
+        facility_id:
+          recordScope === undefined
+            ? undefined
+            : resolveScopedFacilityId(recordScope, facilityId, 'tenant'),
+      })
       .eq('tenant_id', tenantId)
       .eq('id', req.params.id)
       .select();
@@ -363,7 +388,10 @@ router.get('/programs', async (req, res) => {
     ).order('name');
 
     if (error) throw error;
-    res.json(data || []);
+    const resolved = preferFacilityScopedRows(data || [], programIdentity).sort((left, right) =>
+      String(left.name || '').localeCompare(String(right.name || ''))
+    );
+    res.json(resolved);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -378,12 +406,13 @@ router.post('/programs', async (req, res) => {
 
   try {
     const payload = programSchema.parse(req.body);
+    const { scope: recordScope, ...dataFields } = payload;
     const { data, error } = await supabaseAdmin
       .from('programs')
       .insert({
-        ...payload,
+        ...dataFields,
         tenant_id: tenantId,
-        facility_id: facilityId,
+        facility_id: resolveScopedFacilityId(recordScope, facilityId, 'tenant'),
       })
       .select()
       .single();
@@ -407,9 +436,13 @@ router.put('/programs/:id', async (req, res) => {
 
   try {
     const payload = programSchema.parse(req.body);
+    const { scope: recordScope, ...dataFields } = payload;
     let query = supabaseAdmin
       .from('programs')
-      .update(payload)
+      .update({
+        ...dataFields,
+        facility_id: resolveScopedFacilityId(recordScope, facilityId, 'tenant'),
+      })
       .eq('tenant_id', tenantId)
       .eq('id', req.params.id)
       .select();
@@ -725,7 +758,12 @@ router.get('/imaging', async (req, res) => {
       .order('study_name');
 
     if (error) throw error;
-    res.json(data || []);
+    const resolved = preferFacilityScopedRows(data || [], imagingIdentity).sort((left, right) => {
+      const modalityCompare = String(left.modality || '').localeCompare(String(right.modality || ''));
+      if (modalityCompare !== 0) return modalityCompare;
+      return String(left.study_name || '').localeCompare(String(right.study_name || ''));
+    });
+    res.json(resolved);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -740,12 +778,13 @@ router.post('/imaging', async (req, res) => {
 
   try {
     const payload = imagingSchema.parse(req.body);
+    const { scope: recordScope, ...dataFields } = payload;
     const { data, error } = await supabaseAdmin
       .from('imaging_study_catalog')
       .insert({
-        ...payload,
+        ...dataFields,
         tenant_id: tenantId,
-        facility_id: resolveScopedFacilityId(undefined, facilityId, 'facility'),
+        facility_id: resolveScopedFacilityId(recordScope, facilityId, 'tenant'),
         created_by: profileId,
       })
       .select()
@@ -770,9 +809,13 @@ router.put('/imaging/:id', async (req, res) => {
 
   try {
     const payload = imagingSchema.parse(req.body);
+    const { scope: recordScope, ...dataFields } = payload;
     let query = supabaseAdmin
       .from('imaging_study_catalog')
-      .update(payload)
+      .update({
+        ...dataFields,
+        facility_id: resolveScopedFacilityId(recordScope, facilityId, 'tenant'),
+      })
       .eq('tenant_id', tenantId)
       .eq('id', req.params.id)
       .select();

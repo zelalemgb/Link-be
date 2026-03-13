@@ -1,6 +1,11 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { isAuditDurabilityError, recordAuditEvent } from './audit-log';
 import { assertInventoryUnlocked } from './inventoryLockService';
+import {
+  buildIssueVoucherNo,
+  dispatchIssueOrderFallback,
+  isMissingRpcFunctionError,
+} from './inventoryRpcFallbacks.js';
 
 export type InventoryContractErrorCode =
   | `AUTH_${string}`
@@ -108,6 +113,14 @@ const error = <T>(
   message,
 });
 
+const isMissingColumnError = (message: string | undefined, column: string) => {
+  const normalized = String(message || '').toLowerCase();
+  return (
+    normalized.includes(column.toLowerCase()) &&
+    (normalized.includes('does not exist') || normalized.includes('schema cache') || normalized.includes('could not find'))
+  );
+};
+
 export const ensureInventoryMutationAccess = (
   actor: InventoryMutationActor
 ): { ok: true; data: Required<Pick<InventoryMutationActor, 'authUserId' | 'profileId' | 'tenantId' | 'facilityId' | 'role'>> & InventoryMutationActor } | InventoryMutationFailure => {
@@ -136,18 +149,32 @@ export const ensureInventoryMutationAccess = (
 };
 
 const getScopedIssueOrder = async (orderId: string) => {
-  const { data, error: queryError } = await supabaseAdmin
+  let { data, error: queryError } = await supabaseAdmin
     .from('issue_orders')
     .select('id, tenant_id, facility_id, status, voucher_no')
     .eq('id', orderId)
     .maybeSingle();
+  if (queryError && isMissingColumnError(queryError.message, 'tenant_id')) {
+    const fallbackLookup = await supabaseAdmin
+      .from('issue_orders')
+      .select('id, facility_id, status, voucher_no')
+      .eq('id', orderId)
+      .maybeSingle();
+    data = fallbackLookup.data
+      ? {
+          ...fallbackLookup.data,
+          tenant_id: null,
+        }
+      : null;
+    queryError = fallbackLookup.error;
+  }
   if (queryError) {
     throw new Error(queryError.message);
   }
   return data as
     | {
         id: string;
-        tenant_id: string;
+        tenant_id: string | null;
         facility_id: string;
         status: string;
         voucher_no: string | null;
@@ -158,7 +185,7 @@ const getScopedIssueOrder = async (orderId: string) => {
 const assertIssueOrderScope = (
   order: {
     id: string;
-    tenant_id: string;
+    tenant_id: string | null;
     facility_id: string;
     status: string;
     voucher_no: string | null;
@@ -166,7 +193,7 @@ const assertIssueOrderScope = (
   actor: { tenantId: string; facilityId: string }
 ): InventoryMutationResult<{
   id: string;
-  tenant_id: string;
+  tenant_id: string | null;
   facility_id: string;
   status: string;
   voucher_no: string | null;
@@ -174,7 +201,7 @@ const assertIssueOrderScope = (
   if (!order) {
     return error(404, 'VALIDATION_ISSUE_ORDER_NOT_FOUND', 'Issue order not found');
   }
-  if (order.tenant_id !== actor.tenantId || order.facility_id !== actor.facilityId) {
+  if ((order.tenant_id && order.tenant_id !== actor.tenantId) || order.facility_id !== actor.facilityId) {
     return error(403, 'TENANT_RESOURCE_SCOPE_VIOLATION', 'Issue order is outside your tenant scope');
   }
   return { ok: true, data: order };
@@ -277,11 +304,27 @@ const validateDispensingUnitScope = async ({
     return { ok: true, data: null };
   }
 
-  const { data: unit, error: unitError } = await supabaseAdmin
+  let { data: unit, error: unitError } = await supabaseAdmin
     .from('dispensing_units')
     .select('id, tenant_id, facility_id')
     .eq('id', dispensingUnitId)
     .maybeSingle();
+
+  if (unitError && isMissingColumnError(unitError.message, 'tenant_id')) {
+    const fallbackLookup = await supabaseAdmin
+      .from('dispensing_units')
+      .select('id, facility_id')
+      .eq('id', dispensingUnitId)
+      .maybeSingle();
+    unit = fallbackLookup.data
+      ? {
+          ...fallbackLookup.data,
+          tenant_id: tenantId,
+        }
+      : null;
+    unitError = fallbackLookup.error;
+  }
+
   if (unitError) {
     throw new Error(unitError.message);
   }
@@ -292,11 +335,6 @@ const validateDispensingUnitScope = async ({
     return error(403, 'TENANT_RESOURCE_SCOPE_VIOLATION', 'Dispensing unit is outside your tenant scope');
   }
   return { ok: true, data: null };
-};
-
-const buildIssueVoucherNo = (orderId: string) => {
-  const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  return `SIV-${day}-${orderId.slice(0, 8).toUpperCase()}`;
 };
 
 const mapDispatchRpcError = (message: string): InventoryMutationResult<never> => {
@@ -376,14 +414,36 @@ export const createIssueOrder = async ({
     }
 
     const { data: duplicateDraft, error: duplicateError } = await draftQuery.limit(1).maybeSingle();
+    let resolvedDuplicateDraft = duplicateDraft;
     if (duplicateError) {
-      throw new Error(duplicateError.message);
+      if (!isMissingColumnError(duplicateError.message, 'tenant_id')) {
+        throw new Error(duplicateError.message);
+      }
+
+      let fallbackDraftQuery = supabaseAdmin
+        .from('issue_orders')
+        .select('id')
+        .eq('facility_id', scopedActor.facilityId)
+        .eq('period', payload.period.trim())
+        .eq('status', 'draft');
+
+      if (payload.dispensing_unit_id) {
+        fallbackDraftQuery = fallbackDraftQuery.eq('dispensing_unit_id', payload.dispensing_unit_id);
+      } else {
+        fallbackDraftQuery = fallbackDraftQuery.is('dispensing_unit_id', null);
+      }
+
+      const fallbackDuplicate = await fallbackDraftQuery.limit(1).maybeSingle();
+      if (fallbackDuplicate.error) {
+        throw new Error(fallbackDuplicate.error.message);
+      }
+      resolvedDuplicateDraft = fallbackDuplicate.data;
     }
-    if (duplicateDraft?.id) {
+    if (resolvedDuplicateDraft?.id) {
       return error(409, 'CONFLICT_DUPLICATE_DRAFT_ISSUE_ORDER', 'A draft issue order already exists for this period');
     }
 
-    const { data: order, error: insertError } = await supabaseAdmin
+    let { data: order, error: insertError } = await supabaseAdmin
       .from('issue_orders')
       .insert({
         period: payload.period.trim(),
@@ -396,6 +456,22 @@ export const createIssueOrder = async ({
       })
       .select('id')
       .single();
+    if (insertError && isMissingColumnError(insertError.message, 'tenant_id')) {
+      const fallbackInsert = await supabaseAdmin
+        .from('issue_orders')
+        .insert({
+          period: payload.period.trim(),
+          dispensing_unit_id: payload.dispensing_unit_id || null,
+          notes: payload.notes || null,
+          facility_id: scopedActor.facilityId,
+          created_by: scopedActor.profileId,
+          status: 'draft',
+        })
+        .select('id')
+        .single();
+      order = fallbackInsert.data;
+      insertError = fallbackInsert.error;
+    }
 
     if (insertError || !order) {
       if (insertError?.code === '23505') {
@@ -466,7 +542,7 @@ export const updateIssueOrder = async ({
     });
     if (unitScope.ok === false) return unitScope;
 
-    const { data: order, error: updateError } = await supabaseAdmin
+    let { data: order, error: updateError } = await supabaseAdmin
       .from('issue_orders')
       .update({
         period: payload.period.trim(),
@@ -479,6 +555,22 @@ export const updateIssueOrder = async ({
       .eq('facility_id', scopedActor.facilityId)
       .select('id')
       .single();
+    if (updateError && isMissingColumnError(updateError.message, 'tenant_id')) {
+      const fallbackUpdate = await supabaseAdmin
+        .from('issue_orders')
+        .update({
+          period: payload.period.trim(),
+          dispensing_unit_id: payload.dispensing_unit_id || null,
+          notes: payload.notes || null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', orderId)
+        .eq('facility_id', scopedActor.facilityId)
+        .select('id')
+        .single();
+      order = fallbackUpdate.data;
+      updateError = fallbackUpdate.error;
+    }
 
     if (updateError || !order) {
       throw new Error(updateError?.message || 'Failed to update issue order');
@@ -758,7 +850,58 @@ export const dispatchIssueOrder = async ({
       }
     );
     if (dispatchError) {
-      return mapDispatchRpcError(dispatchError.message);
+      if (!isMissingRpcFunctionError(dispatchError.message)) {
+        return mapDispatchRpcError(dispatchError.message);
+      }
+
+      try {
+        const fallbackResult = await dispatchIssueOrderFallback({
+          actorFacilityId: scopedActor.facilityId,
+          actorTenantId: scopedActor.tenantId,
+          actorProfileId: scopedActor.profileId,
+          orderId,
+        });
+
+        const voucherNo = fallbackResult.voucher_no || fallbackVoucherNo;
+        const alreadyDispatched = Boolean(fallbackResult.already_dispatched);
+        const dispatchedItemCount = Number(fallbackResult.dispatched_item_count || 0);
+
+        await recordAuditEvent({
+          action: 'dispatch_issue_order',
+          eventType: 'update',
+          entityType: 'issue_order',
+          tenantId: scopedActor.tenantId,
+          facilityId: scopedActor.facilityId,
+          actorUserId: scopedActor.profileId,
+          actorRole: scopedActor.role,
+          actorIpAddress: scopedActor.ipAddress || null,
+          actorUserAgent: scopedActor.userAgent || null,
+          entityId: orderId,
+          actionCategory: 'inventory',
+          metadata: {
+            voucherNo,
+            dispatchedItemCount,
+            idempotentReplay: alreadyDispatched,
+            transactionalPath: 'direct_fallback',
+          },
+          requestId: scopedActor.requestId || null,
+        }, {
+          strict: true,
+          outboxEventType: 'audit.inventory.issue_order.dispatch.write_failed',
+          outboxAggregateType: 'issue_order',
+          outboxAggregateId: orderId,
+        });
+
+        return {
+          ok: true,
+          data: {
+            success: true,
+            voucherNo,
+          },
+        };
+      } catch (fallbackError: any) {
+        return mapDispatchRpcError(fallbackError?.message || dispatchError.message);
+      }
     }
 
     const rpcResult = (dispatchResult || {}) as {

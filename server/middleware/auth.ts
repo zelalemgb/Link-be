@@ -74,6 +74,10 @@ export interface AuthUser {
     role: Role;
 }
 
+type ResolvedAuthResult =
+    | { ok: true; user: AuthUser }
+    | { ok: false; status: number; error: string; authFailure: boolean };
+
 declare global {
     namespace Express {
         interface Request {
@@ -121,99 +125,40 @@ const classifyAuthProviderFailure = (error: any) => {
 };
 
 export const requireUser = async (req: Request, res: Response, next: NextFunction) => {
+    if (req.user) {
+        return next();
+    }
+
+    const resolved = await resolveRequestUser(req);
+    if (resolved.ok === false) {
+        if (resolved.authFailure) {
+            recordAuthFailure(req.requestId);
+        }
+        return res.status(resolved.status).json({ error: resolved.error });
+    }
+
+    req.user = resolved.user;
+    return next();
+};
+
+export const optionalUser = async (req: Request, _res: Response, next: NextFunction) => {
+    if (req.user) {
+        return next();
+    }
+
     const authHeader = req.header('authorization') || '';
-    const token = authHeader.toLowerCase().startsWith('bearer ')
-        ? authHeader.slice(7)
-        : undefined;
-
-    if (!token) {
-        recordAuthFailure(req.requestId);
-        return res.status(401).json({ error: 'Missing bearer token' });
+    if (!authHeader.toLowerCase().startsWith('bearer ')) {
+        return next();
     }
 
-    try {
-        const { data, error } = await supabaseAdmin.auth.getUser(token);
-        if (error || !data?.user) {
-            if (isAuthDebug) {
-                console.error('[AUTH DEBUG] getUser error:', error?.message || 'No user data');
-            }
-            if (!data?.user && !error) {
-                recordAuthFailure(req.requestId);
-                return res.status(401).json({ error: 'Invalid token' });
-            }
-
-            const classified = classifyAuthProviderFailure(error);
-            if (classified.authFailure) {
-                recordAuthFailure(req.requestId);
-            }
-            return res.status(classified.status).json({ error: classified.error });
-        }
-
-        const authUserId = data.user.id;
-        if (isAuthDebug) {
-            // Log only a truncated prefix — never the full UUID or role.
-            console.log('[AUTH DEBUG] authUserId:', authUserId.slice(0, 8) + '…');
-        }
-
-        // Check cache first
-        let profile = isTestEnv ? null : userProfileCache.get(authUserId);
-        let fromCache = !!profile;
-
-        // If not in cache, fetch user profile to get role and facility context
-        if (!profile) {
-            const { data: fetchedProfile, error: profileErr } = await supabaseAdmin
-                .from('users')
-                .select('id, tenant_id, facility_id, user_role')
-                .eq('auth_user_id', authUserId)
-                .limit(1)
-                .maybeSingle();
-
-            if (profileErr) {
-                if (isAuthDebug) {
-                    console.error('[AUTH DEBUG] Profile fetch error: (redacted)');
-                }
-                recordAuthFailure(req.requestId);
-                return res.status(500).json({ error: 'Failed to fetch user profile' });
-            }
-
-            profile = fetchedProfile;
-
-            // Cache the profile (even if null, for 60 seconds)
-            if (profile && !isTestEnv) {
-                userProfileCache.set(authUserId, profile);
-            }
-        }
-
-        if (isAuthDebug) {
-            if (!profile) {
-                console.warn('[AUTH DEBUG] No profile found');
-            } else {
-                console.log(
-                    '[AUTH DEBUG] Profile resolved:',
-                    profile.id.slice(0, 8) + '…',
-                    `(${fromCache ? 'cached' : 'fetched'})`
-                );
-            }
-        }
-
-        // Periodically clean up expired cache entries
-        if (!isTestEnv && Math.random() < 0.01) {
-            userProfileCache.cleanup();
-        }
-
-        req.user = {
-            authUserId,
-            profileId: profile?.id,
-            tenantId: profile?.tenant_id,
-            facilityId: profile?.facility_id,
-            role: (profile?.user_role as Role | null) || 'staff',
-        };
-
-        next();
-    } catch (err: any) {
-        console.error('Auth middleware error:', err?.message || err);
-        return res.status(500).json({ error: 'Internal auth error' });
+    const resolved = await resolveRequestUser(req);
+    if (resolved.ok === true) {
+        req.user = resolved.user;
+    } else if (isAuthDebug) {
+        console.warn('[AUTH DEBUG] optionalUser skipped auth context:', resolved.error);
     }
+
+    return next();
 };
 
 export const requireScopedUser = (req: Request, res: Response, next: NextFunction) => {
@@ -245,5 +190,116 @@ export const adminKeyGuard = (req: Request, res: Response, next: NextFunction) =
         next();
     } else {
         res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
+    }
+};
+
+const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => {
+    const authHeader = req.header('authorization') || '';
+    const token = authHeader.toLowerCase().startsWith('bearer ')
+        ? authHeader.slice(7)
+        : undefined;
+
+    if (!token) {
+        return {
+            ok: false,
+            status: 401,
+            error: 'Missing bearer token',
+            authFailure: true,
+        };
+    }
+
+    try {
+        const { data, error } = await supabaseAdmin.auth.getUser(token);
+        if (error || !data?.user) {
+            if (isAuthDebug) {
+                console.error('[AUTH DEBUG] getUser error:', error?.message || 'No user data');
+            }
+
+            if (!data?.user && !error) {
+                return {
+                    ok: false,
+                    status: 401,
+                    error: 'Invalid token',
+                    authFailure: true,
+                };
+            }
+
+            const classified = classifyAuthProviderFailure(error);
+            return {
+                ok: false,
+                status: classified.status,
+                error: classified.error,
+                authFailure: classified.authFailure,
+            };
+        }
+
+        const authUserId = data.user.id;
+        if (isAuthDebug) {
+            console.log('[AUTH DEBUG] authUserId:', authUserId.slice(0, 8) + '…');
+        }
+
+        let profile = isTestEnv ? null : userProfileCache.get(authUserId);
+        const fromCache = !!profile;
+
+        if (!profile) {
+            const { data: fetchedProfile, error: profileErr } = await supabaseAdmin
+                .from('users')
+                .select('id, tenant_id, facility_id, user_role')
+                .eq('auth_user_id', authUserId)
+                .limit(1)
+                .maybeSingle();
+
+            if (profileErr) {
+                if (isAuthDebug) {
+                    console.error('[AUTH DEBUG] Profile fetch error: (redacted)');
+                }
+                return {
+                    ok: false,
+                    status: 500,
+                    error: 'Failed to fetch user profile',
+                    authFailure: true,
+                };
+            }
+
+            profile = fetchedProfile;
+            if (profile && !isTestEnv) {
+                userProfileCache.set(authUserId, profile);
+            }
+        }
+
+        if (isAuthDebug) {
+            if (!profile) {
+                console.warn('[AUTH DEBUG] No profile found');
+            } else {
+                console.log(
+                    '[AUTH DEBUG] Profile resolved:',
+                    profile.id.slice(0, 8) + '…',
+                    `(${fromCache ? 'cached' : 'fetched'})`
+                );
+            }
+        }
+
+        if (!isTestEnv && Math.random() < 0.01) {
+            userProfileCache.cleanup();
+        }
+
+        return {
+            ok: true,
+            user: {
+                authUserId,
+                profileId: profile?.id,
+                tenantId: profile?.tenant_id,
+                facilityId: profile?.facility_id,
+                role: (profile?.user_role as Role | null) || 'staff',
+            },
+        };
+    } catch (err: any) {
+        console.error('Auth middleware error:', err?.message || err);
+        return {
+            ok: false,
+            status: 500,
+            error: 'Internal auth error',
+            authFailure: false,
+        };
     }
 };

@@ -10,7 +10,7 @@ import crypto from 'crypto';
 
 // Config & Middleware
 import { supabaseAdmin } from './config/supabase';
-import { requireUser, superAdminGuard } from './middleware/auth';
+import { optionalUser, requireUser, superAdminGuard } from './middleware/auth';
 import { csrfProtection } from './middleware/csrf';
 
 // Routes
@@ -38,6 +38,7 @@ import syncRouter from './routes/sync';
 import hewRouter from './routes/hew';
 import smsRouter from './routes/sms';
 import subscriptionRouter from './routes/subscription';
+import { provisionTrial } from './services/subscriptionService';
 import webhookRouter from './routes/webhook';
 import agentRouter from './routes/agent';
 import dhis2Router from './routes/dhis2';
@@ -318,8 +319,19 @@ const patientAuthLimiter = rateLimit({
   keyGenerator: (req) => req.ip || req.header('x-forwarded-for') || 'unknown',
 });
 
-// Mount Routes
+// Mount public and self-managed routes first.
+app.use('/api/subscription', subscriptionRouter);
+app.use('/api/webhook', webhookRouter);      // Chapa + Stripe webhooks (no auth)
+app.use('/api/agent', agentRouter);          // Regional agent portal
 app.use('/api/auth', authLimiter, authRouter);
+app.use('/api/patient-auth', patientAuthLimiter, patientAuthRouter);
+
+// Resolve request user context once so subscription enforcement can run
+// before protected routers while requireUser reuses the same context.
+app.use(optionalUser);
+app.use(subscriptionGuard);
+
+// Mount protected application routes after subscription enforcement.
 app.use('/api/master-data', masterDataRouter);
 app.use('/api/patients', patientsRouter);
 app.use('/api/staff', staffRouter);
@@ -328,7 +340,6 @@ app.use('/api/inventory', inventoryRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/reception', receptionRouter);
 app.use('/api/orders', ordersRouter);
-app.use('/api/patient-auth', patientAuthLimiter, patientAuthRouter);
 app.use('/api/patient-portal', patientPortalRouter);
 app.use('/api/monitoring', monitoringRouter);
 app.use('/api/facilities', facilitiesRouter);
@@ -343,13 +354,6 @@ app.use('/api/sync', syncRouter);
 app.use('/api/hew', hewRouter);
 app.use('/api/sms', smsRouter);
 app.use('/api/dhis2', dhis2Router);
-// ── Subscription, billing and licensing ────────────────────────────────────
-app.use('/api/subscription', subscriptionRouter);
-app.use('/api/webhook', webhookRouter);      // Chapa + Stripe webhooks (no auth)
-app.use('/api/agent', agentRouter);          // Regional agent portal
-// Subscription enforcement — must be registered AFTER auth routes
-// and AFTER /api/subscription, /api/webhook, /api/agent (which handle their own auth)
-app.use(subscriptionGuard);
 
 
 const clinicRegistrationSchema = z.object({
@@ -514,6 +518,9 @@ app.post('/api/admin/super-admin', requireUser, superAdminGuard, async (req, res
 
       if (tenantErr && tenantErr.code !== '23505' && tenantErr.code !== 'PGRST116') {
         return res.status(500).json({ error: tenantErr.message });
+      }
+      if (tenantInsert?.id) {
+        await provisionTrial(tenantInsert.id, 'health_centre');
       }
       ensuredTenantId = tenantInsert?.id;
     }

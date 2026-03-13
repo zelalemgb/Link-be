@@ -16,6 +16,12 @@ test('master-data routes require tenant scope helper for scoped operations', () 
 
 test('master-data writes enforce admin guard for medication, lab, equipment, and imaging endpoints', () => {
   const source = read();
+  assert.match(source, /router\.post\('\/services'[\s\S]*?ensureMasterDataAdmin/);
+  assert.match(source, /router\.put\('\/services\/:id'[\s\S]*?ensureMasterDataAdmin/);
+  assert.match(source, /router\.delete\('\/services\/:id'[\s\S]*?ensureMasterDataAdmin/);
+  assert.match(source, /router\.post\('\/programs'[\s\S]*?ensureMasterDataAdmin/);
+  assert.match(source, /router\.put\('\/programs\/:id'[\s\S]*?ensureMasterDataAdmin/);
+  assert.match(source, /router\.delete\('\/programs\/:id'[\s\S]*?ensureMasterDataAdmin/);
   assert.match(source, /router\.post\('\/medications'[\s\S]*?ensureMasterDataAdmin/);
   assert.match(source, /router\.put\('\/medications\/:id'[\s\S]*?ensureMasterDataAdmin/);
   assert.match(source, /router\.delete\('\/medications\/:id'[\s\S]*?ensureMasterDataAdmin/);
@@ -45,4 +51,8 @@ test('master-data catalog reads prefer scoped rows and selected facility context
   assert.match(source, /preferFacilityScopedRows/);
   assert.match(source, /readRequestedFacilityId/);
   assert.match(source, /x-link-facility-id/);
+  assert.match(source, /scope: masterCatalogScopeSchema\.default\('tenant'\)/);
+  assert.match(source, /const serviceIdentity =/);
+  assert.match(source, /const programIdentity =/);
+  assert.match(source, /const imagingIdentity =/);
 });

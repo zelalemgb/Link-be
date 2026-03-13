@@ -4,6 +4,7 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { z } from 'zod';
 import { isAuditDurabilityError, recordAuditEvent } from '../services/audit-log.js';
 import { assertInventoryUnlocked } from '../services/inventoryLockService.js';
+import { createStockMovementFallback, isMissingRpcFunctionError } from '../services/inventoryRpcFallbacks.js';
 
 const isInventoryDebug = process.env.INVENTORY_DEBUG === 'true';
 const sendContractError = (res: Response, status: number, code: string, message: string) =>
@@ -246,27 +247,64 @@ export const processStockMovement = async (req: Request, res: Response) => {
             p_adjustment_direction: adjustment_direction || null,
         });
 
+        let movement = Array.isArray(data) ? data[0] : data;
+
         if (error) {
             const normalized = (error.message || '').toLowerCase();
-            if (normalized.includes('missing facility or tenant')) {
-                return sendContractError(res, 403, 'TENANT_MISSING_SCOPE_CONTEXT', 'Missing facility or tenant context');
+            if (isMissingRpcFunctionError(error.message)) {
+                try {
+                    movement = await createStockMovementFallback({
+                        actorFacilityId: facilityId,
+                        actorTenantId: tenantId,
+                        actorProfileId: profileId,
+                        inventoryItemId: inventory_item_id,
+                        movementType: movement_type,
+                        quantity,
+                        batchNumber: batch_number || null,
+                        expiryDate: expiry_date || null,
+                        notes: notes || null,
+                        unitCost: unit_cost ?? null,
+                        referenceNumber: reference_number || null,
+                        adjustmentDirection: adjustment_direction || null,
+                    });
+                } catch (fallbackError: any) {
+                    const fallbackNormalized = String(fallbackError?.message || '').toLowerCase();
+                    if (fallbackNormalized.includes('missing facility or tenant')) {
+                        return sendContractError(res, 403, 'TENANT_MISSING_SCOPE_CONTEXT', 'Missing facility or tenant context');
+                    }
+                    if (fallbackNormalized.includes('not found')) {
+                        return res.status(404).json({ error: fallbackError.message });
+                    }
+                    if (fallbackNormalized.includes('outside your facility')) {
+                        return res.status(403).json({ error: fallbackError.message });
+                    }
+                    if (fallbackNormalized.includes('unsupported movement type') || fallbackNormalized.includes('adjustment direction') || fallbackNormalized.includes('quantity must be greater than zero')) {
+                        return res.status(400).json({ error: fallbackError.message });
+                    }
+                    if (fallbackNormalized.includes('insufficient stock')) {
+                        return res.status(409).json({ error: fallbackError.message });
+                    }
+                    return res.status(500).json({ error: fallbackError?.message || 'Internal server error' });
+                }
+            } else {
+                if (normalized.includes('missing facility or tenant')) {
+                    return sendContractError(res, 403, 'TENANT_MISSING_SCOPE_CONTEXT', 'Missing facility or tenant context');
+                }
+                if (normalized.includes('not found')) {
+                    return res.status(404).json({ error: error.message });
+                }
+                if (normalized.includes('outside your facility')) {
+                    return res.status(403).json({ error: error.message });
+                }
+                if (normalized.includes('unsupported movement type') || normalized.includes('adjustment direction') || normalized.includes('quantity must be greater than zero')) {
+                    return res.status(400).json({ error: error.message });
+                }
+                if (normalized.includes('insufficient stock')) {
+                    return res.status(409).json({ error: error.message });
+                }
+                return res.status(500).json({ error: error.message });
             }
-            if (normalized.includes('not found')) {
-                return res.status(404).json({ error: error.message });
-            }
-            if (normalized.includes('outside your facility')) {
-                return res.status(403).json({ error: error.message });
-            }
-            if (normalized.includes('unsupported movement type') || normalized.includes('adjustment direction') || normalized.includes('quantity must be greater than zero')) {
-                return res.status(400).json({ error: error.message });
-            }
-            if (normalized.includes('insufficient stock')) {
-                return res.status(409).json({ error: error.message });
-            }
-            return res.status(500).json({ error: error.message });
         }
-
-        const movement = Array.isArray(data) ? data[0] : data;
 
         await recordAuditEvent({
             action: 'create_stock_movement',

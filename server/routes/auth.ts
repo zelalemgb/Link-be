@@ -5,6 +5,7 @@ import { supabaseAdmin } from '../config/supabase';
 import { requireUser } from '../middleware/auth';
 import { normalizeWorkspaceMetadata } from '../services/workspaceMetadata';
 import { provisionWorkspaceDefaults } from '../services/workspaceProvisioning';
+import { provisionTrial } from '../services/subscriptionService';
 
 const router = Router();
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://linkhc.org';
@@ -639,6 +640,7 @@ router.post('/provider-onboarding/complete', requireUser, async (req, res) => {
                 return res.status(500).json({ error: tenantInsertError?.message || 'Failed to create provider tenant' });
             }
 
+            await provisionTrial(tenantInsert.id, 'health_centre');
             tenantId = tenantInsert.id;
         }
 

@@ -51,10 +51,38 @@ export const isAuditDurabilityError = (value: unknown): value is AuditDurability
 const uuidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+const allowedActionCategories = new Set([
+  'data_access',
+  'data_modification',
+  'authentication',
+  'authorization',
+  'configuration',
+  'system',
+]);
+
 const asUuidOrNull = (value?: string | null) => {
   if (!value) return null;
   const normalized = value.trim();
   return uuidPattern.test(normalized) ? normalized : null;
+};
+
+const normalizeActionCategory = (event: AuditEvent) => {
+  const requested = String(event.actionCategory || '').trim().toLowerCase();
+  if (allowedActionCategories.has(requested)) {
+    return requested;
+  }
+
+  const eventType = String(event.eventType || '').trim().toLowerCase();
+  if (['create', 'update', 'delete'].includes(eventType)) {
+    return 'data_modification';
+  }
+  if (['read', 'view', 'list', 'export'].includes(eventType)) {
+    return 'data_access';
+  }
+  if (event.actionCategory) {
+    return 'system';
+  }
+  return null;
 };
 
 export const recordAuditEvent = async (event: AuditEvent, options: AuditWriteOptions = {}) => {
@@ -75,7 +103,7 @@ export const recordAuditEvent = async (event: AuditEvent, options: AuditWriteOpt
       actor_user_agent: event.actorUserAgent ?? null,
       entity_id: event.entityId ?? null,
       entity_name: event.entityName ?? null,
-      action_category: event.actionCategory ?? null,
+      action_category: normalizeActionCategory(event),
       compliance_tags: event.complianceTags ?? null,
       sensitivity_level: event.sensitivityLevel ?? null,
       metadata: event.metadata ?? null,

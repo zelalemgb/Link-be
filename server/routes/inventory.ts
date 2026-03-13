@@ -18,6 +18,13 @@ import {
 } from '../services/inventoryMutationService';
 import { isAuditDurabilityError, recordAuditEvent } from '../services/audit-log.js';
 import { assertInventoryUnlocked, getLockedInventorySession } from '../services/inventoryLockService.js';
+import {
+  commitPhysicalInventorySessionFallback,
+  createReceivingFromRequestFallback,
+  finalizeReceivingInvoiceFallback,
+  isMissingRpcFunctionError,
+  submitResupplyRequestFallback,
+} from '../services/inventoryRpcFallbacks.js';
 
 const router = Router();
 
@@ -696,7 +703,23 @@ router.post('/requests/submit', async (req, res) => {
     }
 
     const { requestId, requestDetails, lines } = parsed.data;
-    const { data: effectiveRequestId, error: submitError } = await supabaseAdmin.rpc(
+    const fallbackRequestDetails: Parameters<typeof submitResupplyRequestFallback>[0]['requestDetails'] = {
+      reporting_period: requestDetails.reporting_period,
+      account_type: requestDetails.account_type,
+      request_type: requestDetails.request_type,
+      request_to: requestDetails.request_to,
+      ...(requestDetails.notes !== undefined ? { notes: requestDetails.notes } : {}),
+    };
+    const fallbackLines: Parameters<typeof submitResupplyRequestFallback>[0]['lines'] = lines.map((line) => ({
+      inventory_item_id: line.inventory_item_id,
+      quantity_requested: line.quantity_requested,
+      ...(line.amc !== undefined ? { amc: line.amc } : {}),
+      ...(line.soh !== undefined ? { soh: line.soh } : {}),
+      ...(line.unit_cost !== undefined ? { unit_cost: line.unit_cost } : {}),
+    }));
+    let transactionalPath: 'backend_submit_resupply_request' | 'direct_fallback' = 'backend_submit_resupply_request';
+    let effectiveRequestId: string | null = null;
+    const { data: rpcRequestId, error: submitError } = await supabaseAdmin.rpc(
       'backend_submit_resupply_request',
       {
         p_actor_facility_id: actorFacilityId,
@@ -708,7 +731,27 @@ router.post('/requests/submit', async (req, res) => {
       }
     );
     if (submitError) {
-      return res.status(mapRpcErrorStatus(submitError.message)).json({ error: submitError.message });
+      if (!isMissingRpcFunctionError(submitError.message)) {
+        return res.status(mapRpcErrorStatus(submitError.message)).json({ error: submitError.message });
+      }
+
+      transactionalPath = 'direct_fallback';
+      try {
+        effectiveRequestId = await submitResupplyRequestFallback({
+          actorFacilityId,
+          actorTenantId,
+          actorProfileId,
+          requestId: requestId || null,
+          requestDetails: fallbackRequestDetails,
+          lines: fallbackLines,
+        });
+      } catch (fallbackError: any) {
+        return res.status(mapRpcErrorStatus(fallbackError?.message || '')).json({
+          error: fallbackError?.message || 'Failed to submit resupply request',
+        });
+      }
+    } else {
+      effectiveRequestId = rpcRequestId || null;
     }
 
     await recordInventoryStrictAudit({
@@ -724,7 +767,7 @@ router.post('/requests/submit', async (req, res) => {
         requestType: requestDetails.request_type,
         reportingPeriod: requestDetails.reporting_period,
         lineCount: lines.length,
-        transactionalPath: 'backend_submit_resupply_request',
+        transactionalPath,
       },
       outboxEventType: 'audit.inventory.resupply_request.submit.write_failed',
       outboxAggregateType: 'resupply_request',
@@ -761,6 +804,12 @@ router.post('/receiving/from-request', async (req, res) => {
     }
 
     const { requestId } = parsed.data;
+    let transactionalPath: 'backend_create_receiving_from_request' | 'direct_fallback' = 'backend_create_receiving_from_request';
+    let result: {
+      invoice_id?: string;
+      created?: boolean;
+      repopulated?: boolean;
+    } = {};
     const { data, error: receiveError } = await supabaseAdmin.rpc(
       'backend_create_receiving_from_request',
       {
@@ -771,14 +820,30 @@ router.post('/receiving/from-request', async (req, res) => {
       }
     );
     if (receiveError) {
-      return res.status(mapRpcErrorStatus(receiveError.message)).json({ error: receiveError.message });
-    }
+      if (!isMissingRpcFunctionError(receiveError.message)) {
+        return res.status(mapRpcErrorStatus(receiveError.message)).json({ error: receiveError.message });
+      }
 
-    const result = (data || {}) as {
-      invoice_id?: string;
-      created?: boolean;
-      repopulated?: boolean;
-    };
+      transactionalPath = 'direct_fallback';
+      try {
+        result = await createReceivingFromRequestFallback({
+          actorFacilityId,
+          actorTenantId,
+          actorProfileId,
+          requestId,
+        });
+      } catch (fallbackError: any) {
+        return res.status(mapRpcErrorStatus(fallbackError?.message || '')).json({
+          error: fallbackError?.message || 'Failed to create receiving invoice from request',
+        });
+      }
+    } else {
+      result = (data || {}) as {
+        invoice_id?: string;
+        created?: boolean;
+        repopulated?: boolean;
+      };
+    }
 
     await recordInventoryStrictAudit({
       req,
@@ -793,7 +858,7 @@ router.post('/receiving/from-request', async (req, res) => {
         requestId,
         created: Boolean(result.created),
         repopulated: Boolean(result.repopulated),
-        transactionalPath: 'backend_create_receiving_from_request',
+        transactionalPath,
       },
       outboxEventType: 'audit.inventory.receiving.from_request.write_failed',
       outboxAggregateType: 'receiving_invoice',
@@ -1207,6 +1272,23 @@ router.post('/receiving/invoices/:invoiceId/finalize', async (req, res) => {
       return sendContractError(res, inventoryUnlocked.status, inventoryUnlocked.code, inventoryUnlocked.message);
     }
 
+    let rpcResult: {
+      success?: boolean;
+      requestClosed?: boolean;
+      stockMovementCount?: number;
+      submittedAt?: string;
+    } = {};
+    const fallbackItems: Parameters<typeof finalizeReceivingInvoiceFallback>[0]['items'] =
+      parsed.data.items.map((item) => ({
+        ...(item.id ? { id: item.id } : {}),
+        inventory_item_id: item.inventory_item_id,
+        quantity: item.quantity,
+        batch_no: item.batch_no,
+        ...(item.expiry_date !== undefined ? { expiry_date: item.expiry_date } : {}),
+        unit_cost: item.unit_cost,
+        ...(item.unit_selling_price !== undefined ? { unit_selling_price: item.unit_selling_price } : {}),
+      }));
+    let transactionalPath: 'backend_finalize_receiving_invoice' | 'direct_fallback' = 'backend_finalize_receiving_invoice';
     const { data, error: finalizeError } = await supabaseAdmin.rpc(
       'backend_finalize_receiving_invoice',
       {
@@ -1218,15 +1300,32 @@ router.post('/receiving/invoices/:invoiceId/finalize', async (req, res) => {
       }
     );
     if (finalizeError) {
-      return res.status(mapRpcErrorStatus(finalizeError.message)).json({ error: finalizeError.message });
-    }
+      if (!isMissingRpcFunctionError(finalizeError.message)) {
+        return res.status(mapRpcErrorStatus(finalizeError.message)).json({ error: finalizeError.message });
+      }
 
-    const rpcResult = (data || {}) as {
-      success?: boolean;
-      requestClosed?: boolean;
-      stockMovementCount?: number;
-      submittedAt?: string;
-    };
+      transactionalPath = 'direct_fallback';
+      try {
+        rpcResult = await finalizeReceivingInvoiceFallback({
+          actorFacilityId,
+          actorTenantId,
+          actorProfileId,
+          invoiceId,
+          items: fallbackItems,
+        });
+      } catch (fallbackError: any) {
+        return res.status(mapRpcErrorStatus(fallbackError?.message || '')).json({
+          error: fallbackError?.message || 'Failed to finalize receiving invoice',
+        });
+      }
+    } else {
+      rpcResult = (data || {}) as {
+        success?: boolean;
+        requestClosed?: boolean;
+        stockMovementCount?: number;
+        submittedAt?: string;
+      };
+    }
 
     await recordInventoryStrictAudit({
       req,
@@ -1243,6 +1342,7 @@ router.post('/receiving/invoices/:invoiceId/finalize', async (req, res) => {
         itemCount: parsed.data.items.length,
         stockMovementCount: Number(rpcResult.stockMovementCount || 0),
         requestClosed: Boolean(rpcResult.requestClosed),
+        transactionalPath,
       },
       outboxEventType: 'audit.inventory.receiving_invoice.finalize.write_failed',
       outboxAggregateType: 'receiving_invoice',
@@ -1726,6 +1826,12 @@ router.post('/physical-inventory/sessions/:sessionId/commit', async (req, res) =
       return res.status(404).json({ error: 'Physical inventory session not found' });
     }
 
+    let rpcResult: {
+      success?: boolean;
+      movementCount?: number;
+      committedAt?: string;
+    } = {};
+    let transactionalPath: 'backend_commit_physical_inventory_session' | 'direct_fallback' = 'backend_commit_physical_inventory_session';
     const { data, error: commitError } = await supabaseAdmin.rpc(
       'backend_commit_physical_inventory_session',
       {
@@ -1736,14 +1842,30 @@ router.post('/physical-inventory/sessions/:sessionId/commit', async (req, res) =
       }
     );
     if (commitError) {
-      return res.status(mapRpcErrorStatus(commitError.message)).json({ error: commitError.message });
-    }
+      if (!isMissingRpcFunctionError(commitError.message)) {
+        return res.status(mapRpcErrorStatus(commitError.message)).json({ error: commitError.message });
+      }
 
-    const rpcResult = (data || {}) as {
-      success?: boolean;
-      movementCount?: number;
-      committedAt?: string;
-    };
+      transactionalPath = 'direct_fallback';
+      try {
+        rpcResult = await commitPhysicalInventorySessionFallback({
+          actorFacilityId,
+          actorTenantId,
+          actorProfileId,
+          sessionId: session.id,
+        });
+      } catch (fallbackError: any) {
+        return res.status(mapRpcErrorStatus(fallbackError?.message || '')).json({
+          error: fallbackError?.message || 'Failed to commit physical inventory session',
+        });
+      }
+    } else {
+      rpcResult = (data || {}) as {
+        success?: boolean;
+        movementCount?: number;
+        committedAt?: string;
+      };
+    }
 
     await recordInventoryStrictAudit({
       req,
@@ -1757,6 +1879,7 @@ router.post('/physical-inventory/sessions/:sessionId/commit', async (req, res) =
       metadata: {
         inventoryId: session.inventory_id,
         movementCount: Number(rpcResult.movementCount || 0),
+        transactionalPath,
       },
       outboxEventType: 'audit.inventory.physical_inventory_session.commit.write_failed',
       outboxAggregateType: 'physical_inventory_session',
