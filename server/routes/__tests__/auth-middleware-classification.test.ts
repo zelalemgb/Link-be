@@ -88,3 +88,74 @@ test('requireUser returns 503 when auth provider is unavailable', async () => {
     (supabaseAdmin as any).from = originalFrom;
   }
 });
+
+test('requireUser falls back to a recently validated token when auth provider becomes unavailable', async () => {
+  const { requireUser, supabaseAdmin } = await loadModules();
+  const originalAuth = (supabaseAdmin as any).auth;
+  const originalFrom = (supabaseAdmin as any).from;
+
+  try {
+    let authCalls = 0;
+    (supabaseAdmin as any).auth = {
+      getUser: async () => {
+        authCalls += 1;
+        if (authCalls === 1) {
+          return {
+            data: {
+              user: {
+                id: 'auth-user-1',
+                email: 'root@linkhc.org',
+              },
+            },
+            error: null,
+          };
+        }
+
+        return {
+          data: { user: null },
+          error: { status: 503, message: 'upstream unavailable' },
+        };
+      },
+    };
+
+    (supabaseAdmin as any).from = () => ({
+      select: () => ({
+        eq: () => ({
+          limit: () => ({
+            maybeSingle: async () => ({
+              data: {
+                id: 'profile-1',
+                tenant_id: 'tenant-1',
+                facility_id: 'facility-1',
+                user_role: 'super_admin',
+              },
+              error: null,
+            }),
+          }),
+        }),
+      }),
+    });
+
+    const app = buildApp(requireUser);
+    const token = [
+      'header',
+      Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 600 })).toString('base64url'),
+      'signature',
+    ].join('.');
+
+    const firstResponse = await request(app)
+      .get('/secure')
+      .set('authorization', `Bearer ${token}`);
+
+    const secondResponse = await request(app)
+      .get('/secure')
+      .set('authorization', `Bearer ${token}`);
+
+    assert.equal(firstResponse.status, 200);
+    assert.equal(secondResponse.status, 200);
+    assert.deepEqual(secondResponse.body, { ok: true });
+  } finally {
+    (supabaseAdmin as any).auth = originalAuth;
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});

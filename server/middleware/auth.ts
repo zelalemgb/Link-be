@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
+import { createHash } from 'crypto';
 import { supabaseAdmin } from '../config/supabase';
 import { recordAuthFailure } from '../services/monitoring';
 
@@ -55,6 +56,62 @@ class UserProfileCache {
 }
 
 const userProfileCache = new UserProfileCache();
+
+interface TokenCacheEntry {
+    user: AuthUser;
+    expiresAt: number;
+}
+
+class ValidatedTokenCache {
+    private cache: Map<string, TokenCacheEntry> = new Map();
+    private readonly maxEntries = 1000;
+    private readonly fallbackTtlMs = 15 * 60 * 1000; // 15 minutes
+
+    private keyFor(token: string) {
+        return createHash('sha256').update(token).digest('hex');
+    }
+
+    private resolveExpiry(token: string) {
+        const fallbackExpiry = Date.now() + this.fallbackTtlMs;
+        const [, payloadSegment] = token.split('.');
+        if (!payloadSegment) return fallbackExpiry;
+
+        try {
+            const payload = JSON.parse(Buffer.from(payloadSegment, 'base64url').toString('utf8'));
+            const expMs = typeof payload?.exp === 'number' ? payload.exp * 1000 : NaN;
+            if (!Number.isFinite(expMs)) return fallbackExpiry;
+            return Math.min(expMs, fallbackExpiry);
+        } catch {
+            return fallbackExpiry;
+        }
+    }
+
+    get(token: string): AuthUser | null {
+        const entry = this.cache.get(this.keyFor(token));
+        if (!entry) return null;
+
+        if (Date.now() > entry.expiresAt) {
+            this.cache.delete(this.keyFor(token));
+            return null;
+        }
+
+        return entry.user;
+    }
+
+    set(token: string, user: AuthUser): void {
+        if (this.cache.size >= this.maxEntries) {
+            const firstKey = this.cache.keys().next().value;
+            if (firstKey) this.cache.delete(firstKey);
+        }
+
+        this.cache.set(this.keyFor(token), {
+            user,
+            expiresAt: this.resolveExpiry(token),
+        });
+    }
+}
+
+const validatedTokenCache = new ValidatedTokenCache();
 
 export type Role =
     | 'admin'
@@ -123,6 +180,11 @@ const classifyAuthProviderFailure = (error: any) => {
         error: 'Authentication service temporarily unavailable. Please retry.',
         authFailure: false,
     };
+};
+
+const getCachedValidatedUser = (token: string | undefined) => {
+    if (!token) return null;
+    return validatedTokenCache.get(token);
 };
 
 export const requireUser = async (req: Request, res: Response, next: NextFunction) => {
@@ -226,6 +288,15 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
             }
 
             const classified = classifyAuthProviderFailure(error);
+            if (!classified.authFailure) {
+                const cachedUser = getCachedValidatedUser(token);
+                if (cachedUser) {
+                    return {
+                        ok: true,
+                        user: cachedUser,
+                    };
+                }
+            }
             return {
                 ok: false,
                 status: classified.status,
@@ -253,6 +324,13 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
             if (profileErr) {
                 if (isAuthDebug) {
                     console.error('[AUTH DEBUG] Profile fetch error: (redacted)');
+                }
+                const cachedUser = getCachedValidatedUser(token);
+                if (cachedUser) {
+                    return {
+                        ok: true,
+                        user: cachedUser,
+                    };
                 }
                 return {
                     ok: false,
@@ -284,18 +362,29 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
             userProfileCache.cleanup();
         }
 
+        const resolvedUser: AuthUser = {
+            authUserId,
+            profileId: profile?.id,
+            tenantId: profile?.tenant_id,
+            facilityId: profile?.facility_id,
+            email: data.user.email?.trim().toLowerCase() || undefined,
+            role: (profile?.user_role as Role | null) || 'staff',
+        };
+
+        validatedTokenCache.set(token, resolvedUser);
+
         return {
             ok: true,
-            user: {
-                authUserId,
-                profileId: profile?.id,
-                tenantId: profile?.tenant_id,
-                facilityId: profile?.facility_id,
-                email: data.user.email?.trim().toLowerCase() || undefined,
-                role: (profile?.user_role as Role | null) || 'staff',
-            },
+            user: resolvedUser,
         };
     } catch (err: any) {
+        const cachedUser = getCachedValidatedUser(token);
+        if (cachedUser) {
+            return {
+                ok: true,
+                user: cachedUser,
+            };
+        }
         console.error('Auth middleware error:', err?.message || err);
         return {
             ok: false,
