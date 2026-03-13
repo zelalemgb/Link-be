@@ -62,6 +62,79 @@ const ensureInvitationManagerForFacility = async (
   return false;
 };
 
+const ensureClinicAdminRoleForFacilityOwner = async ({
+  authUserId,
+  facilityId,
+  tenantId,
+}: {
+  authUserId: string;
+  facilityId: string;
+  tenantId: string;
+}) => {
+  const { data: userRow, error: userError } = await supabaseAdmin
+    .from('users')
+    .select('id')
+    .eq('auth_user_id', authUserId)
+    .eq('facility_id', facilityId)
+    .maybeSingle();
+
+  if (userError) {
+    throw new Error(userError.message);
+  }
+  if (!userRow?.id) {
+    throw new Error('Facility owner profile not found for clinic upgrade');
+  }
+
+  const { data: clinicAdminRole, error: roleError } = await supabaseAdmin
+    .from('roles')
+    .select('id')
+    .or('slug.eq.clinic-admin,name.eq.clinic_admin')
+    .maybeSingle();
+
+  if (roleError) {
+    throw new Error(roleError.message);
+  }
+  if (!clinicAdminRole?.id) {
+    throw new Error('Clinic admin role not found');
+  }
+
+  const { data: existingRoleLink, error: existingRoleError } = await supabaseAdmin
+    .from('user_roles')
+    .select('id')
+    .eq('user_id', userRow.id)
+    .eq('role_id', clinicAdminRole.id)
+    .eq('facility_id', facilityId)
+    .eq('is_active', true)
+    .maybeSingle();
+
+  if (existingRoleError) {
+    throw new Error(existingRoleError.message);
+  }
+
+  if (existingRoleLink?.id) {
+    return;
+  }
+
+  const { error: roleInsertError } = await supabaseAdmin
+    .from('user_roles')
+    .insert({
+      user_id: userRow.id,
+      role_id: clinicAdminRole.id,
+      facility_id: facilityId,
+      tenant_id: tenantId,
+      is_active: true,
+      assigned_by: userRow.id,
+      metadata: {
+        is_primary: false,
+        source: 'provider_team_mode_upgrade',
+      },
+    });
+
+  if (roleInsertError) {
+    throw new Error(roleInsertError.message);
+  }
+};
+
 const isRoleAssignable = (role: string) => !nonAssignableRoles.has(normalizeRole(role));
 
 const buildInvitationLink = (token: string) => {
@@ -503,8 +576,18 @@ router.put('/team-mode', requireUser, requireScopedUser, async (req, res) => {
     const tenantUpdatePayload: Record<string, string> = {
       team_mode: parsed.data.teamMode,
     };
+    const shouldEnsureClinicAdminAccess =
+      parsed.data.teamMode !== 'solo' &&
+      (currentTenantRow.workspace_type === 'provider' || currentTenantRow.workspace_type === 'clinic');
     const shouldPromoteToClinic =
       currentTenantRow.workspace_type === 'provider' && parsed.data.teamMode !== 'solo';
+    if (shouldEnsureClinicAdminAccess) {
+      await ensureClinicAdminRoleForFacilityOwner({
+        authUserId,
+        facilityId,
+        tenantId: facility.tenant_id,
+      });
+    }
     if (shouldPromoteToClinic) {
       tenantUpdatePayload.workspace_type = 'clinic';
       if (!currentTenantRow.setup_mode || currentTenantRow.setup_mode === 'legacy') {

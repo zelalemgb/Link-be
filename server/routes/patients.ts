@@ -15,6 +15,7 @@ import {
     maybeAssertProviderPhiConsentForPatient,
 } from '../services/providerPhiConsentGuard';
 import { extractStructuredNoteFields } from '../services/hewStructuredNoteService';
+import { isTransientSupabaseTransportError } from '../services/supabaseTransportError';
 
 const router = Router();
 router.use(requireUser, requireScopedUser);
@@ -1358,7 +1359,9 @@ router.post('/visits/:id/stage', async (req, res) => {
         });
 
         if (appendError) {
-            return res.status(400).json({ error: appendError.message || 'Failed to append stage' });
+            const message = appendError.message || 'Failed to append stage';
+            const status = isTransientSupabaseTransportError(appendError) ? 503 : 400;
+            return res.status(status).json({ error: message });
         }
 
         if (tenantId) {

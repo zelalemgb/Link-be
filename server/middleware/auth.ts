@@ -71,6 +71,7 @@ export interface AuthUser {
     profileId?: string;
     tenantId?: string;
     facilityId?: string;
+    email?: string;
     role: Role;
 }
 
@@ -290,6 +291,7 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
                 profileId: profile?.id,
                 tenantId: profile?.tenant_id,
                 facilityId: profile?.facility_id,
+                email: data.user.email?.trim().toLowerCase() || undefined,
                 role: (profile?.user_role as Role | null) || 'staff',
             },
         };

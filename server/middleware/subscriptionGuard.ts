@@ -22,6 +22,7 @@ const BYPASS_PREFIXES = [
   '/api/webhook',
   '/api/license',
   '/api/agent',
+  '/api/platform-audit',
   '/api/health',
   '/health',
 ];

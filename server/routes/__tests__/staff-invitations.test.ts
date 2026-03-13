@@ -52,12 +52,26 @@ test('team mode upgrade promotes provider workspaces to clinic metadata', () => 
   const sourcePath = path.resolve(__dirname, '../staff-invitations.ts');
   const source = fs.readFileSync(sourcePath, 'utf8');
 
+  assert.match(source, /const shouldEnsureClinicAdminAccess =/);
+  assert.match(source, /parsed\.data\.teamMode !== 'solo'/);
+  assert.match(source, /currentTenantRow\.workspace_type === 'provider' \|\| currentTenantRow\.workspace_type === 'clinic'/);
   assert.match(
     source,
     /currentTenantRow\.workspace_type === 'provider' && parsed\.data\.teamMode !== 'solo'/
   );
   assert.match(source, /tenantUpdatePayload\.workspace_type = 'clinic';/);
   assert.match(source, /tenantUpdatePayload\.setup_mode = 'recommended';/);
+});
+
+test('team mode upgrade grants clinic_admin access to promoted and previously promoted provider owners', () => {
+  const sourcePath = path.resolve(__dirname, '../staff-invitations.ts');
+  const source = fs.readFileSync(sourcePath, 'utf8');
+
+  assert.match(source, /const ensureClinicAdminRoleForFacilityOwner = async/);
+  assert.match(source, /\.or\('slug\.eq\.clinic-admin,name\.eq\.clinic_admin'\)/);
+  assert.match(source, /source:\s*'provider_team_mode_upgrade'/);
+  assert.match(source, /if \(shouldEnsureClinicAdminAccess\) \{/);
+  assert.match(source, /await ensureClinicAdminRoleForFacilityOwner\(\{/);
 });
 
 test('staff invitation manager rules include doctor facility-owner path', () => {

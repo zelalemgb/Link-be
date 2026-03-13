@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
 import { requireUser } from '../middleware/auth';
+import { recordPlatformActivityEvent } from '../services/platform-activity';
 import { normalizeWorkspaceMetadata } from '../services/workspaceMetadata';
 import { provisionWorkspaceDefaults } from '../services/workspaceProvisioning';
 import { provisionTrial } from '../services/subscriptionService';
@@ -28,6 +29,13 @@ type VerificationCodeRecord = {
 };
 
 const normalizeEmail = (email: string) => email.trim().toLowerCase();
+const platformSessionIdPattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const resolvePlatformSessionId = (headerValue: string | undefined) => {
+    const normalized = headerValue?.trim() || '';
+    return platformSessionIdPattern.test(normalized) ? normalized : null;
+};
 
 const hashVerificationCode = (email: string, verificationCode: string) =>
     crypto
@@ -550,8 +558,36 @@ router.post('/clinic-admin-onboarding/complete', requireUser, async (req, res) =
  * Creates or finalizes a solo provider workspace for the authenticated user.
  */
 router.post('/provider-onboarding/complete', requireUser, async (req, res) => {
+    const sessionId = resolvePlatformSessionId(req.header('x-link-session-id'));
     const parsed = completeProviderOnboardingSchema.safeParse(req.body || {});
     if (!parsed.success) {
+        void recordPlatformActivityEvent(
+            {
+                sessionId,
+                source: 'web',
+                category: 'registration',
+                eventName: 'registration.solo_provider.failed',
+                outcome: 'failure',
+                actorUserId: req.user?.profileId || null,
+                actorAuthUserId: req.user?.authUserId || null,
+                actorRole: req.user?.role || 'provider_candidate',
+                actorEmail: req.user?.email || null,
+                tenantId: req.user?.tenantId || null,
+                facilityId: req.user?.facilityId || null,
+                pagePath: '/auth',
+                entryPoint: 'solo_provider_registration',
+                errorMessage: parsed.error.issues[0]?.message || 'Invalid payload',
+                responseStatus: 400,
+            },
+            {
+                actorUserId: req.user?.profileId || null,
+                actorAuthUserId: req.user?.authUserId || null,
+                actorRole: req.user?.role || null,
+                actorEmail: req.user?.email || null,
+                tenantId: req.user?.tenantId || null,
+                facilityId: req.user?.facilityId || null,
+            }
+        ).catch(() => undefined);
         return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
     }
 
@@ -855,6 +891,41 @@ router.post('/provider-onboarding/complete', requireUser, async (req, res) => {
             console.warn('Provider onboarding metadata update failed:', authMetadataError?.message || authMetadataError);
         }
 
+        try {
+            await recordPlatformActivityEvent(
+                {
+                    sessionId,
+                    source: 'web',
+                    category: 'registration',
+                    eventName: 'registration.solo_provider.completed',
+                    outcome: 'success',
+                    actorUserId: userProfileId,
+                    actorAuthUserId: authUserId,
+                    actorRole: 'doctor',
+                    actorEmail: normalizedEmail,
+                    tenantId,
+                    facilityId,
+                    pagePath: '/auth',
+                    entryPoint: 'solo_provider_registration',
+                    metadata: {
+                        clinicCode,
+                        providerName: resolvedFullName,
+                        workspaceName,
+                    },
+                },
+                {
+                    actorUserId: userProfileId,
+                    actorAuthUserId: authUserId,
+                    actorRole: 'doctor',
+                    actorEmail: normalizedEmail,
+                    tenantId,
+                    facilityId,
+                }
+            );
+        } catch (auditError: any) {
+            console.warn('Provider onboarding audit logging failed:', auditError?.message || auditError);
+        }
+
         return res.json({
             success: true,
             profileId: userProfileId,
@@ -865,6 +936,41 @@ router.post('/provider-onboarding/complete', requireUser, async (req, res) => {
         });
     } catch (err: any) {
         console.error('Provider onboarding completion error:', err?.message || err);
+        try {
+            await recordPlatformActivityEvent(
+                {
+                    sessionId,
+                    source: 'web',
+                    category: 'registration',
+                    eventName: 'registration.solo_provider.failed',
+                    outcome: 'failure',
+                    actorUserId: req.user?.profileId || null,
+                    actorAuthUserId: req.user?.authUserId || null,
+                    actorRole: req.user?.role || 'provider_candidate',
+                    actorEmail: req.user?.email || null,
+                    tenantId: req.user?.tenantId || null,
+                    facilityId: req.user?.facilityId || null,
+                    pagePath: '/auth',
+                    entryPoint: 'solo_provider_registration',
+                    responseStatus: 500,
+                    errorMessage: err?.message || 'Provider onboarding failed',
+                    metadata: {
+                        workspaceName: parsed.data.workspaceName || null,
+                        providerName: parsed.data.fullName || null,
+                    },
+                },
+                {
+                    actorUserId: req.user?.profileId || null,
+                    actorAuthUserId: req.user?.authUserId || null,
+                    actorRole: req.user?.role || null,
+                    actorEmail: req.user?.email || null,
+                    tenantId: req.user?.tenantId || null,
+                    facilityId: req.user?.facilityId || null,
+                }
+            );
+        } catch (auditError: any) {
+            console.warn('Provider onboarding failure audit logging failed:', auditError?.message || auditError);
+        }
         return res.status(500).json({ error: 'Internal server error' });
     }
 });

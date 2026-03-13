@@ -37,6 +37,7 @@ import pharmacyRouter from './routes/pharmacy';
 import syncRouter from './routes/sync';
 import hewRouter from './routes/hew';
 import smsRouter from './routes/sms';
+import platformAuditRouter from './routes/platform-audit';
 import subscriptionRouter from './routes/subscription';
 import { provisionTrial } from './services/subscriptionService';
 import webhookRouter from './routes/webhook';
@@ -44,6 +45,7 @@ import agentRouter from './routes/agent';
 import dhis2Router from './routes/dhis2';
 import { subscriptionGuard } from './middleware/subscriptionGuard';
 import { recordResponseStatus } from './services/monitoring';
+import { recordPlatformActivityEvent } from './services/platform-activity';
 import { normalizeWorkspaceMetadata } from './services/workspaceMetadata';
 
 export const app = express();
@@ -329,6 +331,7 @@ app.use('/api/patient-auth', patientAuthLimiter, patientAuthRouter);
 // Resolve request user context once so subscription enforcement can run
 // before protected routers while requireUser reuses the same context.
 app.use(optionalUser);
+app.use('/api/platform-audit', platformAuditRouter);
 app.use(subscriptionGuard);
 
 // Mount protected application routes after subscription enforcement.
@@ -391,6 +394,13 @@ const normalizeRegistrationModules = (values: string[] | undefined) => {
 const isWorkspacePreferenceColumnError = (message?: string) =>
   Boolean(message && /(requested_setup_mode|requested_modules)/i.test(message));
 
+const resolvePlatformSessionId = (req: express.Request) => {
+  const headerValue = req.header('x-link-session-id')?.trim() || '';
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(headerValue)
+    ? headerValue
+    : null;
+};
+
 app.post(
   '/api/clinics',
   rateLimit({ windowMs: 15 * 60 * 1000, limit: 30 }),
@@ -448,9 +458,60 @@ app.post(
         return res.status(500).json({ error: error?.message || 'Unable to submit registration' });
       }
 
+      void recordPlatformActivityEvent(
+        {
+          sessionId: resolvePlatformSessionId(req),
+          source: 'server',
+          category: 'registration',
+          eventName: 'registration.clinic.completed',
+          outcome: 'success',
+          actorRole: 'clinic_owner_candidate',
+          actorEmail: admin.email.trim().toLowerCase(),
+          pagePath: '/register',
+          entryPoint: 'clinic_registration',
+          metadata: {
+            clinic_name: clinic.name.trim(),
+            clinic_location: clinic.location.trim(),
+            requested_setup_mode: requestedSetupMode,
+            requested_modules: requestedModules,
+            registration_id: data.id,
+          },
+        },
+        {
+          actorEmail: admin.email.trim().toLowerCase(),
+          ipAddress: req.ip || req.socket?.remoteAddress || null,
+          userAgent: req.get('user-agent') || null,
+        }
+      ).catch((platformError) => {
+        console.warn('clinic registration platform audit failed:', platformError?.message || platformError);
+      });
+
       return res.status(201).json({ registrationId: data.id });
     } catch (err) {
       console.error('clinic registration failed', err);
+      void recordPlatformActivityEvent(
+        {
+          sessionId: resolvePlatformSessionId(req),
+          source: 'server',
+          category: 'registration',
+          eventName: 'registration.clinic.failed',
+          outcome: 'failure',
+          actorRole: 'clinic_owner_candidate',
+          actorEmail: admin.email.trim().toLowerCase(),
+          pagePath: '/register',
+          entryPoint: 'clinic_registration',
+          errorMessage: err instanceof Error ? err.message : 'Unexpected error submitting registration',
+          metadata: {
+            clinic_name: clinic.name.trim(),
+            requested_setup_mode: requestedSetupMode,
+          },
+        },
+        {
+          actorEmail: admin.email.trim().toLowerCase(),
+          ipAddress: req.ip || req.socket?.remoteAddress || null,
+          userAgent: req.get('user-agent') || null,
+        }
+      ).catch(() => {});
       return res.status(500).json({ error: 'Unexpected error submitting registration' });
     }
   }
@@ -1319,9 +1380,51 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
   const filterFacilityId = (req.query.facilityId as string | undefined) || 'all';
   const filterRole = (req.query.role as string | undefined) || 'all';
   const filterStatus = (req.query.status as string | undefined) || 'all';
+  const activitySearch = q.replace(/[,]/g, ' ').trim();
+
+  const applyPlatformActivityFilters = (query: any) => {
+    let nextQuery = query;
+    if (filterTenantId !== 'all') {
+      nextQuery = nextQuery.eq('tenant_id', filterTenantId);
+    }
+    if (filterFacilityId !== 'all') {
+      nextQuery = nextQuery.eq('facility_id', filterFacilityId);
+    }
+    if (filterRole !== 'all') {
+      nextQuery = nextQuery.eq('actor_role', filterRole);
+    }
+    if (activitySearch) {
+      nextQuery = nextQuery.or(
+        [
+          `event_name.ilike.%${activitySearch}%`,
+          `page_path.ilike.%${activitySearch}%`,
+          `actor_email.ilike.%${activitySearch}%`,
+          `error_message.ilike.%${activitySearch}%`,
+        ].join(',')
+      );
+    }
+    return nextQuery;
+  };
 
   try {
-    const [{ data: tenants }, { data: facilities }, { data: users }, { data: approvals }] = await Promise.all([
+    const now = new Date();
+    const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const last30d = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    const [
+      { data: tenants },
+      { data: facilities },
+      { data: users },
+      { data: approvals },
+      { data: recentActivity },
+      { data: recentErrors },
+      totalEvents24hResult,
+      goroShortcut24hResult,
+      errorEvents24hResult,
+      clinicRegistrations30dResult,
+      soloProviderRegistrations30dResult,
+      { data: sessionEndDurations },
+    ] = await Promise.all([
       supabaseAdmin.from('tenants').select('id, name, subdomain, is_active, created_at'),
       supabaseAdmin
         .from('facilities')
@@ -1333,7 +1436,75 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         .from('staff_registration_requests')
         .select('id, facility_id, auth_user_id, status, created_at')
         .eq('status', 'pending'),
+      applyPlatformActivityFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select(
+            'id, session_id, category, event_name, outcome, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, response_status, duration_ms, error_message, metadata, occurred_at'
+          )
+          .order('occurred_at', { ascending: false })
+          .limit(20)
+      ),
+      applyPlatformActivityFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select(
+            'id, session_id, event_name, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, response_status, duration_ms, error_message, metadata, occurred_at'
+          )
+          .eq('category', 'error')
+          .order('occurred_at', { ascending: false })
+          .limit(10)
+      ),
+      applyPlatformActivityFilters(
+        supabaseAdmin.from('platform_activity_log').select('id', { count: 'exact', head: true }).gte('occurred_at', last24h)
+      ),
+      applyPlatformActivityFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('id', { count: 'exact', head: true })
+          .eq('event_name', 'action.goro_quick_access.clicked')
+          .gte('occurred_at', last24h)
+      ),
+      applyPlatformActivityFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('id', { count: 'exact', head: true })
+          .eq('category', 'error')
+          .gte('occurred_at', last24h)
+      ),
+      applyPlatformActivityFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('id', { count: 'exact', head: true })
+          .eq('event_name', 'registration.clinic.completed')
+          .gte('occurred_at', last30d)
+      ),
+      applyPlatformActivityFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('id', { count: 'exact', head: true })
+          .eq('event_name', 'registration.solo_provider.completed')
+          .gte('occurred_at', last30d)
+      ),
+      applyPlatformActivityFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('duration_ms')
+          .eq('event_name', 'session.ended')
+          .gte('occurred_at', last24h)
+          .order('occurred_at', { ascending: false })
+          .limit(200)
+      ),
     ]);
+
+    const avgSessionDurationMinutes =
+      (sessionEndDurations || []).length > 0
+        ? Math.round(
+            (sessionEndDurations || []).reduce((sum: number, row: any) => sum + (row.duration_ms || 0), 0) /
+              Math.max((sessionEndDurations || []).length, 1) /
+              60000
+          )
+        : 0;
 
     const tenantMap = new Map((tenants ?? []).map((t) => [t.id, t]));
     const facilityMap = new Map((facilities ?? []).map((f) => [f.id, f]));
@@ -1387,6 +1558,24 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
           ? tenantMap.get(facilityMap.get(a.facility_id)?.tenant_id ?? '')?.name
           : '',
         facility_name: facilityMap.get(a.facility_id)?.name || '',
+      })),
+      activitySummary: {
+        events24h: totalEvents24hResult.count || 0,
+        goroQuickAccess24h: goroShortcut24hResult.count || 0,
+        errors24h: errorEvents24hResult.count || 0,
+        clinicRegistrations30d: clinicRegistrations30dResult.count || 0,
+        soloProviderRegistrations30d: soloProviderRegistrations30dResult.count || 0,
+        avgSessionDurationMinutes,
+      },
+      recentPlatformActivity: (recentActivity || []).map((row: any) => ({
+        ...row,
+        tenant_name: row.tenant_id ? tenantMap.get(row.tenant_id)?.name || '' : '',
+        facility_name: row.facility_id ? facilityMap.get(row.facility_id)?.name || '' : '',
+      })),
+      recentPlatformErrors: (recentErrors || []).map((row: any) => ({
+        ...row,
+        tenant_name: row.tenant_id ? tenantMap.get(row.tenant_id)?.name || '' : '',
+        facility_name: row.facility_id ? facilityMap.get(row.facility_id)?.name || '' : '',
       })),
       health: {
         api: { uptime: 99.9, p95ms: 250, errorRate: 0.5 },
