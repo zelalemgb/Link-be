@@ -40,6 +40,7 @@ import smsRouter from './routes/sms';
 import subscriptionRouter from './routes/subscription';
 import webhookRouter from './routes/webhook';
 import agentRouter from './routes/agent';
+import dhis2Router from './routes/dhis2';
 import { subscriptionGuard } from './middleware/subscriptionGuard';
 import { recordResponseStatus } from './services/monitoring';
 import { normalizeWorkspaceMetadata } from './services/workspaceMetadata';
@@ -341,6 +342,7 @@ app.use('/api/pharmacy', pharmacyRouter);
 app.use('/api/sync', syncRouter);
 app.use('/api/hew', hewRouter);
 app.use('/api/sms', smsRouter);
+app.use('/api/dhis2', dhis2Router);
 // ── Subscription, billing and licensing ────────────────────────────────────
 app.use('/api/subscription', subscriptionRouter);
 app.use('/api/webhook', webhookRouter);      // Chapa + Stripe webhooks (no auth)

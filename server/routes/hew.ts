@@ -338,11 +338,12 @@ router.get('/caseload', async (req, res) => {
 
     const { data: noteRows, error } = await supabaseAdmin
       .from('community_notes')
-      .select('patient_id, follow_up_due')
+      .select('patient_id, follow_up_due, note_type, note_text, flags, location, visit_date, created_at')
       .eq('facility_id', facilityId)
       .eq('author_id', authorId)
       .not('follow_up_due', 'is', null)
       .order('follow_up_due', { ascending: true })
+      .order('created_at', { ascending: false })
       .limit(50);
 
     if (error) {
@@ -355,10 +356,25 @@ router.get('/caseload', async (req, res) => {
     }
 
     // Deduplicate patient_ids, keeping the closest follow_up_due per patient
-    const patientMap = new Map<string, string>();
+    const patientMap = new Map<string, {
+      follow_up_due: string | null;
+      latest_note_type: string | null;
+      latest_note_text: string | null;
+      latest_flags: string[];
+      latest_location: string | null;
+      latest_visit_date: string | null;
+    }>();
     for (const row of noteRows) {
       if (!patientMap.has(row.patient_id)) {
-        patientMap.set(row.patient_id, row.follow_up_due);
+        const structured = extractStructuredNoteFields(row.note_text || '');
+        patientMap.set(row.patient_id, {
+          follow_up_due: row.follow_up_due,
+          latest_note_type: row.note_type || null,
+          latest_note_text: structured.noteText || null,
+          latest_flags: Array.isArray(row.flags) ? row.flags : [],
+          latest_location: row.location || null,
+          latest_visit_date: row.visit_date || null,
+        });
       }
     }
 
@@ -376,7 +392,17 @@ router.get('/caseload', async (req, res) => {
 
     // Attach follow_up_due and sort
     const enriched = (patients ?? [])
-      .map((p: any) => ({ ...p, follow_up_due: patientMap.get(p.id) ?? null }))
+      .map((p: any) => ({
+        ...p,
+        ...(patientMap.get(p.id) || {
+          follow_up_due: null,
+          latest_note_type: null,
+          latest_note_text: null,
+          latest_flags: [],
+          latest_location: null,
+          latest_visit_date: null,
+        }),
+      }))
       .sort((a: any, b: any) => (a.follow_up_due ?? '').localeCompare(b.follow_up_due ?? ''));
 
     return res.json({ patients: enriched });

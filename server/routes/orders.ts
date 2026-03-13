@@ -29,6 +29,7 @@ const labCreateSchema = z.object({
   patientId: z.string().uuid(),
   orders: z.array(
     z.object({
+      lab_test_master_id: z.string().uuid().optional().nullable(),
       test_name: z.string().min(1),
       test_code: z.string().optional().nullable(),
       reference_range: z.string().optional().nullable(),
@@ -59,6 +60,7 @@ const medicationCreateSchema = z.object({
   patientId: z.string().uuid(),
   orders: z.array(
     z.object({
+      medication_master_id: z.string().uuid().optional().nullable(),
       medication_name: z.string().min(1),
       generic_name: z.string().optional().nullable(),
       dosage: z.string().min(1),
@@ -275,6 +277,7 @@ router.get('/lab', async (req, res) => {
           patient_id,
           test_name,
           test_code,
+          lab_test_master_id,
           result,
           result_value,
           reference_range,
@@ -285,8 +288,10 @@ router.get('/lab', async (req, res) => {
           payment_status,
           amount,
           paid_at,
-          sample_type,
           collected_at,
+          lab_test_master:lab_test_master_id (
+            sample_type
+          ),
           visits!inner(
             id,
             created_at,
@@ -317,6 +322,8 @@ router.get('/lab', async (req, res) => {
 
     (data || []).forEach((row: any) => {
       const visit = row.visits;
+      const labTestMaster = Array.isArray(row.lab_test_master) ? row.lab_test_master[0] : row.lab_test_master;
+      const sampleType = labTestMaster?.sample_type || null;
       if (!visit) return;
       const visitId = visit.id;
       const patient = visit.patients;
@@ -330,7 +337,7 @@ router.get('/lab', async (req, res) => {
           sex: patient?.gender === 'female' ? 'Female' : 'Male',
           urgency: row.urgency === 'stat' ? 'STAT' : 'Routine',
           accession: null,
-          sampleType: row.sample_type || null,
+          sampleType,
           collector: parseCollector(row.notes),
           collectedAt: row.collected_at || null,
           status: 'Not Collected',
@@ -363,6 +370,7 @@ router.get('/lab', async (req, res) => {
 
       entry.tests.push({
         id: row.id,
+        lab_test_master_id: row.lab_test_master_id || undefined,
         test_name: row.test_name,
         test_code: row.test_code || undefined,
         result: row.result_value || row.result || undefined,
@@ -375,7 +383,7 @@ router.get('/lab', async (req, res) => {
         payment_status: row.payment_status || null,
         amount: row.amount || undefined,
         paid_at: row.paid_at || undefined,
-        sample_type: row.sample_type || undefined,
+        sample_type: sampleType || undefined,
         collected_at: row.collected_at || undefined,
       });
     });
@@ -493,6 +501,7 @@ router.get('/medications', async (req, res) => {
           visit_id,
           patient_id,
           ordered_by,
+          medication_master_id,
           medication_name,
           generic_name,
           dosage,
@@ -582,6 +591,7 @@ router.get('/medications', async (req, res) => {
         visit_id: row.visit_id,
         patient_id: row.patient_id,
         ordered_by: row.ordered_by,
+        medication_master_id: row.medication_master_id || null,
         medication_name: row.medication_name,
         generic_name: row.generic_name,
         dosage: row.dosage,
@@ -660,11 +670,25 @@ router.post('/lab', async (req, res) => {
 
     const { data: existing } = await supabaseAdmin
       .from('lab_orders')
-      .select('test_name')
+      .select('test_name, lab_test_master_id')
       .eq('visit_id', visitId);
 
-    const existingSet = new Set((existing || []).map((row: any) => row.test_name?.toLowerCase()));
-    const toInsert = orders.filter((order) => !existingSet.has(order.test_name.toLowerCase()));
+    const existingSet = new Set(
+      (existing || []).flatMap((row: any) => {
+        const keys: string[] = [];
+        if (row.lab_test_master_id) {
+          keys.push(`id:${row.lab_test_master_id}`);
+        }
+        if (row.test_name) {
+          keys.push(`name:${row.test_name.toLowerCase()}`);
+        }
+        return keys;
+      })
+    );
+    const toInsert = orders.filter((order) => {
+      const lookupKey = order.lab_test_master_id ? `id:${order.lab_test_master_id}` : `name:${order.test_name.toLowerCase()}`;
+      return !existingSet.has(lookupKey);
+    });
     const skipped = orders.length - toInsert.length;
 
     if (toInsert.length === 0) {
@@ -676,6 +700,7 @@ router.post('/lab', async (req, res) => {
       patient_id: patientId,
       ordered_by: profileId,
       tenant_id: tenantId,
+      lab_test_master_id: order.lab_test_master_id || null,
       test_name: order.test_name,
       test_code: order.test_code || null,
       reference_range: order.reference_range || null,
@@ -812,15 +837,21 @@ router.post('/medications', async (req, res) => {
 
     const { data: existing } = await supabaseAdmin
       .from('medication_orders')
-      .select('medication_name, dosage, frequency')
+      .select('medication_name, dosage, frequency, medication_master_id')
       .eq('visit_id', visitId);
 
     const existingSet = new Set(
-      (existing || []).map((row: any) => `${row.medication_name?.toLowerCase()}-${row.dosage}-${row.frequency}`)
+      (existing || []).map((row: any) =>
+        row.medication_master_id
+          ? `id:${row.medication_master_id}-${row.dosage}-${row.frequency}`
+          : `name:${row.medication_name?.toLowerCase()}-${row.dosage}-${row.frequency}`
+      )
     );
 
     const toInsert = orders.filter((order) => {
-      const key = `${order.medication_name.toLowerCase()}-${order.dosage}-${order.frequency}`;
+      const key = order.medication_master_id
+        ? `id:${order.medication_master_id}-${order.dosage}-${order.frequency}`
+        : `name:${order.medication_name.toLowerCase()}-${order.dosage}-${order.frequency}`;
       return !existingSet.has(key);
     });
     const skipped = orders.length - toInsert.length;
@@ -835,6 +866,7 @@ router.post('/medications', async (req, res) => {
       ordered_by: profileId,
       tenant_id: tenantId,
       facility_id: facilityId,
+      medication_master_id: order.medication_master_id || null,
       medication_name: order.medication_name,
       generic_name: order.generic_name || null,
       dosage: order.dosage,
