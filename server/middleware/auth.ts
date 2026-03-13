@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
-import { createHash } from 'crypto';
+import { createHash, createPublicKey, KeyObject } from 'crypto';
+import jwt, { Algorithm, JwtHeader, JwtPayload } from 'jsonwebtoken';
 import { supabaseAdmin } from '../config/supabase';
 import { recordAuthFailure } from '../services/monitoring';
 
@@ -57,6 +58,11 @@ class UserProfileCache {
 
 const userProfileCache = new UserProfileCache();
 
+type VerifiedTokenIdentity = {
+    authUserId: string;
+    email?: string;
+};
+
 interface TokenCacheEntry {
     user: AuthUser;
     expiresAt: number;
@@ -112,6 +118,76 @@ class ValidatedTokenCache {
 }
 
 const validatedTokenCache = new ValidatedTokenCache();
+
+type JwkRecord = {
+    kid?: string;
+    alg?: string;
+    use?: string;
+    kty: string;
+    n?: string;
+    e?: string;
+    crv?: string;
+    x?: string;
+    y?: string;
+};
+
+class SupabaseJwksCache {
+    private keys = new Map<string, KeyObject>();
+    private expiresAt = 0;
+    private readonly ttlMs = 60 * 60 * 1000; // 1 hour
+
+    private get jwksUrl() {
+        const base = process.env.SUPABASE_URL?.replace(/\/+$/, '');
+        return base ? `${base}/auth/v1/.well-known/jwks.json` : '';
+    }
+
+    private async refresh() {
+        if (!this.jwksUrl) {
+            throw new Error('SUPABASE_URL is not configured');
+        }
+
+        const response = await fetch(this.jwksUrl);
+        if (!response.ok) {
+            throw new Error(`JWKS fetch failed with status ${response.status}`);
+        }
+
+        const payload = (await response.json()) as { keys?: JwkRecord[] };
+        const nextKeys = new Map<string, KeyObject>();
+
+        for (const key of payload.keys ?? []) {
+            if (!key.kid) continue;
+            try {
+                nextKeys.set(
+                    key.kid,
+                    createPublicKey({
+                        key,
+                        format: 'jwk',
+                    })
+                );
+            } catch {
+                continue;
+            }
+        }
+
+        if (nextKeys.size === 0) {
+            throw new Error('JWKS did not return any usable public keys');
+        }
+
+        this.keys = nextKeys;
+        this.expiresAt = Date.now() + this.ttlMs;
+    }
+
+    async getKey(kid: string) {
+        const hasFreshKeys = Date.now() < this.expiresAt && this.keys.size > 0;
+        if (!hasFreshKeys || !this.keys.has(kid)) {
+            await this.refresh();
+        }
+
+        return this.keys.get(kid) ?? null;
+    }
+}
+
+const supabaseJwksCache = new SupabaseJwksCache();
 
 export type Role =
     | 'admin'
@@ -185,6 +261,43 @@ const classifyAuthProviderFailure = (error: any) => {
 const getCachedValidatedUser = (token: string | undefined) => {
     if (!token) return null;
     return validatedTokenCache.get(token);
+};
+
+const resolveSupabaseIssuer = () => `${process.env.SUPABASE_URL?.replace(/\/+$/, '')}/auth/v1`;
+
+const verifySupabaseJwtLocally = async (token: string): Promise<VerifiedTokenIdentity | null> => {
+    if (token.split('.').length !== 3) {
+        return null;
+    }
+
+    const decoded = jwt.decode(token, { complete: true });
+    if (!decoded || typeof decoded !== 'object') {
+        return null;
+    }
+
+    const header = decoded.header as JwtHeader;
+    if (!header?.kid || !header.alg || header.alg.startsWith('HS')) {
+        return null;
+    }
+
+    const key = await supabaseJwksCache.getKey(header.kid);
+    if (!key) {
+        return null;
+    }
+
+    const verified = jwt.verify(token, key, {
+        algorithms: [header.alg as Algorithm],
+        issuer: resolveSupabaseIssuer(),
+    }) as JwtPayload;
+
+    if (typeof verified?.sub !== 'string' || verified.sub.trim().length === 0) {
+        return null;
+    }
+
+    return {
+        authUserId: verified.sub,
+        email: typeof verified.email === 'string' ? verified.email.trim().toLowerCase() : undefined,
+    };
 };
 
 export const requireUser = async (req: Request, res: Response, next: NextFunction) => {
@@ -272,7 +385,23 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
     }
 
     try {
-        const { data, error } = await supabaseAdmin.auth.getUser(token);
+        let verifiedIdentity: VerifiedTokenIdentity | null = null;
+        try {
+            verifiedIdentity = await verifySupabaseJwtLocally(token);
+        } catch (jwtError) {
+            if (isAuthDebug) {
+                console.warn('[AUTH DEBUG] local JWT verification failed:', (jwtError as any)?.message || jwtError);
+            }
+        }
+
+        let authUserId: string | undefined;
+        let authEmail: string | undefined;
+
+        if (verifiedIdentity) {
+            authUserId = verifiedIdentity.authUserId;
+            authEmail = verifiedIdentity.email;
+        } else {
+            const { data, error } = await supabaseAdmin.auth.getUser(token);
         if (error || !data?.user) {
             if (isAuthDebug) {
                 console.error('[AUTH DEBUG] getUser error:', error?.message || 'No user data');
@@ -305,7 +434,19 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
             };
         }
 
-        const authUserId = data.user.id;
+            authUserId = data.user.id;
+            authEmail = data.user.email?.trim().toLowerCase() || undefined;
+        }
+
+        if (!authUserId) {
+            return {
+                ok: false,
+                status: 401,
+                error: 'Invalid token',
+                authFailure: true,
+            };
+        }
+
         if (isAuthDebug) {
             console.log('[AUTH DEBUG] authUserId:', authUserId.slice(0, 8) + '…');
         }
@@ -367,7 +508,7 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
             profileId: profile?.id,
             tenantId: profile?.tenant_id,
             facilityId: profile?.facility_id,
-            email: data.user.email?.trim().toLowerCase() || undefined,
+            email: authEmail,
             role: (profile?.user_role as Role | null) || 'staff',
         };
 
