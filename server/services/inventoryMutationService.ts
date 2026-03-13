@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '../config/supabase.js';
 import { isAuditDurabilityError, recordAuditEvent } from './audit-log';
+import { assertInventoryUnlocked } from './inventoryLockService';
 
 export type InventoryContractErrorCode =
   | `AUTH_${string}`
@@ -737,6 +738,15 @@ export const dispatchIssueOrder = async ({
     if (actorResult.ok === false) return actorResult;
     const scopedActor = actorResult.data;
 
+    const inventoryUnlocked = await assertInventoryUnlocked({
+      tenantId: scopedActor.tenantId,
+      facilityId: scopedActor.facilityId,
+      action: 'dispatch issue orders',
+    });
+    if (inventoryUnlocked.ok === false) {
+      return error(inventoryUnlocked.status, 'CONFLICT_INVENTORY_COUNT_LOCKED', inventoryUnlocked.message);
+    }
+
     const fallbackVoucherNo = buildIssueVoucherNo(orderId);
     const { data: dispatchResult, error: dispatchError } = await supabaseAdmin.rpc(
       'backend_dispatch_issue_order',
@@ -1020,6 +1030,15 @@ export const approveLossAdjustment = async ({
     const actorResult = ensureInventoryMutationAccess(actor);
     if (actorResult.ok === false) return actorResult;
     const scopedActor = actorResult.data;
+
+    const inventoryUnlocked = await assertInventoryUnlocked({
+      tenantId: scopedActor.tenantId,
+      facilityId: scopedActor.facilityId,
+      action: 'approve loss adjustments',
+    });
+    if (inventoryUnlocked.ok === false) {
+      return error(inventoryUnlocked.status, 'CONFLICT_INVENTORY_COUNT_LOCKED', inventoryUnlocked.message);
+    }
 
     const { data: approvalResult, error: approvalError } = await supabaseAdmin.rpc(
       'backend_approve_loss_adjustment',

@@ -829,8 +829,15 @@ test('inventory mutation updateLossAdjustment fails closed on strict audit durab
 test('inventory mutation dispatchIssueOrder is idempotent on transactional replay', async () => {
   const { inventoryMutationService, supabaseAdmin } = await loadModules();
   const originalRpc = (supabaseAdmin as any).rpc;
+  const originalFrom = (supabaseAdmin as any).from;
 
   try {
+    (supabaseAdmin as any).from = createFromStub({
+      physical_inventory_sessions: {
+        maybeSingle: () => ({ data: null, error: null }),
+      },
+    });
+
     (supabaseAdmin as any).rpc = async (fn: string) => {
       assert.equal(fn, 'backend_dispatch_issue_order');
       return {
@@ -862,14 +869,22 @@ test('inventory mutation dispatchIssueOrder is idempotent on transactional repla
     }
   } finally {
     (supabaseAdmin as any).rpc = originalRpc;
+    (supabaseAdmin as any).from = originalFrom;
   }
 });
 
 test('inventory mutation approveLossAdjustment is idempotent on transactional replay', async () => {
   const { inventoryMutationService, supabaseAdmin } = await loadModules();
   const originalRpc = (supabaseAdmin as any).rpc;
+  const originalFrom = (supabaseAdmin as any).from;
 
   try {
+    (supabaseAdmin as any).from = createFromStub({
+      physical_inventory_sessions: {
+        maybeSingle: () => ({ data: null, error: null }),
+      },
+    });
+
     (supabaseAdmin as any).rpc = async (fn: string) => {
       assert.equal(fn, 'backend_approve_loss_adjustment');
       return {
@@ -900,14 +915,22 @@ test('inventory mutation approveLossAdjustment is idempotent on transactional re
     }
   } finally {
     (supabaseAdmin as any).rpc = originalRpc;
+    (supabaseAdmin as any).from = originalFrom;
   }
 });
 
 test('inventory mutation dispatchIssueOrder maps transactional stock conflict to stable error', async () => {
   const { inventoryMutationService, supabaseAdmin } = await loadModules();
   const originalRpc = (supabaseAdmin as any).rpc;
+  const originalFrom = (supabaseAdmin as any).from;
 
   try {
+    (supabaseAdmin as any).from = createFromStub({
+      physical_inventory_sessions: {
+        maybeSingle: () => ({ data: null, error: null }),
+      },
+    });
+
     (supabaseAdmin as any).rpc = async () => ({
       data: null,
       error: {
@@ -933,6 +956,7 @@ test('inventory mutation dispatchIssueOrder maps transactional stock conflict to
     }
   } finally {
     (supabaseAdmin as any).rpc = originalRpc;
+    (supabaseAdmin as any).from = originalFrom;
   }
 });
 

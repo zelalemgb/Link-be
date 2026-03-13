@@ -17,6 +17,7 @@ import {
   type LossAdjustmentMutationPayload,
 } from '../services/inventoryMutationService';
 import { isAuditDurabilityError, recordAuditEvent } from '../services/audit-log.js';
+import { assertInventoryUnlocked, getLockedInventorySession } from '../services/inventoryLockService.js';
 
 const router = Router();
 
@@ -69,7 +70,7 @@ const receivingInvoiceSchema = z.object({
 const receivingInvoiceItemSchema = z.object({
   inventory_item_id: z.string().uuid(),
   batch_no: z.string().min(1),
-  quantity: z.coerce.number().min(0),
+  quantity: z.coerce.number().int().positive(),
   unit_cost: z.coerce.number().min(0),
   unit_selling_price: z.coerce.number().min(0).optional().nullable(),
   profit_margin: z.coerce.number().optional().nullable(),
@@ -83,7 +84,7 @@ const receivingInvoiceItemSchema = z.object({
 const receivingItemUpdateSchema = z
   .object({
     batch_no: z.string().min(1).optional(),
-    quantity: z.coerce.number().min(0).optional(),
+    quantity: z.coerce.number().int().positive().optional(),
     unit_cost: z.coerce.number().min(0).optional(),
     unit_selling_price: z.coerce.number().min(0).nullable().optional(),
     profit_margin: z.coerce.number().nullable().optional(),
@@ -101,7 +102,7 @@ const finalizeInvoiceSchema = z.object({
     z.object({
       id: z.string().uuid().optional(),
       inventory_item_id: z.string().uuid(),
-      quantity: z.coerce.number().min(0),
+      quantity: z.coerce.number().int().positive(),
       batch_no: z.string().min(1),
       expiry_date: z.string().nullable().optional(),
       unit_cost: z.coerce.number().min(0),
@@ -134,6 +135,40 @@ const lossAdjustmentMutationSchema = z.object({
   quantity: z.coerce.number().positive(),
   soh: z.coerce.number().min(0).nullable().optional(),
   notes: z.string().max(1000).nullable().optional(),
+});
+
+const physicalInventorySessionSchema = z.object({
+  account_type: z.string().trim().min(1).max(120),
+  period_type: z.string().trim().min(1).max(120),
+  notes: z.string().max(1000).nullable().optional(),
+});
+
+const physicalInventoryItemSchema = z.object({
+  inventory_item_id: z.string().uuid(),
+  batch_no: z.string().trim().max(120).nullable().optional(),
+  manufacturer: z.string().trim().max(255).nullable().optional(),
+  expiry_date: z.string().nullable().optional(),
+  qty_sound: z.coerce.number().int().min(0),
+  qty_damaged: z.coerce.number().int().min(0),
+  qty_expired: z.coerce.number().int().min(0),
+  system_qty: z.coerce.number().int().min(0),
+  new_unit_cost: z.coerce.number().min(0).nullable().optional(),
+}).refine(
+  (payload) => (payload.qty_sound + payload.qty_damaged + payload.qty_expired) > 0,
+  { message: 'At least one counted quantity is required' }
+);
+
+const physicalInventoryItemUpdateSchema = z.object({
+  batch_no: z.string().trim().max(120).nullable().optional(),
+  manufacturer: z.string().trim().max(255).nullable().optional(),
+  expiry_date: z.string().nullable().optional(),
+  qty_sound: z.coerce.number().int().min(0).optional(),
+  qty_damaged: z.coerce.number().int().min(0).optional(),
+  qty_expired: z.coerce.number().int().min(0).optional(),
+  system_qty: z.coerce.number().int().min(0).optional(),
+  new_unit_cost: z.coerce.number().min(0).nullable().optional(),
+}).refine((payload) => Object.keys(payload).length > 0, {
+  message: 'At least one field is required',
 });
 
 const resolveActorProfile = async (authUserId: string, profileId?: string) => {
@@ -182,6 +217,9 @@ const mapRpcErrorStatus = (message: string) => {
     return 403;
   }
   if (normalized.includes('no line items') || normalized.includes('at least one line item')) return 400;
+  if (normalized.includes('positive quantity') || normalized.includes('must include item, positive quantity, cost, and batch')) return 400;
+  if (normalized.includes('already submitted') || normalized.includes('cannot be committed') || normalized.includes('cannot be ended')) return 409;
+  if (normalized.includes('insufficient stock')) return 409;
   return 500;
 };
 
@@ -247,6 +285,53 @@ const recordInventoryStrictAudit = async ({
       outboxAggregateId: outboxAggregateId || entityId || null,
     }
   );
+};
+
+const parseOptionalDateParam = (value: unknown) => {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const normalized = value.trim();
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return normalized;
+};
+
+const addMonthsUtc = (date: Date, months: number) => {
+  const next = new Date(date.toISOString());
+  next.setUTCMonth(next.getUTCMonth() + months);
+  return next;
+};
+
+const calculateMonthSpan = (dateFrom?: string | null, dateTo?: string | null, fallbackMonths = 3) => {
+  if (!dateFrom || !dateTo) return fallbackMonths;
+  const start = new Date(dateFrom);
+  const end = new Date(dateTo);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) return fallbackMonths;
+  const diffDays = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)));
+  return Math.max(1, Math.ceil(diffDays / 30));
+};
+
+const getMovementSign = (movementType: string, quantity: number) => {
+  const normalized = (movementType || '').toLowerCase();
+  if (['receipt', 'return', 'transfer_in', 'adjustment'].includes(normalized)) return Math.abs(quantity);
+  if (['issue', 'out', 'transfer_out', 'expired', 'damaged', 'loss'].includes(normalized)) return -Math.abs(quantity);
+  return 0;
+};
+
+const buildPhysicalInventoryId = () => {
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const random = Math.random().toString(36).slice(2, 8).toUpperCase();
+  return `PHY-${day}-${random}`;
+};
+
+const loadScopedPhysicalInventorySession = async (sessionId: string, facilityId: string, tenantId: string) => {
+  const { data, error } = await supabaseAdmin
+    .from('physical_inventory_sessions')
+    .select('*')
+    .eq('id', sessionId)
+    .eq('facility_id', facilityId)
+    .eq('tenant_id', tenantId)
+    .maybeSingle();
+  return { data, error };
 };
 
 const uuidParamSchema = z.string().uuid();
@@ -1113,128 +1198,36 @@ router.post('/receiving/invoices/:invoiceId/finalize', async (req, res) => {
       return res.status(409).json({ error: 'Invoice is already submitted' });
     }
 
-    const { data: existingItems, error: existingItemsError } = await supabaseAdmin
-      .from('receiving_invoice_items')
-      .select('id')
-      .eq('invoice_id', invoiceId);
-    if (existingItemsError) {
-      return res.status(500).json({ error: existingItemsError.message });
+    const inventoryUnlocked = await assertInventoryUnlocked({
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      action: 'finalize receiving invoices',
+    });
+    if (inventoryUnlocked.ok === false) {
+      return sendContractError(res, inventoryUnlocked.status, inventoryUnlocked.code, inventoryUnlocked.message);
     }
-    const existingItemIds = new Set((existingItems || []).map((row: any) => row.id));
-    for (const item of parsed.data.items) {
-      if (item.id && !existingItemIds.has(item.id)) {
-        return res.status(400).json({ error: `Invoice item ${item.id} does not belong to this invoice` });
+
+    const { data, error: finalizeError } = await supabaseAdmin.rpc(
+      'backend_finalize_receiving_invoice',
+      {
+        p_actor_facility_id: actorFacilityId,
+        p_actor_tenant_id: actorTenantId,
+        p_actor_profile_id: actorProfileId,
+        p_invoice_id: invoiceId,
+        p_items: parsed.data.items,
       }
+    );
+    if (finalizeError) {
+      return res.status(mapRpcErrorStatus(finalizeError.message)).json({ error: finalizeError.message });
     }
 
-    const rows = parsed.data.items.map((item) => ({
-      id: item.id,
-      invoice_id: invoiceId,
-      tenant_id: actorTenantId,
-      inventory_item_id: item.inventory_item_id,
-      quantity: item.quantity,
-      batch_no: item.batch_no,
-      expiry_date: item.expiry_date || null,
-      unit_cost: item.unit_cost,
-      unit_selling_price: item.unit_selling_price ?? null,
-    }));
-    if (rows.length > 0) {
-      const { error: upsertError } = await supabaseAdmin
-        .from('receiving_invoice_items')
-        .upsert(rows, { onConflict: 'id' });
-      if (upsertError) {
-        return res.status(500).json({ error: upsertError.message });
-      }
-    }
+    const rpcResult = (data || {}) as {
+      success?: boolean;
+      requestClosed?: boolean;
+      stockMovementCount?: number;
+      submittedAt?: string;
+    };
 
-    for (const item of rows) {
-      if ((item.quantity || 0) <= 0) continue;
-
-      const { data: lastMove } = await supabaseAdmin
-        .from('stock_movements')
-        .select('balance_after')
-        .eq('inventory_item_id', item.inventory_item_id)
-        .eq('facility_id', actorFacilityId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      const currentBalance = Number(lastMove?.balance_after || 0);
-      const newBalance = currentBalance + Number(item.quantity || 0);
-      const { error: movementError } = await supabaseAdmin
-        .from('stock_movements')
-        .insert({
-          inventory_item_id: item.inventory_item_id,
-          facility_id: actorFacilityId,
-          tenant_id: actorTenantId,
-          movement_type: 'receipt',
-          quantity: item.quantity,
-          balance_after: newBalance,
-          batch_number: item.batch_no,
-          expiry_date: item.expiry_date,
-          unit_cost: item.unit_cost,
-          created_by: actorProfileId,
-          reference_number: `INV-${invoice.invoice_no || 'REF'}`,
-          notes: 'Received via Receiving (GRN)',
-        });
-      if (movementError) {
-        return res.status(500).json({ error: movementError.message });
-      }
-    }
-
-    const submittedAt = new Date().toISOString();
-    const { error: statusError } = await supabaseAdmin
-      .from('receiving_invoices')
-      .update({
-        status: 'submitted',
-        submitted_at: submittedAt,
-        updated_at: submittedAt,
-      })
-      .eq('id', invoiceId)
-      .eq('facility_id', actorFacilityId)
-      .eq('tenant_id', actorTenantId);
-    if (statusError) {
-      return res.status(500).json({ error: statusError.message });
-    }
-
-    let requestClosed = false;
-    if (invoice.request_id) {
-      const { data: allItems, error: allItemsError } = await supabaseAdmin
-        .from('receiving_invoice_items')
-        .select('inventory_item_id, quantity, requested_quantity, receiving_invoices!inner(status)')
-        .eq('receiving_invoices.request_id', invoice.request_id)
-        .eq('receiving_invoices.status', 'submitted');
-      if (allItemsError) {
-        return res.status(500).json({ error: allItemsError.message });
-      }
-
-      const totals: Record<string, { received: number; requested: number }> = {};
-      (allItems || []).forEach((row: any) => {
-        if (!totals[row.inventory_item_id]) {
-          totals[row.inventory_item_id] = {
-            received: 0,
-            requested: Number(row.requested_quantity || 0),
-          };
-        }
-        totals[row.inventory_item_id].received += Number(row.quantity || 0);
-      });
-
-      const hasTotals = Object.keys(totals).length > 0;
-      requestClosed = hasTotals && Object.values(totals).every((total) => total.received >= total.requested);
-      if (requestClosed) {
-        const { error: closeRequestError } = await supabaseAdmin
-          .from('request_for_resupply')
-          .update({ status: 'fulfilled', updated_at: submittedAt })
-          .eq('id', invoice.request_id)
-          .eq('facility_id', actorFacilityId)
-          .eq('tenant_id', actorTenantId);
-        if (closeRequestError) {
-          return res.status(500).json({ error: closeRequestError.message });
-        }
-      }
-    }
-
-    const stockMovementCount = rows.filter((row) => Number(row.quantity || 0) > 0).length;
     await recordInventoryStrictAudit({
       req,
       tenantId: actorTenantId,
@@ -1247,21 +1240,1135 @@ router.post('/receiving/invoices/:invoiceId/finalize', async (req, res) => {
       metadata: {
         invoiceNo: invoice.invoice_no,
         requestId: invoice.request_id || null,
-        itemCount: rows.length,
-        stockMovementCount,
-        requestClosed,
+        itemCount: parsed.data.items.length,
+        stockMovementCount: Number(rpcResult.stockMovementCount || 0),
+        requestClosed: Boolean(rpcResult.requestClosed),
       },
       outboxEventType: 'audit.inventory.receiving_invoice.finalize.write_failed',
       outboxAggregateType: 'receiving_invoice',
       outboxAggregateId: invoiceId,
     });
 
-    return res.json({ success: true, requestClosed });
+    return res.json({
+      success: true,
+      requestClosed: Boolean(rpcResult.requestClosed),
+      stockMovementCount: Number(rpcResult.stockMovementCount || 0),
+      submittedAt: rpcResult.submittedAt || null,
+    });
   } catch (error: any) {
     console.error('Finalize receiving invoice error:', error?.message || error);
     if (isAuditDurabilityError(error)) {
       return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
     }
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/physical-inventory/sessions', async (req, res) => {
+  try {
+    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('physical_inventory_sessions')
+      .select('*')
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .order('created_at', { ascending: false });
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({ sessions: data || [] });
+  } catch (error: any) {
+    console.error('List physical inventory sessions error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/physical-inventory/sessions/:sessionId', async (req, res) => {
+  const sessionIdResult = resolveRequiredUuidParam({
+    value: req.params.sessionId,
+    requiredCode: 'VALIDATION_PHYSICAL_INVENTORY_SESSION_ID_REQUIRED',
+    invalidCode: 'VALIDATION_INVALID_PHYSICAL_INVENTORY_SESSION_ID',
+    label: 'Physical inventory session id',
+  });
+  if (!sessionIdResult.ok) {
+    return sendContractError(res, sessionIdResult.status, sessionIdResult.code, sessionIdResult.message);
+  }
+
+  try {
+    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const { data: session, error: sessionError } = await loadScopedPhysicalInventorySession(
+      sessionIdResult.value,
+      actorFacilityId,
+      actorTenantId
+    );
+    if (sessionError) {
+      return res.status(500).json({ error: sessionError.message });
+    }
+    if (!session) {
+      return res.status(404).json({ error: 'Physical inventory session not found' });
+    }
+
+    const { data: items, error: itemsError } = await supabaseAdmin
+      .from('physical_inventory_session_items')
+      .select(`
+        *,
+        inventory_items:inventory_item_id (name, generic_name, strength, unit_cost)
+      `)
+      .eq('session_id', session.id)
+      .order('created_at', { ascending: true });
+    if (itemsError) {
+      return res.status(500).json({ error: itemsError.message });
+    }
+
+    return res.json({ session, items: items || [] });
+  } catch (error: any) {
+    console.error('Get physical inventory session error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/physical-inventory/sessions', async (req, res) => {
+  const parsed = physicalInventorySessionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return sendContractError(
+      res,
+      400,
+      'VALIDATION_INVALID_PHYSICAL_INVENTORY_SESSION_PAYLOAD',
+      parsed.error.issues[0]?.message || 'Invalid physical inventory session payload'
+    );
+  }
+
+  try {
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId || !actorProfileId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const lockedSession = await getLockedInventorySession({
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+    });
+    if (lockedSession) {
+      return sendContractError(
+        res,
+        409,
+        'CONFLICT_INVENTORY_COUNT_LOCKED',
+        `Physical inventory ${lockedSession.inventory_id || lockedSession.id} is already locking stock transactions`
+      );
+    }
+
+    const payload = parsed.data;
+    const inventoryId = buildPhysicalInventoryId();
+    const { data, error } = await supabaseAdmin
+      .from('physical_inventory_sessions')
+      .insert({
+        inventory_id: inventoryId,
+        tenant_id: actorTenantId,
+        facility_id: actorFacilityId,
+        account_type: payload.account_type,
+        period_type: payload.period_type,
+        notes: payload.notes || null,
+        status: 'draft',
+        is_locked: true,
+        created_by: actorProfileId,
+      })
+      .select('*')
+      .single();
+    if (error) {
+      if (error.code === '23505') {
+        return sendContractError(
+          res,
+          409,
+          'CONFLICT_INVENTORY_COUNT_LOCKED',
+          'Another physical inventory session is already active for this facility'
+        );
+      }
+      return res.status(500).json({ error: error.message });
+    }
+
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'create_physical_inventory_session',
+      eventType: 'create',
+      entityType: 'physical_inventory_session',
+      entityId: data?.id || null,
+      metadata: {
+        inventoryId,
+        accountType: payload.account_type,
+        periodType: payload.period_type,
+      },
+      outboxEventType: 'audit.inventory.physical_inventory_session.create.write_failed',
+      outboxAggregateType: 'physical_inventory_session',
+      outboxAggregateId: data?.id || null,
+    });
+
+    return res.status(201).json({ session: data });
+  } catch (error: any) {
+    console.error('Create physical inventory session error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/physical-inventory/sessions/:sessionId/items', async (req, res) => {
+  const parsed = physicalInventoryItemSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return sendContractError(
+      res,
+      400,
+      'VALIDATION_INVALID_PHYSICAL_INVENTORY_ITEM_PAYLOAD',
+      parsed.error.issues[0]?.message || 'Invalid physical inventory item payload'
+    );
+  }
+
+  const sessionIdResult = resolveRequiredUuidParam({
+    value: req.params.sessionId,
+    requiredCode: 'VALIDATION_PHYSICAL_INVENTORY_SESSION_ID_REQUIRED',
+    invalidCode: 'VALIDATION_INVALID_PHYSICAL_INVENTORY_SESSION_ID',
+    label: 'Physical inventory session id',
+  });
+  if (!sessionIdResult.ok) {
+    return sendContractError(res, sessionIdResult.status, sessionIdResult.code, sessionIdResult.message);
+  }
+
+  try {
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId || !actorProfileId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const { data: session, error: sessionError } = await loadScopedPhysicalInventorySession(
+      sessionIdResult.value,
+      actorFacilityId,
+      actorTenantId
+    );
+    if (sessionError) {
+      return res.status(500).json({ error: sessionError.message });
+    }
+    if (!session) {
+      return res.status(404).json({ error: 'Physical inventory session not found' });
+    }
+    if (session.status !== 'draft') {
+      return res.status(409).json({ error: 'Items can only be edited on draft physical inventory sessions' });
+    }
+
+    const { data: inventoryItem } = await supabaseAdmin
+      .from('inventory_items')
+      .select('id')
+      .eq('id', parsed.data.inventory_item_id)
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .maybeSingle();
+    if (!inventoryItem) {
+      return res.status(404).json({ error: 'Inventory item not found in your facility' });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('physical_inventory_session_items')
+      .insert({
+        session_id: session.id,
+        tenant_id: actorTenantId,
+        inventory_item_id: parsed.data.inventory_item_id,
+        batch_no: parsed.data.batch_no || null,
+        manufacturer: parsed.data.manufacturer || null,
+        expiry_date: parsed.data.expiry_date || null,
+        qty_sound: parsed.data.qty_sound,
+        qty_damaged: parsed.data.qty_damaged,
+        qty_expired: parsed.data.qty_expired,
+        system_qty: parsed.data.system_qty,
+        new_unit_cost: parsed.data.new_unit_cost ?? null,
+        created_by: actorProfileId,
+      })
+      .select('*')
+      .single();
+    if (error) {
+      if (error.code === '23505') {
+        return res.status(409).json({ error: 'This inventory item and batch already exists in the active count' });
+      }
+      return res.status(500).json({ error: error.message });
+    }
+
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'create_physical_inventory_item',
+      eventType: 'create',
+      entityType: 'physical_inventory_item',
+      entityId: data?.id || null,
+      metadata: {
+        sessionId: session.id,
+        inventoryItemId: parsed.data.inventory_item_id,
+      },
+      outboxEventType: 'audit.inventory.physical_inventory_item.create.write_failed',
+      outboxAggregateType: 'physical_inventory_item',
+      outboxAggregateId: data?.id || null,
+    });
+
+    return res.status(201).json({ item: data });
+  } catch (error: any) {
+    console.error('Create physical inventory item error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.patch('/physical-inventory/items/:itemId', async (req, res) => {
+  const parsed = physicalInventoryItemUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return sendContractError(
+      res,
+      400,
+      'VALIDATION_INVALID_PHYSICAL_INVENTORY_ITEM_PAYLOAD',
+      parsed.error.issues[0]?.message || 'Invalid physical inventory item payload'
+    );
+  }
+
+  try {
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId || !actorProfileId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const { itemId } = req.params;
+    const { data: existingItem, error: existingItemError } = await supabaseAdmin
+      .from('physical_inventory_session_items')
+      .select('id, session_id, qty_sound, qty_damaged, qty_expired')
+      .eq('id', itemId)
+      .maybeSingle();
+    if (existingItemError) {
+      return res.status(500).json({ error: existingItemError.message });
+    }
+    if (!existingItem) {
+      return res.status(404).json({ error: 'Physical inventory item not found' });
+    }
+
+    const { data: session, error: sessionError } = await loadScopedPhysicalInventorySession(
+      existingItem.session_id,
+      actorFacilityId,
+      actorTenantId
+    );
+    if (sessionError) {
+      return res.status(500).json({ error: sessionError.message });
+    }
+    if (!session) {
+      return res.status(403).json({ error: 'Cannot edit physical inventory items outside your facility' });
+    }
+    if (session.status !== 'draft') {
+      return res.status(409).json({ error: 'Items can only be edited on draft physical inventory sessions' });
+    }
+
+    const updatedPayload = { ...parsed.data };
+    const total =
+      Number(updatedPayload.qty_sound ?? existingItem.qty_sound ?? 0) +
+      Number(updatedPayload.qty_damaged ?? existingItem.qty_damaged ?? 0) +
+      Number(updatedPayload.qty_expired ?? existingItem.qty_expired ?? 0);
+    if (
+      ('qty_sound' in updatedPayload || 'qty_damaged' in updatedPayload || 'qty_expired' in updatedPayload) &&
+      total <= 0
+    ) {
+      return res.status(400).json({ error: 'At least one counted quantity is required' });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('physical_inventory_session_items')
+      .update(updatedPayload)
+      .eq('id', itemId)
+      .eq('session_id', existingItem.session_id)
+      .select('*')
+      .single();
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'update_physical_inventory_item',
+      eventType: 'update',
+      entityType: 'physical_inventory_item',
+      entityId: data?.id || itemId,
+      metadata: {
+        sessionId: existingItem.session_id,
+        fieldsUpdated: Object.keys(parsed.data),
+      },
+      outboxEventType: 'audit.inventory.physical_inventory_item.update.write_failed',
+      outboxAggregateType: 'physical_inventory_item',
+      outboxAggregateId: data?.id || itemId,
+    });
+
+    return res.json({ item: data });
+  } catch (error: any) {
+    console.error('Update physical inventory item error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.delete('/physical-inventory/items/:itemId', async (req, res) => {
+  try {
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId || !actorProfileId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const { itemId } = req.params;
+    const { data: existingItem, error: existingItemError } = await supabaseAdmin
+      .from('physical_inventory_session_items')
+      .select('id, session_id')
+      .eq('id', itemId)
+      .maybeSingle();
+    if (existingItemError) {
+      return res.status(500).json({ error: existingItemError.message });
+    }
+    if (!existingItem) {
+      return res.status(404).json({ error: 'Physical inventory item not found' });
+    }
+
+    const { data: session, error: sessionError } = await loadScopedPhysicalInventorySession(
+      existingItem.session_id,
+      actorFacilityId,
+      actorTenantId
+    );
+    if (sessionError) {
+      return res.status(500).json({ error: sessionError.message });
+    }
+    if (!session) {
+      return res.status(403).json({ error: 'Cannot delete physical inventory items outside your facility' });
+    }
+    if (session.status !== 'draft') {
+      return res.status(409).json({ error: 'Items can only be deleted on draft physical inventory sessions' });
+    }
+
+    const { error } = await supabaseAdmin
+      .from('physical_inventory_session_items')
+      .delete()
+      .eq('id', itemId)
+      .eq('session_id', existingItem.session_id);
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'delete_physical_inventory_item',
+      eventType: 'delete',
+      entityType: 'physical_inventory_item',
+      entityId: itemId,
+      metadata: {
+        sessionId: existingItem.session_id,
+      },
+      outboxEventType: 'audit.inventory.physical_inventory_item.delete.write_failed',
+      outboxAggregateType: 'physical_inventory_item',
+      outboxAggregateId: itemId,
+    });
+
+    return res.json({ success: true });
+  } catch (error: any) {
+    console.error('Delete physical inventory item error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/physical-inventory/sessions/:sessionId/commit', async (req, res) => {
+  const sessionIdResult = resolveRequiredUuidParam({
+    value: req.params.sessionId,
+    requiredCode: 'VALIDATION_PHYSICAL_INVENTORY_SESSION_ID_REQUIRED',
+    invalidCode: 'VALIDATION_INVALID_PHYSICAL_INVENTORY_SESSION_ID',
+    label: 'Physical inventory session id',
+  });
+  if (!sessionIdResult.ok) {
+    return sendContractError(res, sessionIdResult.status, sessionIdResult.code, sessionIdResult.message);
+  }
+
+  try {
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId || !actorProfileId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const { data: session, error: sessionError } = await loadScopedPhysicalInventorySession(
+      sessionIdResult.value,
+      actorFacilityId,
+      actorTenantId
+    );
+    if (sessionError) {
+      return res.status(500).json({ error: sessionError.message });
+    }
+    if (!session) {
+      return res.status(404).json({ error: 'Physical inventory session not found' });
+    }
+
+    const { data, error: commitError } = await supabaseAdmin.rpc(
+      'backend_commit_physical_inventory_session',
+      {
+        p_actor_facility_id: actorFacilityId,
+        p_actor_tenant_id: actorTenantId,
+        p_actor_profile_id: actorProfileId,
+        p_session_id: session.id,
+      }
+    );
+    if (commitError) {
+      return res.status(mapRpcErrorStatus(commitError.message)).json({ error: commitError.message });
+    }
+
+    const rpcResult = (data || {}) as {
+      success?: boolean;
+      movementCount?: number;
+      committedAt?: string;
+    };
+
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'commit_physical_inventory_session',
+      eventType: 'update',
+      entityType: 'physical_inventory_session',
+      entityId: session.id,
+      metadata: {
+        inventoryId: session.inventory_id,
+        movementCount: Number(rpcResult.movementCount || 0),
+      },
+      outboxEventType: 'audit.inventory.physical_inventory_session.commit.write_failed',
+      outboxAggregateType: 'physical_inventory_session',
+      outboxAggregateId: session.id,
+    });
+
+    return res.json({
+      success: true,
+      movementCount: Number(rpcResult.movementCount || 0),
+      committedAt: rpcResult.committedAt || null,
+    });
+  } catch (error: any) {
+    console.error('Commit physical inventory session error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/physical-inventory/sessions/:sessionId/end', async (req, res) => {
+  const sessionIdResult = resolveRequiredUuidParam({
+    value: req.params.sessionId,
+    requiredCode: 'VALIDATION_PHYSICAL_INVENTORY_SESSION_ID_REQUIRED',
+    invalidCode: 'VALIDATION_INVALID_PHYSICAL_INVENTORY_SESSION_ID',
+    label: 'Physical inventory session id',
+  });
+  if (!sessionIdResult.ok) {
+    return sendContractError(res, sessionIdResult.status, sessionIdResult.code, sessionIdResult.message);
+  }
+
+  try {
+    const { actorFacilityId, actorTenantId, actorProfileId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId || !actorProfileId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const { data: session, error: sessionError } = await loadScopedPhysicalInventorySession(
+      sessionIdResult.value,
+      actorFacilityId,
+      actorTenantId
+    );
+    if (sessionError) {
+      return res.status(500).json({ error: sessionError.message });
+    }
+    if (!session) {
+      return res.status(404).json({ error: 'Physical inventory session not found' });
+    }
+    if (session.status !== 'committed') {
+      return res.status(409).json({ error: 'Only committed physical inventory sessions can be ended' });
+    }
+
+    const endedAt = new Date().toISOString();
+    const { data, error } = await supabaseAdmin
+      .from('physical_inventory_sessions')
+      .update({
+        status: 'closed',
+        is_locked: false,
+        ended_at: endedAt,
+        ended_by: actorProfileId,
+        updated_at: endedAt,
+      })
+      .eq('id', session.id)
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .select('*')
+      .single();
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    await recordInventoryStrictAudit({
+      req,
+      tenantId: actorTenantId,
+      facilityId: actorFacilityId,
+      actorProfileId,
+      action: 'end_physical_inventory_session',
+      eventType: 'update',
+      entityType: 'physical_inventory_session',
+      entityId: session.id,
+      metadata: {
+        inventoryId: session.inventory_id,
+        endedAt,
+      },
+      outboxEventType: 'audit.inventory.physical_inventory_session.end.write_failed',
+      outboxAggregateType: 'physical_inventory_session',
+      outboxAggregateId: session.id,
+    });
+
+    return res.json({ success: true, session: data });
+  } catch (error: any) {
+    console.error('End physical inventory session error:', error?.message || error);
+    if (isAuditDurabilityError(error)) {
+      return sendContractError(res, 500, 'CONFLICT_AUDIT_DURABILITY_FAILURE', 'Audit durability requirement failed');
+    }
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/reports/stock-status', async (req, res) => {
+  try {
+    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const category = typeof req.query.category === 'string' ? req.query.category.trim() : 'all';
+    const itemSearch = typeof req.query.item === 'string' ? req.query.item.trim().toLowerCase() : '';
+    const dateFrom = parseOptionalDateParam(req.query.dateFrom) || addMonthsUtc(new Date(), -3).toISOString().slice(0, 10);
+    const dateTo = parseOptionalDateParam(req.query.dateTo) || new Date().toISOString().slice(0, 10);
+    const monthSpan = calculateMonthSpan(dateFrom, dateTo, 3);
+
+    let itemQuery = supabaseAdmin
+      .from('inventory_items')
+      .select('id, name, generic_name, category, reorder_level, max_stock_level, unit_cost')
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .eq('is_active', true);
+    if (category && category !== 'all') {
+      itemQuery = itemQuery.eq('category', category);
+    }
+    const { data: items, error: itemsError } = await itemQuery;
+    if (itemsError) {
+      return res.status(500).json({ error: itemsError.message });
+    }
+
+    const filteredItems = (items || []).filter((item: any) => {
+      if (!itemSearch) return true;
+      const haystack = `${item.name || ''} ${item.generic_name || ''}`.toLowerCase();
+      return haystack.includes(itemSearch);
+    });
+
+    const { data: stockRows, error: stockError } = await supabaseAdmin
+      .from('current_stock')
+      .select('inventory_item_id, current_quantity, reorder_level, tenant_id')
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId);
+    if (stockError) {
+      return res.status(500).json({ error: stockError.message });
+    }
+
+    const { data: movementRows, error: movementError } = await supabaseAdmin
+      .from('stock_movements')
+      .select('inventory_item_id, movement_type, quantity, created_at')
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .gte('created_at', `${dateFrom}T00:00:00.000Z`)
+      .lte('created_at', `${dateTo}T23:59:59.999Z`)
+      .in('movement_type', ['issue', 'out', 'transfer_out']);
+    if (movementError) {
+      return res.status(500).json({ error: movementError.message });
+    }
+
+    const stockMap = new Map<string, number>();
+    (stockRows || []).forEach((row: any) => {
+      stockMap.set(row.inventory_item_id, Number(row.current_quantity || 0));
+    });
+
+    const issueMap = new Map<string, number>();
+    (movementRows || []).forEach((row: any) => {
+      issueMap.set(
+        row.inventory_item_id,
+        Number(issueMap.get(row.inventory_item_id) || 0) + Math.abs(Number(row.quantity || 0))
+      );
+    });
+
+    const rows = filteredItems.map((item: any) => {
+      const soh = Number(stockMap.get(item.id) || 0);
+      const amc = Number((Number(issueMap.get(item.id) || 0) / monthSpan).toFixed(2));
+      const mos = amc > 0 ? Number((soh / amc).toFixed(2)) : null;
+      let status = 'Normal';
+      if (soh <= 0) status = 'Out of Stock';
+      else if (soh <= Number(item.reorder_level || 0)) status = 'Low Stock';
+      else if (item.max_stock_level && soh > Number(item.max_stock_level)) status = 'Over Stock';
+
+      return {
+        inventory_item_id: item.id,
+        item: item.name,
+        category: item.category || 'Uncategorized',
+        account: 'Unassigned',
+        soh,
+        amc,
+        mos,
+        status,
+      };
+    });
+
+    return res.json({ rows, dateFrom, dateTo, monthSpan });
+  } catch (error: any) {
+    console.error('Stock status report error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/reports/bin-card', async (req, res) => {
+  const itemIdResult = resolveRequiredUuidParam({
+    value: typeof req.query.inventory_item_id === 'string' ? req.query.inventory_item_id : undefined,
+    requiredCode: 'VALIDATION_INVENTORY_ITEM_ID_REQUIRED',
+    invalidCode: 'VALIDATION_INVALID_INVENTORY_ITEM_ID',
+    label: 'Inventory item id',
+  });
+  if (!itemIdResult.ok) {
+    return sendContractError(res, itemIdResult.status, itemIdResult.code, itemIdResult.message);
+  }
+
+  try {
+    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const dateFrom = parseOptionalDateParam(req.query.dateFrom);
+    const dateTo = parseOptionalDateParam(req.query.dateTo);
+
+    let query = supabaseAdmin
+      .from('stock_movements')
+      .select(`
+        id,
+        movement_type,
+        quantity,
+        balance_after,
+        batch_number,
+        reference_number,
+        notes,
+        created_at,
+        inventory_items:inventory_item_id (name, generic_name)
+      `)
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .eq('inventory_item_id', itemIdResult.value)
+      .order('created_at', { ascending: true });
+    if (dateFrom) {
+      query = query.gte('created_at', `${dateFrom}T00:00:00.000Z`);
+    }
+    if (dateTo) {
+      query = query.lte('created_at', `${dateTo}T23:59:59.999Z`);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    const rows = (data || []).map((row: any) => {
+      const sign = getMovementSign(row.movement_type, Number(row.quantity || 0));
+      return {
+        id: row.id,
+        date: row.created_at,
+        transactionType: row.movement_type,
+        reference: row.reference_number || '-',
+        received: sign > 0 ? Number(row.quantity || 0) : 0,
+        issued: sign < 0 ? Number(row.quantity || 0) : 0,
+        balance: Number(row.balance_after || 0),
+        batch: row.batch_number || '-',
+        notes: row.notes || null,
+        itemName: (row.inventory_items as any)?.name || null,
+      };
+    });
+
+    return res.json({ rows });
+  } catch (error: any) {
+    console.error('Bin card report error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/reports/expiry', async (req, res) => {
+  try {
+    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const mode = typeof req.query.mode === 'string' && req.query.mode === 'expired' ? 'expired' : 'near-expiry';
+    const thresholdMonths = Math.max(1, Number(req.query.thresholdMonths || 6));
+    const dateFrom = parseOptionalDateParam(req.query.dateFrom);
+    const dateTo = parseOptionalDateParam(req.query.dateTo);
+    const category = typeof req.query.category === 'string' ? req.query.category.trim() : 'all';
+
+    const { data, error } = await supabaseAdmin
+      .from('stock_movements')
+      .select(`
+        inventory_item_id,
+        movement_type,
+        quantity,
+        batch_number,
+        expiry_date,
+        unit_cost,
+        inventory_items:inventory_item_id (name, category, unit_cost)
+      `)
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .not('expiry_date', 'is', null);
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    const grouped = new Map<string, any>();
+    (data || []).forEach((row: any) => {
+      const item = row.inventory_items as any;
+      if (category && category !== 'all' && item?.category !== category) return;
+      const key = `${row.inventory_item_id}::${row.batch_number || ''}::${row.expiry_date}`;
+      const sign = getMovementSign(row.movement_type, Number(row.quantity || 0));
+      const current = grouped.get(key) || {
+        inventory_item_id: row.inventory_item_id,
+        item: item?.name || 'Unknown',
+        category: item?.category || 'Uncategorized',
+        batch: row.batch_number || '-',
+        expiryDate: row.expiry_date,
+        quantity: 0,
+        unitCost: Number(row.unit_cost ?? item?.unit_cost ?? 0),
+      };
+      current.quantity += sign;
+      if (Number(row.unit_cost ?? 0) > 0) {
+        current.unitCost = Number(row.unit_cost);
+      }
+      grouped.set(key, current);
+    });
+
+    const today = new Date();
+    const thresholdDate = addMonthsUtc(today, thresholdMonths);
+    const rows = Array.from(grouped.values())
+      .filter((row: any) => Number(row.quantity || 0) > 0 && row.expiryDate)
+      .filter((row: any) => {
+        const expiry = new Date(row.expiryDate);
+        if (Number.isNaN(expiry.getTime())) return false;
+        if (mode === 'expired') {
+          if (expiry >= today) return false;
+          if (dateFrom && expiry < new Date(dateFrom)) return false;
+          if (dateTo && expiry > new Date(dateTo)) return false;
+          return true;
+        }
+        return expiry >= today && expiry <= thresholdDate;
+      })
+      .sort((a: any, b: any) => String(a.expiryDate).localeCompare(String(b.expiryDate)))
+      .map((row: any) => {
+        const expiry = new Date(row.expiryDate);
+        const diffDays = Math.ceil((expiry.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+        return {
+          ...row,
+          value: Number((Number(row.quantity || 0) * Number(row.unitCost || 0)).toFixed(2)),
+          daysUntilExpiry: diffDays,
+          status: mode === 'expired' ? 'Expired' : 'Near Expiry',
+        };
+      });
+
+    return res.json({ rows, mode, thresholdMonths });
+  } catch (error: any) {
+    console.error('Expiry report error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/reports/financial/cost', async (req, res) => {
+  try {
+    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const dateFrom = parseOptionalDateParam(req.query.dateFrom) || addMonthsUtc(new Date(), -3).toISOString().slice(0, 10);
+    const dateTo = parseOptionalDateParam(req.query.dateTo) || new Date().toISOString().slice(0, 10);
+
+    const { data: stockRows, error: stockError } = await supabaseAdmin
+      .from('current_stock')
+      .select('inventory_item_id, current_quantity, tenant_id')
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId);
+    if (stockError) {
+      return res.status(500).json({ error: stockError.message });
+    }
+
+    const inventoryIds = (stockRows || []).map((row: any) => row.inventory_item_id).filter(Boolean);
+    let balanceValue = 0;
+    if (inventoryIds.length > 0) {
+      const { data: items, error: itemError } = await supabaseAdmin
+        .from('inventory_items')
+        .select('id, unit_cost')
+        .eq('facility_id', actorFacilityId)
+        .eq('tenant_id', actorTenantId)
+        .in('id', inventoryIds);
+      if (itemError) {
+        return res.status(500).json({ error: itemError.message });
+      }
+      const itemCostMap = new Map<string, number>();
+      (items || []).forEach((item: any) => itemCostMap.set(item.id, Number(item.unit_cost || 0)));
+      balanceValue = (stockRows || []).reduce(
+        (sum: number, row: any) => sum + Number(row.current_quantity || 0) * Number(itemCostMap.get(row.inventory_item_id) || 0),
+        0
+      );
+    }
+
+    const { data: movements, error: movementError } = await supabaseAdmin
+      .from('stock_movements')
+      .select('movement_type, quantity, unit_cost, created_at')
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .gte('created_at', `${dateFrom}T00:00:00.000Z`)
+      .lte('created_at', `${dateTo}T23:59:59.999Z`);
+    if (movementError) {
+      return res.status(500).json({ error: movementError.message });
+    }
+
+    let receivedValue = 0;
+    let issuedValue = 0;
+    (movements || []).forEach((row: any) => {
+      const quantity = Math.abs(Number(row.quantity || 0));
+      const unitCost = Number(row.unit_cost || 0);
+      const value = quantity * unitCost;
+      const movementType = String(row.movement_type || '').toLowerCase();
+      if (['receipt', 'return', 'transfer_in', 'adjustment'].includes(movementType)) {
+        receivedValue += value;
+      }
+      if (['issue', 'out', 'transfer_out'].includes(movementType)) {
+        issuedValue += value;
+      }
+    });
+
+    return res.json({
+      totalValue: Number((receivedValue + balanceValue).toFixed(2)),
+      receivedValue: Number(receivedValue.toFixed(2)),
+      issuedValue: Number(issuedValue.toFixed(2)),
+      balanceValue: Number(balanceValue.toFixed(2)),
+      dateFrom,
+      dateTo,
+    });
+  } catch (error: any) {
+    console.error('Cost report error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/reports/financial/wastage', async (req, res) => {
+  try {
+    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const year = Number(req.query.year || new Date().getUTCFullYear());
+    const dateFrom = `${year}-01-01`;
+    const dateTo = `${year}-12-31`;
+
+    const { data: movements, error } = await supabaseAdmin
+      .from('stock_movements')
+      .select('movement_type, quantity, unit_cost, created_at')
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .gte('created_at', `${dateFrom}T00:00:00.000Z`)
+      .lte('created_at', `${dateTo}T23:59:59.999Z`);
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    let expiredValue = 0;
+    let damagedValue = 0;
+    let totalWastageValue = 0;
+    let receivedBaseValue = 0;
+
+    (movements || []).forEach((row: any) => {
+      const quantity = Math.abs(Number(row.quantity || 0));
+      const unitCost = Number(row.unit_cost || 0);
+      const value = quantity * unitCost;
+      const movementType = String(row.movement_type || '').toLowerCase();
+      if (['receipt', 'return', 'transfer_in', 'adjustment'].includes(movementType)) {
+        receivedBaseValue += value;
+      }
+      if (movementType === 'expired') expiredValue += value;
+      if (movementType === 'damaged') damagedValue += value;
+      if (['expired', 'damaged', 'loss'].includes(movementType)) totalWastageValue += value;
+    });
+
+    const wastageRate = receivedBaseValue > 0 ? (totalWastageValue / receivedBaseValue) * 100 : 0;
+    return res.json({
+      year,
+      expiredValue: Number(expiredValue.toFixed(2)),
+      damagedValue: Number(damagedValue.toFixed(2)),
+      totalWastageValue: Number(totalWastageValue.toFixed(2)),
+      wastageRate: Number(wastageRate.toFixed(2)),
+    });
+  } catch (error: any) {
+    console.error('Wastage report error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/reports/financial/activity', async (req, res) => {
+  try {
+    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const dateFrom = parseOptionalDateParam(req.query.dateFrom) || addMonthsUtc(new Date(), -1).toISOString().slice(0, 10);
+    const dateTo = parseOptionalDateParam(req.query.dateTo) || new Date().toISOString().slice(0, 10);
+
+    const { data, error } = await supabaseAdmin
+      .from('stock_movements')
+      .select('movement_type, quantity, created_at')
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .gte('created_at', `${dateFrom}T00:00:00.000Z`)
+      .lte('created_at', `${dateTo}T23:59:59.999Z`);
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    let totalReceived = 0;
+    let totalIssued = 0;
+    let totalLoss = 0;
+    let adjustments = 0;
+
+    (data || []).forEach((row: any) => {
+      const quantity = Math.abs(Number(row.quantity || 0));
+      const movementType = String(row.movement_type || '').toLowerCase();
+      if (['receipt', 'return', 'transfer_in'].includes(movementType)) totalReceived += quantity;
+      if (['issue', 'out', 'transfer_out'].includes(movementType)) totalIssued += quantity;
+      if (['loss', 'expired', 'damaged'].includes(movementType)) totalLoss += quantity;
+      if (movementType === 'adjustment') adjustments += quantity;
+    });
+
+    return res.json({
+      dateFrom,
+      dateTo,
+      totalReceived,
+      totalIssued,
+      totalLoss,
+      adjustments,
+    });
+  } catch (error: any) {
+    console.error('Activity report error:', error?.message || error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/reports/financial/consumption', async (req, res) => {
+  try {
+    const { actorFacilityId, actorTenantId } = await resolveActorScope(req);
+    if (!actorFacilityId || !actorTenantId) {
+      return res.status(403).json({ error: 'Missing facility or tenant context' });
+    }
+
+    const year = Number(req.query.year || new Date().getUTCFullYear());
+    const unitId = typeof req.query.dispensing_unit_id === 'string' ? req.query.dispensing_unit_id : null;
+    const yearStart = `${year}-01-01T00:00:00.000Z`;
+    const yearEnd = `${year}-12-31T23:59:59.999Z`;
+
+    let orderQuery = supabaseAdmin
+      .from('issue_orders')
+      .select('id, dispensing_unit_id, issued_at')
+      .eq('facility_id', actorFacilityId)
+      .eq('tenant_id', actorTenantId)
+      .eq('status', 'issued')
+      .gte('issued_at', yearStart)
+      .lte('issued_at', yearEnd);
+    if (unitId) {
+      orderQuery = orderQuery.eq('dispensing_unit_id', unitId);
+    }
+
+    const { data: orders, error: orderError } = await orderQuery;
+    if (orderError) {
+      return res.status(500).json({ error: orderError.message });
+    }
+    const orderIds = (orders || []).map((order: any) => order.id);
+    if (orderIds.length === 0) {
+      return res.json({ year, rows: [] });
+    }
+
+    const issuedAtByOrder = new Map<string, string>();
+    (orders || []).forEach((order: any) => issuedAtByOrder.set(order.id, order.issued_at));
+
+    const { data: items, error: itemError } = await supabaseAdmin
+      .from('issue_order_items')
+      .select(`
+        order_id,
+        qty_issued,
+        inventory_items:inventory_item_id (category)
+      `)
+      .in('order_id', orderIds);
+    if (itemError) {
+      return res.status(500).json({ error: itemError.message });
+    }
+
+    const rowsByCategory = new Map<string, any>();
+    (items || []).forEach((item: any) => {
+      const issuedAt = issuedAtByOrder.get(item.order_id);
+      if (!issuedAt) return;
+      const month = new Date(issuedAt).getUTCMonth();
+      const category = (item.inventory_items as any)?.category || 'Uncategorized';
+      const current = rowsByCategory.get(category) || {
+        category,
+        jan: 0,
+        feb: 0,
+        mar: 0,
+        q1Total: 0,
+        average: 0,
+      };
+      const quantity = Number(item.qty_issued || 0);
+      if (month === 0) current.jan += quantity;
+      if (month === 1) current.feb += quantity;
+      if (month === 2) current.mar += quantity;
+      current.q1Total = current.jan + current.feb + current.mar;
+      current.average = Number((current.q1Total / 3).toFixed(2));
+      rowsByCategory.set(category, current);
+    });
+
+    return res.json({
+      year,
+      rows: Array.from(rowsByCategory.values()).sort((a, b) => a.category.localeCompare(b.category)),
+    });
+  } catch (error: any) {
+    console.error('Consumption report error:', error?.message || error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });

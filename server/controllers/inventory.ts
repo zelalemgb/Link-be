@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import { supabaseAdmin } from '../config/supabase.js';
 import { z } from 'zod';
 import { isAuditDurabilityError, recordAuditEvent } from '../services/audit-log.js';
+import { assertInventoryUnlocked } from '../services/inventoryLockService.js';
 
 const isInventoryDebug = process.env.INVENTORY_DEBUG === 'true';
 const sendContractError = (res: Response, status: number, code: string, message: string) =>
@@ -23,12 +24,13 @@ const createItemSchema = z.object({
 const stockMovementSchema = z.object({
     inventory_item_id: z.string().uuid(),
     movement_type: z.enum(['receipt', 'issue', 'adjustment', 'loss', 'return']),
-    quantity: z.number().positive(),
+    quantity: z.coerce.number().int().positive(),
     batch_number: z.string().optional(),
     expiry_date: z.string().optional(), // ISO date string
     notes: z.string().optional(),
-    unit_cost: z.number().optional(),
+    unit_cost: z.coerce.number().min(0).optional(),
     reference_number: z.string().optional(),
+    adjustment_direction: z.enum(['increase', 'decrease']).optional(),
 });
 
 // --- Controllers ---
@@ -212,7 +214,7 @@ export const processStockMovement = async (req: Request, res: Response) => {
         return res.status(400).json({ error: parsed.error.issues[0]?.message });
     }
 
-    const { inventory_item_id, movement_type, quantity, batch_number, expiry_date, notes, unit_cost, reference_number } = parsed.data;
+    const { inventory_item_id, movement_type, quantity, batch_number, expiry_date, notes, unit_cost, reference_number, adjustment_direction } = parsed.data;
 
     // Validation: Inputs
     if (quantity <= 0) {
@@ -220,72 +222,51 @@ export const processStockMovement = async (req: Request, res: Response) => {
     }
 
     try {
-        // 1. Get Current Balance (locked read would be ideal, but for now standard read)
-        // We get the LATEST balance_after from stock_movements
-        const { data: lastMove } = await supabaseAdmin
-            .from('stock_movements')
-            .select('balance_after')
-            .eq('inventory_item_id', inventory_item_id)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-
-        const currentBalance = lastMove?.balance_after || 0;
-        let newBalance = currentBalance;
-
-        // 2. Logic based on type
-        if (['receipt', 'return'].includes(movement_type)) {
-            newBalance += quantity;
-        } else if (['issue', 'loss', 'adjustment'].includes(movement_type)) {
-            // For adjustment, if it's negative adjustment, treat as reduction. 
-            // Actually, 'adjustment' usually takes a delta or a final count. 
-            // Here we assume 'adjustment' means REMOVING stock (e.g. broken). 
-            // If we want ADDING stock via adjustment, we need a sign or separate type 'positive_adjustment'.
-            // Let's assume 'adjustment' in this context acts like 'issue' (reduction) unless specified.
-            // Better: Use signed quantity? No, schema says positive.
-            // Let's map strict types:
-            // Receipt, Return -> ADD
-            // Issue, Loss -> SUBTRACT
-            // Adjustment -> Depends. Ideally we'd have 'adjustment_add' or 'adjustment_sub'. 
-            // For safety, let's assume 'adjustment' here subtracts (e.g. inventory count correction down).
-
-            if (movement_type === 'adjustment') {
-                // Ambiguity risk. Let's forbid 'adjustment' via this generic handler without sign?
-                // Or assume user sends negative quantity? But schema says positive.
-                // Let's assume Issue/Loss reduce.
-                // If type is Adjustment, allow ONLY if we know direction.
-                // For now, treat Issue/Loss as subtract.
-                newBalance -= quantity;
-            } else {
-                // Issue/Loss
-                if (currentBalance < quantity) {
-                    return res.status(400).json({ error: `Insufficient stock. Current: ${currentBalance}, Requested: ${quantity}` });
-                }
-                newBalance -= quantity;
-            }
+        const inventoryUnlocked = await assertInventoryUnlocked({
+            tenantId,
+            facilityId,
+            action: 'post stock movements',
+        });
+        if (inventoryUnlocked.ok === false) {
+            return sendContractError(res, inventoryUnlocked.status, inventoryUnlocked.code, inventoryUnlocked.message);
         }
 
-        // 3. Insert Movement
-        const { data, error } = await supabaseAdmin
-            .from('stock_movements')
-            .insert({
-                inventory_item_id,
-                facility_id: facilityId,
-                tenant_id: tenantId,
-                movement_type,
-                quantity,
-                balance_after: newBalance,
-                batch_number,
-                expiry_date,
-                unit_cost,
-                created_by: profileId,
-                notes,
-                reference_number
-            })
-            .select()
-            .single();
+        const { data, error } = await supabaseAdmin.rpc('backend_create_stock_movement', {
+            p_actor_facility_id: facilityId,
+            p_actor_tenant_id: tenantId,
+            p_actor_profile_id: profileId,
+            p_inventory_item_id: inventory_item_id,
+            p_movement_type: movement_type,
+            p_quantity: quantity,
+            p_batch_number: batch_number || null,
+            p_expiry_date: expiry_date || null,
+            p_notes: notes || null,
+            p_unit_cost: unit_cost ?? null,
+            p_reference_number: reference_number || null,
+            p_adjustment_direction: adjustment_direction || null,
+        });
 
-        if (error) return res.status(500).json({ error: error.message });
+        if (error) {
+            const normalized = (error.message || '').toLowerCase();
+            if (normalized.includes('missing facility or tenant')) {
+                return sendContractError(res, 403, 'TENANT_MISSING_SCOPE_CONTEXT', 'Missing facility or tenant context');
+            }
+            if (normalized.includes('not found')) {
+                return res.status(404).json({ error: error.message });
+            }
+            if (normalized.includes('outside your facility')) {
+                return res.status(403).json({ error: error.message });
+            }
+            if (normalized.includes('unsupported movement type') || normalized.includes('adjustment direction') || normalized.includes('quantity must be greater than zero')) {
+                return res.status(400).json({ error: error.message });
+            }
+            if (normalized.includes('insufficient stock')) {
+                return res.status(409).json({ error: error.message });
+            }
+            return res.status(500).json({ error: error.message });
+        }
+
+        const movement = Array.isArray(data) ? data[0] : data;
 
         await recordAuditEvent({
             action: 'create_stock_movement',
@@ -297,24 +278,25 @@ export const processStockMovement = async (req: Request, res: Response) => {
             actorRole: req.user?.role || null,
             actorIpAddress: req.ip || req.socket?.remoteAddress || null,
             actorUserAgent: req.get('user-agent') || null,
-            entityId: data?.id || null,
+            entityId: movement?.id || null,
             actionCategory: 'inventory',
             metadata: {
                 inventoryItemId: inventory_item_id,
-                movementType: movement_type,
+                movementType: movement?.movement_type || movement_type,
                 quantity,
-                balanceAfter: newBalance,
+                balanceAfter: movement?.balance_after ?? null,
                 referenceNumber: reference_number || null,
+                adjustmentDirection: adjustment_direction || null,
             },
             requestId: req.requestId || null,
         }, {
             strict: true,
             outboxEventType: 'audit.inventory.stock_movement.create.write_failed',
             outboxAggregateType: 'stock_movement',
-            outboxAggregateId: data?.id || null,
+            outboxAggregateId: movement?.id || null,
         });
 
-        return res.status(201).json(data);
+        return res.status(201).json(movement);
 
     } catch (err: any) {
         console.error('processStockMovement error:', err?.message || err);
