@@ -156,12 +156,12 @@ const listQuerySchema = z.object({
   status: z.enum(['pending', 'triaged', 'linked', 'expired']).optional(),
 });
 
-router.get('/pretriage', requireUser, requireScopedUser, async (req: Request & { user?: any; scope?: any }, res: Response) => {
+router.get('/pretriage', requireUser, requireScopedUser, async (req: Request & { user?: any }, res: Response) => {
   const q = listQuerySchema.safeParse(req.query);
   if (!q.success) return res.status(400).json({ error: 'Bad query' });
 
-  const facilityId = req.scope?.facilityId;
-  if (!facilityId) return res.status(400).json({ error: 'No facility in scope' });
+  const facilityId = req.user?.facilityId;
+  if (!facilityId) return res.status(403).json({ error: 'Missing facility context' });
 
   let query = supabaseAdmin
     .from('pre_triage_requests')
