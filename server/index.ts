@@ -47,6 +47,7 @@ import { subscriptionGuard } from './middleware/subscriptionGuard';
 import { recordResponseStatus } from './services/monitoring';
 import { recordPlatformActivityEvent } from './services/platform-activity';
 import { buildPlatformActivitySearchClauses, buildPlatformFailureFilter } from './services/platformActivityFilters';
+import { matchesPlatformTrafficScope, resolvePlatformTrafficScope } from './services/platformTrafficScope';
 import { normalizeWorkspaceMetadata } from './services/workspaceMetadata';
 
 export const app = express();
@@ -1381,6 +1382,7 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
   const filterFacilityId = (req.query.facilityId as string | undefined) || 'all';
   const filterRole = (req.query.role as string | undefined) || 'all';
   const filterStatus = (req.query.status as string | undefined) || 'all';
+  const trafficScope = resolvePlatformTrafficScope(req.query.trafficScope as string | undefined);
   const activitySearch = q.replace(/[,]/g, ' ').trim();
 
   const applyPlatformActivityBaseFilters = (query: any) => {
@@ -1409,9 +1411,14 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
     return applyPlatformActivityBaseFilters(query).or(buildPlatformFailureFilter(activitySearch));
   };
 
+  const applyPlatformFailureBaseFilters = (query: any) => {
+    return applyPlatformActivityBaseFilters(query).or(buildPlatformFailureFilter(''));
+  };
+
   try {
     const now = new Date();
     const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const last7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const last30d = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
     const [
@@ -1421,17 +1428,17 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
       { data: approvals },
       { data: recentActivity },
       { data: recentErrors },
-      totalEvents24hResult,
-      goroShortcut24hResult,
-      errorEvents24hResult,
-      clinicRegistrations30dResult,
-      soloProviderRegistrations30dResult,
       { data: sessionEndDurations },
+      { data: activityWindow24h },
+      { data: activityWindow7d },
+      { data: errorWindow24h },
+      { data: clinicRegistrationRows30d },
+      { data: soloProviderRegistrationRows30d },
     ] = await Promise.all([
       supabaseAdmin.from('tenants').select('id, name, subdomain, is_active, created_at'),
       supabaseAdmin
         .from('facilities')
-        .select('id, tenant_id, name, facility_type, location, address, verified, clinic_code, admin_user_id'),
+        .select('id, tenant_id, name, facility_type, location, address, verified, clinic_code, admin_user_id, activation_status'),
       supabaseAdmin
         .from('users')
         .select('id, auth_user_id, user_role, tenant_id, facility_id, verified, created_at, full_name'),
@@ -1443,66 +1450,88 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         supabaseAdmin
           .from('platform_activity_log')
           .select(
-            'id, session_id, category, event_name, outcome, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, request_method, response_status, duration_ms, error_message, ip_address, user_agent, metadata, occurred_at'
+            'id, session_id, source, category, event_name, outcome, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, request_method, response_status, duration_ms, error_message, ip_address, user_agent, referrer, metadata, occurred_at'
           )
           .order('occurred_at', { ascending: false })
-          .limit(20)
+          .limit(120)
       ),
       applyPlatformFailureFilters(
         supabaseAdmin
           .from('platform_activity_log')
           .select(
-            'id, session_id, category, source, event_name, outcome, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, request_method, response_status, duration_ms, error_message, ip_address, user_agent, metadata, occurred_at'
+            'id, session_id, category, source, event_name, outcome, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, request_method, response_status, duration_ms, error_message, ip_address, user_agent, referrer, metadata, occurred_at'
           )
           .order('occurred_at', { ascending: false })
-          .limit(10)
-      ),
-      applyPlatformActivityFilters(
-        supabaseAdmin.from('platform_activity_log').select('id', { count: 'exact', head: true }).gte('occurred_at', last24h)
+          .limit(80)
       ),
       applyPlatformActivityFilters(
         supabaseAdmin
           .from('platform_activity_log')
-          .select('id', { count: 'exact', head: true })
-          .eq('event_name', 'action.goro_quick_access.clicked')
-          .gte('occurred_at', last24h)
-      ),
-      applyPlatformFailureFilters(
-        supabaseAdmin
-          .from('platform_activity_log')
-          .select('id', { count: 'exact', head: true })
-          .gte('occurred_at', last24h)
-      ),
-      applyPlatformActivityFilters(
-        supabaseAdmin
-          .from('platform_activity_log')
-          .select('id', { count: 'exact', head: true })
-          .eq('event_name', 'registration.clinic.completed')
-          .gte('occurred_at', last30d)
-      ),
-      applyPlatformActivityFilters(
-        supabaseAdmin
-          .from('platform_activity_log')
-          .select('id', { count: 'exact', head: true })
-          .eq('event_name', 'registration.solo_provider.completed')
-          .gte('occurred_at', last30d)
-      ),
-      applyPlatformActivityFilters(
-        supabaseAdmin
-          .from('platform_activity_log')
-          .select('duration_ms')
+          .select('duration_ms, source, referrer, metadata')
           .eq('event_name', 'session.ended')
           .gte('occurred_at', last24h)
           .order('occurred_at', { ascending: false })
-          .limit(200)
+          .limit(400)
+      ),
+      applyPlatformActivityBaseFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('session_id, actor_email, actor_role, tenant_id, facility_id, event_name, page_path, request_path, source, referrer, metadata, occurred_at')
+          .gte('occurred_at', last24h)
+          .order('occurred_at', { ascending: false })
+          .limit(2500)
+      ),
+      applyPlatformActivityBaseFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('session_id, actor_email, actor_role, tenant_id, facility_id, event_name, page_path, request_path, source, referrer, metadata, occurred_at')
+          .gte('occurred_at', last7d)
+          .order('occurred_at', { ascending: false })
+          .limit(5000)
+      ),
+      applyPlatformFailureBaseFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('session_id, actor_email, actor_role, tenant_id, facility_id, event_name, page_path, request_path, response_status, error_message, source, referrer, metadata, occurred_at')
+          .gte('occurred_at', last24h)
+          .order('occurred_at', { ascending: false })
+          .limit(2500)
+      ),
+      applyPlatformActivityBaseFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('id, source, referrer, metadata')
+          .eq('event_name', 'registration.clinic.completed')
+          .gte('occurred_at', last30d)
+          .limit(1000)
+      ),
+      applyPlatformActivityBaseFilters(
+        supabaseAdmin
+          .from('platform_activity_log')
+          .select('id, source, referrer, metadata')
+          .eq('event_name', 'registration.solo_provider.completed')
+          .gte('occurred_at', last30d)
+          .limit(1000)
       ),
     ]);
 
+    const filterRowsByTrafficScope = (rows: any[] | null | undefined) =>
+      (rows || []).filter((row) => matchesPlatformTrafficScope(row, trafficScope));
+
+    const filteredRecentActivity = filterRowsByTrafficScope(recentActivity).slice(0, 20);
+    const filteredRecentErrors = filterRowsByTrafficScope(recentErrors).slice(0, 10);
+    const filteredActivityRows24h = filterRowsByTrafficScope(activityWindow24h);
+    const filteredActivityRows7d = filterRowsByTrafficScope(activityWindow7d);
+    const filteredErrorRows24h = filterRowsByTrafficScope(errorWindow24h);
+    const filteredSessionEndDurations = filterRowsByTrafficScope(sessionEndDurations);
+    const filteredClinicRegistrationRows30d = filterRowsByTrafficScope(clinicRegistrationRows30d);
+    const filteredSoloProviderRegistrationRows30d = filterRowsByTrafficScope(soloProviderRegistrationRows30d);
+
     const avgSessionDurationMinutes =
-      (sessionEndDurations || []).length > 0
+      filteredSessionEndDurations.length > 0
         ? Math.round(
-            (sessionEndDurations || []).reduce((sum: number, row: any) => sum + (row.duration_ms || 0), 0) /
-              Math.max((sessionEndDurations || []).length, 1) /
+            filteredSessionEndDurations.reduce((sum: number, row: any) => sum + (row.duration_ms || 0), 0) /
+              Math.max(filteredSessionEndDurations.length, 1) /
               60000
           )
         : 0;
@@ -1545,6 +1574,173 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
       return true;
     });
 
+    const activityRows24h = filteredActivityRows24h;
+    const activityRows7d = filteredActivityRows7d;
+    const errorRows24h = filteredErrorRows24h;
+
+    const getTenantIdForRow = (row: any) => row.tenant_id || (row.facility_id ? facilityMap.get(row.facility_id)?.tenant_id || null : null);
+    const getActorKeyForRow = (row: any) =>
+      row.actor_email || (row.session_id ? `session:${row.session_id}` : null);
+    const getSurfaceLabelForRow = (row: any) => row.page_path || row.request_path || row.event_name || 'Unknown surface';
+
+    const collectUnique = (rows: any[], valueForRow: (row: any) => string | null | undefined) => {
+      const values = new Set<string>();
+      for (const row of rows) {
+        const value = valueForRow(row);
+        if (value) values.add(value);
+      }
+      return values;
+    };
+
+    const countBy = (rows: any[], valueForRow: (row: any) => string | null | undefined) => {
+      const counts = new Map<string, number>();
+      for (const row of rows) {
+        const value = valueForRow(row);
+        if (!value) continue;
+        counts.set(value, (counts.get(value) || 0) + 1);
+      }
+      return counts;
+    };
+
+    const topCountEntry = (counts: Map<string, number>) =>
+      Array.from(counts.entries())
+        .sort((left, right) => {
+          if (right[1] !== left[1]) return right[1] - left[1];
+          return left[0].localeCompare(right[0]);
+        })[0] || null;
+
+    const topSurfaceFromCounts = (counts: Map<string, number>) => topCountEntry(counts)?.[0] || null;
+
+    const activeTenantIds24h = collectUnique(activityRows24h, getTenantIdForRow);
+    const activeFacilityIds24h = collectUnique(activityRows24h, (row) => row.facility_id || null);
+    const activeActorKeys24h = collectUnique(activityRows24h, getActorKeyForRow);
+    const activeFacilityIds7d = collectUnique(activityRows7d, (row) => row.facility_id || null);
+    const activeTenantIds7d = collectUnique(activityRows7d, getTenantIdForRow);
+    const affectedTenantIds24h = collectUnique(errorRows24h, getTenantIdForRow);
+    const affectedFacilityIds24h = collectUnique(errorRows24h, (row) => row.facility_id || null);
+    const affectedActorKeys24h = collectUnique(errorRows24h, getActorKeyForRow);
+
+    const roleActivityCounts24h = countBy(activityRows24h, (row) => row.actor_role || null);
+    const workflowCounts24h = countBy(activityRows24h, getSurfaceLabelForRow);
+    const surfaceErrorCounts24h = countBy(errorRows24h, getSurfaceLabelForRow);
+
+    const topActiveRoleEntry = topCountEntry(roleActivityCounts24h);
+    const topWorkflowEntry = topCountEntry(workflowCounts24h);
+    const topErrorSurfaceEntry = topCountEntry(surfaceErrorCounts24h);
+
+    const tenantErrorBuckets = new Map<
+      string,
+      { count: number; lastSeen: string | null; facilities: Set<string>; actors: Set<string>; surfaces: Map<string, number> }
+    >();
+    const facilityErrorBuckets = new Map<
+      string,
+      { count: number; lastSeen: string | null; actors: Set<string>; surfaces: Map<string, number> }
+    >();
+
+    for (const row of errorRows24h) {
+      const tenantId = getTenantIdForRow(row);
+      const facilityId = row.facility_id || null;
+      const actorKey = getActorKeyForRow(row);
+      const surface = getSurfaceLabelForRow(row);
+
+      if (tenantId) {
+        if (!tenantErrorBuckets.has(tenantId)) {
+          tenantErrorBuckets.set(tenantId, {
+            count: 0,
+            lastSeen: null,
+            facilities: new Set<string>(),
+            actors: new Set<string>(),
+            surfaces: new Map<string, number>(),
+          });
+        }
+        const bucket = tenantErrorBuckets.get(tenantId)!;
+        bucket.count += 1;
+        bucket.lastSeen = bucket.lastSeen && bucket.lastSeen > row.occurred_at ? bucket.lastSeen : row.occurred_at;
+        if (facilityId) bucket.facilities.add(facilityId);
+        if (actorKey) bucket.actors.add(actorKey);
+        bucket.surfaces.set(surface, (bucket.surfaces.get(surface) || 0) + 1);
+      }
+
+      if (facilityId) {
+        if (!facilityErrorBuckets.has(facilityId)) {
+          facilityErrorBuckets.set(facilityId, {
+            count: 0,
+            lastSeen: null,
+            actors: new Set<string>(),
+            surfaces: new Map<string, number>(),
+          });
+        }
+        const bucket = facilityErrorBuckets.get(facilityId)!;
+        bucket.count += 1;
+        bucket.lastSeen = bucket.lastSeen && bucket.lastSeen > row.occurred_at ? bucket.lastSeen : row.occurred_at;
+        if (actorKey) bucket.actors.add(actorKey);
+        bucket.surfaces.set(surface, (bucket.surfaces.get(surface) || 0) + 1);
+      }
+    }
+
+    const atRiskTenants = Array.from(tenantErrorBuckets.entries())
+      .sort((left, right) => {
+        if (right[1].count !== left[1].count) return right[1].count - left[1].count;
+        return (right[1].lastSeen || '').localeCompare(left[1].lastSeen || '');
+      })
+      .slice(0, 5)
+      .map(([tenantId, bucket]) => ({
+        tenant_id: tenantId,
+        tenant_name: tenantMap.get(tenantId)?.name || tenantId,
+        error_count: bucket.count,
+        facilities_impacted: bucket.facilities.size,
+        actors_impacted: bucket.actors.size,
+        last_seen: bucket.lastSeen,
+        top_surface: topSurfaceFromCounts(bucket.surfaces) || 'Unknown surface',
+      }));
+
+    const atRiskFacilities = Array.from(facilityErrorBuckets.entries())
+      .sort((left, right) => {
+        if (right[1].count !== left[1].count) return right[1].count - left[1].count;
+        return (right[1].lastSeen || '').localeCompare(left[1].lastSeen || '');
+      })
+      .slice(0, 5)
+      .map(([facilityId, bucket]) => ({
+        facility_id: facilityId,
+        facility_name: facilityMap.get(facilityId)?.name || facilityId,
+        tenant_id: facilityMap.get(facilityId)?.tenant_id || null,
+        tenant_name: facilityMap.get(facilityId)?.tenant_id
+          ? tenantMap.get(facilityMap.get(facilityId)?.tenant_id || '')?.name || ''
+          : '',
+        error_count: bucket.count,
+        actors_impacted: bucket.actors.size,
+        last_seen: bucket.lastSeen,
+        top_surface: topSurfaceFromCounts(bucket.surfaces) || 'Unknown surface',
+      }));
+
+    const quietFacilitiesAll = filteredFacilities
+      .filter((facility: any) => facility.verified && !activeFacilityIds7d.has(facility.id))
+      .map((facility: any) => ({
+        facility_id: facility.id,
+        facility_name: facility.name,
+        tenant_id: facility.tenant_id,
+        tenant_name: tenantMap.get(facility.tenant_id)?.name || '',
+        reason: 'No platform activity in the last 7 days',
+      }));
+    const quietFacilities = quietFacilitiesAll.slice(0, 5);
+
+    const newTenants7d = filteredTenants.filter((tenant: any) => {
+      const createdAt = tenant.created_at ? new Date(tenant.created_at).getTime() : Number.NaN;
+      return Number.isFinite(createdAt) && createdAt >= new Date(last7d).getTime();
+    });
+    const newTenantsWithoutActivity7d = newTenants7d.filter((tenant: any) => !activeTenantIds7d.has(tenant.id));
+
+    let likelyNextIssue = 'No clear escalation cluster from current telemetry.';
+    if (atRiskTenants.length > 0) {
+      likelyNextIssue = `${atRiskTenants[0].tenant_name} is the hottest failure cluster, led by ${atRiskTenants[0].top_surface}.`;
+    } else if (quietFacilities.length > 0) {
+      likelyNextIssue = `${quietFacilities[0].facility_name} is live but quiet. Confirm whether the team is blocked, offline, or disengaged.`;
+    } else if (newTenantsWithoutActivity7d.length > 0) {
+      likelyNextIssue = `${newTenantsWithoutActivity7d.length} new tenant${newTenantsWithoutActivity7d.length === 1 ? '' : 's'} have not shown activity in 7 days.`;
+    } else if (filteredApprovals.length > 0) {
+      likelyNextIssue = `${filteredApprovals.length} approval${filteredApprovals.length === 1 ? '' : 's'} are still waiting and may delay first-value.`;
+    }
+
     return res.json({
       tenants: filteredTenants,
       facilities: filteredFacilities,
@@ -1561,28 +1757,55 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         facility_name: facilityMap.get(a.facility_id)?.name || '',
       })),
       activitySummary: {
-        events24h: totalEvents24hResult.count || 0,
-        goroQuickAccess24h: goroShortcut24hResult.count || 0,
-        errors24h: errorEvents24hResult.count || 0,
-        clinicRegistrations30d: clinicRegistrations30dResult.count || 0,
-        soloProviderRegistrations30d: soloProviderRegistrations30dResult.count || 0,
+        events24h: filteredActivityRows24h.length,
+        goroQuickAccess24h: filteredActivityRows24h.filter((row: any) => row.event_name === 'action.goro_quick_access.clicked').length,
+        errors24h: filteredErrorRows24h.length,
+        clinicRegistrations30d: filteredClinicRegistrationRows30d.length,
+        soloProviderRegistrations30d: filteredSoloProviderRegistrationRows30d.length,
         avgSessionDurationMinutes,
       },
-      recentPlatformActivity: (recentActivity || []).map((row: any) => ({
+      trafficScope,
+      recentPlatformActivity: filteredRecentActivity.map((row: any) => ({
         ...row,
         tenant_name: row.tenant_id ? tenantMap.get(row.tenant_id)?.name || '' : '',
         facility_name: row.facility_id ? facilityMap.get(row.facility_id)?.name || '' : '',
       })),
-      recentPlatformErrors: (recentErrors || []).map((row: any) => ({
+      recentPlatformErrors: filteredRecentErrors.map((row: any) => ({
         ...row,
         tenant_name: row.tenant_id ? tenantMap.get(row.tenant_id)?.name || '' : '',
         facility_name: row.facility_id ? facilityMap.get(row.facility_id)?.name || '' : '',
       })),
+      insights: {
+        activeTenants24h: activeTenantIds24h.size,
+        activeFacilities24h: activeFacilityIds24h.size,
+        activeActors24h: activeActorKeys24h.size,
+        affectedTenants24h: affectedTenantIds24h.size,
+        affectedFacilities24h: affectedFacilityIds24h.size,
+        affectedActors24h: affectedActorKeys24h.size,
+        quietVerifiedFacilities7d: quietFacilitiesAll.length,
+        newTenants7d: newTenants7d.length,
+        newTenantsWithoutActivity7d: newTenantsWithoutActivity7d.length,
+        topActiveRole24h: topActiveRoleEntry
+          ? { label: topActiveRoleEntry[0], count: topActiveRoleEntry[1] }
+          : null,
+        topWorkflow24h: topWorkflowEntry
+          ? { label: topWorkflowEntry[0], count: topWorkflowEntry[1] }
+          : null,
+        topErrorSurface24h: topErrorSurfaceEntry
+          ? { label: topErrorSurfaceEntry[0], count: topErrorSurfaceEntry[1] }
+          : null,
+        topErrorTenant24h: atRiskTenants[0] || null,
+        topErrorFacility24h: atRiskFacilities[0] || null,
+        likelyNextIssue,
+        atRiskTenants,
+        atRiskFacilities,
+        quietFacilities,
+      },
       health: {
         api: { uptime: 99.9, p95ms: 250, errorRate: 0.5 },
         db: { slowQueries: 0, connections: 10, storageGb: 20 },
         queues: { natsLag: 0, outboxBacklog: 0, failedJobs: 0 },
-        sync: { offlineDevices: 0, stuckOver2h: 0 },
+        sync: { offlineDevices: 0, stuckOver2h: 0, pendingFacilities: 0 },
         sms: { successRate: 97.5, failures24h: 0 },
         incidents: { active: false },
       },

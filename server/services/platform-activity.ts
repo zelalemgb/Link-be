@@ -89,6 +89,28 @@ const sanitizeMetadata = (value: unknown) => {
   }
 };
 
+const resolveDeploymentEnvironment = () => {
+  const nodeEnv = clampText(process.env.NODE_ENV, 32)?.toLowerCase();
+  if (nodeEnv === 'production') return 'production';
+  if (nodeEnv === 'test') return 'test';
+  return 'local';
+};
+
+const resolveAppOriginHint = () =>
+  clampText(
+    process.env.FRONTEND_URL || process.env.APP_BASE_URL || process.env.BACKEND_URL || process.env.RAILWAY_STATIC_URL,
+    512
+  );
+
+const resolveReleaseSha = () =>
+  clampText(
+    process.env.RELEASE_SHA ||
+      process.env.GIT_SHA ||
+      process.env.COMMIT_SHA ||
+      process.env.K_REVISION,
+    128
+  );
+
 const mergeMetadata = (
   event: PlatformActivityEvent,
   context: PlatformActivityContext
@@ -96,6 +118,9 @@ const mergeMetadata = (
   const metadata = sanitizeMetadata(event.metadata);
   return {
     ...metadata,
+    environment: clampText((metadata as Record<string, unknown>).environment, 32) || resolveDeploymentEnvironment(),
+    app_origin: clampText((metadata as Record<string, unknown>).app_origin, 512) || resolveAppOriginHint(),
+    release_sha: clampText((metadata as Record<string, unknown>).release_sha, 128) || resolveReleaseSha(),
     actor_role_hint: clampText(event.actorRole, 128),
     actor_email_hint: clampText(event.actorEmail, 320),
     request_path: clampText(event.requestPath, 512),
