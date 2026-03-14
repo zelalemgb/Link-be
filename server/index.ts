@@ -1426,6 +1426,7 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
       { data: facilities },
       { data: users },
       { data: approvals },
+      { data: clinicApprovals },
       { data: recentActivity },
       { data: recentErrors },
       { data: sessionEndDurations },
@@ -1446,6 +1447,14 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         .from('staff_registration_requests')
         .select('id, facility_id, auth_user_id, status, created_at')
         .eq('status', 'pending'),
+      supabaseAdmin
+        .from('clinic_registrations')
+        .select(
+          'id, clinic_name, admin_name, admin_email, admin_phone, location, country, status, created_at, tenant_id, facility_id'
+        )
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false })
+        .limit(200),
       applyPlatformActivityFilters(
         supabaseAdmin
           .from('platform_activity_log')
@@ -1565,14 +1574,59 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
       return true;
     });
 
-    const filteredApprovals = (approvals ?? []).filter((a) => {
+    const filteredStaffApprovals = (approvals ?? []).filter((a) => {
       if (filterFacilityId !== 'all' && a.facility_id !== filterFacilityId) return false;
       if (filterTenantId !== 'all') {
         const fac = facilityMap.get(a.facility_id);
         if (fac && fac.tenant_id !== filterTenantId) return false;
       }
+      if (q && !String(a.auth_user_id || '').toLowerCase().includes(q)) return false;
       return true;
     });
+
+    const filteredClinicApprovals = (clinicApprovals ?? []).filter((registration) => {
+      if (filterFacilityId !== 'all' && registration.facility_id !== filterFacilityId) return false;
+      if (filterTenantId !== 'all' && registration.tenant_id !== filterTenantId) return false;
+      if (
+        q &&
+        ![
+          registration.clinic_name,
+          registration.admin_name,
+          registration.admin_email,
+          registration.location,
+          registration.country,
+        ]
+          .filter(Boolean)
+          .some((value: string) => value.toLowerCase().includes(q))
+      ) {
+        return false;
+      }
+      return true;
+    });
+
+    const filteredApprovals = [
+      ...filteredClinicApprovals.map((registration) => ({
+        id: registration.id,
+        request_type: 'clinic_registration',
+        clinic_name: registration.clinic_name,
+        admin_name: registration.admin_name,
+        admin_email: registration.admin_email,
+        admin_phone: registration.admin_phone,
+        location: registration.location,
+        country: registration.country,
+        tenant_id: registration.tenant_id,
+        facility_id: registration.facility_id,
+        status: registration.status,
+        created_at: registration.created_at,
+        notes: registration.admin_phone || registration.admin_email,
+        tenant_name: registration.tenant_id ? tenantMap.get(registration.tenant_id)?.name || '' : '',
+        facility_name: registration.facility_id ? facilityMap.get(registration.facility_id)?.name || '' : '',
+      })),
+      ...filteredStaffApprovals.map((approval) => ({
+        ...approval,
+        request_type: 'staff_registration',
+      })),
+    ].sort((left, right) => String(right.created_at || '').localeCompare(String(left.created_at || '')));
 
     const activityRows24h = filteredActivityRows24h;
     const activityRows7d = filteredActivityRows7d;
@@ -1749,13 +1803,18 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         tenant_name: tenantMap.get(u.tenant_id)?.name || '',
         facility_name: facilityMap.get(u.facility_id)?.name || '',
       })),
-      approvals: filteredApprovals.map((a) => ({
-        ...a,
-        tenant_name: facilityMap.get(a.facility_id)?.tenant_id
-          ? tenantMap.get(facilityMap.get(a.facility_id)?.tenant_id ?? '')?.name
-          : '',
-        facility_name: facilityMap.get(a.facility_id)?.name || '',
-      })),
+      approvals: filteredApprovals.map((a) => {
+        if (a.request_type === 'clinic_registration') {
+          return a;
+        }
+        return {
+          ...a,
+          tenant_name: facilityMap.get(a.facility_id)?.tenant_id
+            ? tenantMap.get(facilityMap.get(a.facility_id)?.tenant_id ?? '')?.name
+            : '',
+          facility_name: facilityMap.get(a.facility_id)?.name || '',
+        };
+      }),
       activitySummary: {
         events24h: filteredActivityRows24h.length,
         goroQuickAccess24h: filteredActivityRows24h.filter((row: any) => row.event_name === 'action.goro_quick_access.clicked').length,
