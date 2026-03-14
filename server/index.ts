@@ -46,6 +46,7 @@ import dhis2Router from './routes/dhis2';
 import { subscriptionGuard } from './middleware/subscriptionGuard';
 import { recordResponseStatus } from './services/monitoring';
 import { recordPlatformActivityEvent } from './services/platform-activity';
+import { buildPlatformActivitySearchClauses, buildPlatformFailureFilter } from './services/platformActivityFilters';
 import { normalizeWorkspaceMetadata } from './services/workspaceMetadata';
 
 export const app = express();
@@ -1382,7 +1383,7 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
   const filterStatus = (req.query.status as string | undefined) || 'all';
   const activitySearch = q.replace(/[,]/g, ' ').trim();
 
-  const applyPlatformActivityFilters = (query: any) => {
+  const applyPlatformActivityBaseFilters = (query: any) => {
     let nextQuery = query;
     if (filterTenantId !== 'all') {
       nextQuery = nextQuery.eq('tenant_id', filterTenantId);
@@ -1393,17 +1394,19 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
     if (filterRole !== 'all') {
       nextQuery = nextQuery.eq('actor_role', filterRole);
     }
+    return nextQuery;
+  };
+
+  const applyPlatformActivityFilters = (query: any) => {
+    let nextQuery = applyPlatformActivityBaseFilters(query);
     if (activitySearch) {
-      nextQuery = nextQuery.or(
-        [
-          `event_name.ilike.%${activitySearch}%`,
-          `page_path.ilike.%${activitySearch}%`,
-          `actor_email.ilike.%${activitySearch}%`,
-          `error_message.ilike.%${activitySearch}%`,
-        ].join(',')
-      );
+      nextQuery = nextQuery.or(buildPlatformActivitySearchClauses(activitySearch).join(','));
     }
     return nextQuery;
+  };
+
+  const applyPlatformFailureFilters = (query: any) => {
+    return applyPlatformActivityBaseFilters(query).or(buildPlatformFailureFilter(activitySearch));
   };
 
   try {
@@ -1445,13 +1448,12 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
           .order('occurred_at', { ascending: false })
           .limit(20)
       ),
-      applyPlatformActivityFilters(
+      applyPlatformFailureFilters(
         supabaseAdmin
           .from('platform_activity_log')
           .select(
-            'id, session_id, source, event_name, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, request_method, response_status, duration_ms, error_message, ip_address, user_agent, metadata, occurred_at'
+            'id, session_id, category, source, event_name, outcome, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, request_method, response_status, duration_ms, error_message, ip_address, user_agent, metadata, occurred_at'
           )
-          .eq('category', 'error')
           .order('occurred_at', { ascending: false })
           .limit(10)
       ),
@@ -1465,11 +1467,10 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
           .eq('event_name', 'action.goro_quick_access.clicked')
           .gte('occurred_at', last24h)
       ),
-      applyPlatformActivityFilters(
+      applyPlatformFailureFilters(
         supabaseAdmin
           .from('platform_activity_log')
           .select('id', { count: 'exact', head: true })
-          .eq('category', 'error')
           .gte('occurred_at', last24h)
       ),
       applyPlatformActivityFilters(
