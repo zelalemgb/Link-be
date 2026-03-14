@@ -483,6 +483,55 @@ const invokeClinicRegistrationReview = async (
   return payload;
 };
 
+const invokeClinicApprovalEmail = async (
+  req: express.Request,
+  input: {
+    facilityId: string;
+    clinicName: string;
+    clinicCode?: string | null;
+    adminName?: string | null;
+    activationStatus?: 'testing' | 'active';
+  }
+) => {
+  const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/+$/, '');
+  const apikey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+  const authHeader = req.header('authorization') || '';
+
+  if (!supabaseUrl || !apikey || !authHeader) {
+    throw new Error('Clinic approval email function is not configured');
+  }
+
+  const response = await fetch(`${supabaseUrl}/functions/v1/send-clinic-approval-email`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey,
+      Authorization: authHeader,
+    },
+    body: JSON.stringify({
+      facilityId: input.facilityId,
+      clinicName: input.clinicName,
+      clinicCode: input.clinicCode || '',
+      adminName: input.adminName || '',
+      activationStatus: input.activationStatus || 'testing',
+    }),
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(
+      String(payload?.error || payload?.message || `Clinic approval email failed with status ${response.status}`)
+    );
+  }
+
+  if (payload?.success === false) {
+    throw new Error(String(payload?.error || payload?.message || 'Clinic approval email failed'));
+  }
+
+  return payload;
+};
+
 app.post(
   '/api/clinics',
   rateLimit({ windowMs: 15 * 60 * 1000, limit: 30 }),
@@ -2061,6 +2110,66 @@ app.post('/api/super-admin/approvals/:id/review', requireUser, superAdminGuard, 
     return res.json({ success: true, requestType, action });
   } catch (error: any) {
     const mapped = mapSuperAdminApprovalError(error?.message || 'Failed to review approval');
+    return res.status(mapped.status).json({ error: mapped.error });
+  }
+});
+
+app.post('/api/super-admin/facilities/:id/resend-approval-email', requireUser, superAdminGuard, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const { data: facility, error } = await supabaseAdmin
+      .from('facilities')
+      .select('id, name, clinic_code, verified, admin_user_id, activation_status, notes')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    if (!facility?.id) {
+      return res.status(404).json({ error: 'Facility not found' });
+    }
+
+    if (!facility.verified) {
+      return res.status(409).json({ error: 'Only approved facilities can resend the approval email' });
+    }
+
+    if (facility.admin_user_id) {
+      return res.status(409).json({ error: 'This facility already has an admin account' });
+    }
+
+    let adminName = '';
+    if (facility.notes) {
+      try {
+        const parsedNotes = typeof facility.notes === 'string' ? JSON.parse(facility.notes) : facility.notes;
+        if (typeof parsedNotes?.admin_name === 'string') {
+          adminName = parsedNotes.admin_name.trim();
+        }
+      } catch (parseError) {
+        console.warn('super-admin resend approval email notes parse failed:', parseError);
+      }
+    }
+
+    const result = await invokeClinicApprovalEmail(req, {
+      facilityId: facility.id,
+      clinicName: facility.name,
+      clinicCode: facility.clinic_code || null,
+      adminName,
+      activationStatus:
+        facility.activation_status === 'active' || facility.activation_status === 'testing'
+          ? facility.activation_status
+          : 'testing',
+    });
+
+    return res.json({
+      success: true,
+      facilityId: facility.id,
+      emailSent: result?.success !== false,
+    });
+  } catch (error: any) {
+    const mapped = mapSuperAdminApprovalError(error?.message || 'Failed to resend clinic approval email');
     return res.status(mapped.status).json({ error: mapped.error });
   }
 });

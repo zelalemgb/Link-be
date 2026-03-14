@@ -18,3 +18,12 @@ test('super admin review route is wired for clinic and staff approvals', () => {
   assert.match(source, /review-clinic-registration/);
   assert.match(source, /backend_approve_staff_registration_request/);
 });
+
+test('super admin can resend approval emails for approved facilities without admins', () => {
+  const source = fs.readFileSync(path.resolve(process.cwd(), 'server/index.ts'), 'utf8');
+
+  assert.match(source, /app\.post\('\/api\/super-admin\/facilities\/:id\/resend-approval-email'/);
+  assert.match(source, /send-clinic-approval-email/);
+  assert.match(source, /Only approved facilities can resend the approval email/);
+  assert.match(source, /This facility already has an admin account/);
+});
