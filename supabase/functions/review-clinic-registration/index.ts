@@ -555,6 +555,26 @@ Deno.serve(async (req) => {
 
       console.log(`Facility ${registrationId} approved with activation_status: ${activationType}`);
 
+      // Provision 30-day trial on the tenant
+      if (facility.tenant_id) {
+        const trialStarted = new Date().toISOString();
+        const trialExpires = new Date(Date.now() + 30 * 86_400_000).toISOString();
+        const { error: trialError } = await supabaseAdmin
+          .from('tenants')
+          .update({
+            subscription_status: 'trial',
+            trial_started_at: trialStarted,
+            trial_expires_at: trialExpires,
+          })
+          .eq('id', facility.tenant_id);
+
+        if (trialError) {
+          console.error('Failed to provision trial:', trialError.message);
+        } else {
+          console.log(`Trial provisioned for tenant ${facility.tenant_id}, expires ${trialExpires}`);
+        }
+      }
+
       // Send approval email with onboarding link
       const emailResult = await sendApprovalEmail(
         resolvedAdmin.adminEmail,
@@ -655,6 +675,26 @@ Deno.serve(async (req) => {
 
       tenantId = tenantInsert.id as string;
 
+      // Provision 30-day trial on the new tenant
+      {
+        const trialStarted = new Date().toISOString();
+        const trialExpires = new Date(Date.now() + 30 * 86_400_000).toISOString();
+        const { error: trialError } = await supabaseAdmin
+          .from('tenants')
+          .update({
+            subscription_status: 'trial',
+            trial_started_at: trialStarted,
+            trial_expires_at: trialExpires,
+          })
+          .eq('id', tenantId);
+
+        if (trialError) {
+          console.error('Failed to provision trial for new tenant:', trialError.message);
+        } else {
+          console.log(`Trial provisioned for new tenant ${tenantId}, expires ${trialExpires}`);
+        }
+      }
+
       const { data: codeData, error: codeErr } = await supabaseAdmin.rpc('generate_clinic_code', {
         clinic_name_input: normalizedClinicName,
       });
@@ -720,6 +760,34 @@ Deno.serve(async (req) => {
 
       if (approveErr) {
         throw new Error(approveErr.message);
+      }
+    }
+
+    // Provision trial if tenant doesn't have one yet
+    if (tenantId) {
+      const { data: existingTenant } = await supabaseAdmin
+        .from('tenants')
+        .select('trial_started_at')
+        .eq('id', tenantId)
+        .maybeSingle();
+
+      if (existingTenant && !existingTenant.trial_started_at) {
+        const trialStarted = new Date().toISOString();
+        const trialExpires = new Date(Date.now() + 30 * 86_400_000).toISOString();
+        const { error: trialError } = await supabaseAdmin
+          .from('tenants')
+          .update({
+            subscription_status: 'trial',
+            trial_started_at: trialStarted,
+            trial_expires_at: trialExpires,
+          })
+          .eq('id', tenantId);
+
+        if (trialError) {
+          console.error('Failed to provision trial for existing tenant:', trialError.message);
+        } else {
+          console.log(`Trial provisioned for existing tenant ${tenantId}, expires ${trialExpires}`);
+        }
       }
     }
 
