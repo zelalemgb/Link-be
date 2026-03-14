@@ -80,10 +80,8 @@ const resolveRequestedModules = (setupMode: RequestedSetupMode, requestedModules
 const normalizeFrontendOrigin = (value: string) => value.replace(/#.*$/, '').replace(/\/+$/, '');
 
 const buildClinicOnboardingUrl = (facilityId: string, adminEmail: string) => {
-  // The web app uses HashRouter in production (/#/...), so keep hash routes to avoid
-  // depending on server-side rewrites for deep links.
   const origin = normalizeFrontendOrigin(FRONTEND_URL);
-  return `${origin}/#/auth/clinic-onboarding?facility=${facilityId}&email=${encodeURIComponent(adminEmail)}`;
+  return `${origin}/auth/clinic-onboarding?facility=${facilityId}&email=${encodeURIComponent(adminEmail)}`;
 };
 
 const corsHeaders = {
