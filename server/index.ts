@@ -1440,7 +1440,7 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         supabaseAdmin
           .from('platform_activity_log')
           .select(
-            'id, session_id, category, event_name, outcome, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, response_status, duration_ms, error_message, metadata, occurred_at'
+            'id, session_id, category, event_name, outcome, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, request_method, response_status, duration_ms, error_message, ip_address, user_agent, metadata, occurred_at'
           )
           .order('occurred_at', { ascending: false })
           .limit(20)
@@ -1449,7 +1449,7 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         supabaseAdmin
           .from('platform_activity_log')
           .select(
-            'id, session_id, event_name, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, response_status, duration_ms, error_message, metadata, occurred_at'
+            'id, session_id, source, event_name, actor_email, actor_role, tenant_id, facility_id, page_path, page_title, entry_point, request_path, request_method, response_status, duration_ms, error_message, ip_address, user_agent, metadata, occurred_at'
           )
           .eq('category', 'error')
           .order('occurred_at', { ascending: false })
