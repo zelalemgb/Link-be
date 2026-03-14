@@ -1438,7 +1438,7 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
       supabaseAdmin.from('tenants').select('id, name, subdomain, is_active, created_at'),
       supabaseAdmin
         .from('facilities')
-        .select('id, tenant_id, name, facility_type, location, address, verified, clinic_code, admin_user_id, activation_status'),
+        .select('id, tenant_id, name, facility_type, location, address, verified, clinic_code, admin_user_id'),
       supabaseAdmin
         .from('users')
         .select('id, auth_user_id, user_role, tenant_id, facility_id, verified, created_at, full_name'),
