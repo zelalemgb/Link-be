@@ -403,6 +403,86 @@ const resolvePlatformSessionId = (req: express.Request) => {
     : null;
 };
 
+const superAdminApprovalDecisionSchema = z.object({
+  requestType: z.enum(['clinic_registration', 'staff_registration']),
+  action: z.enum(['approve', 'reject']),
+  activationType: z.enum(['testing', 'active']).optional(),
+  rejectionReason: z.string().trim().max(500).optional(),
+});
+
+const mapSuperAdminApprovalError = (message: string) => {
+  const normalized = message.toLowerCase();
+
+  if (
+    normalized.includes('not found') ||
+    normalized.includes('registration not found') ||
+    normalized.includes('request not found')
+  ) {
+    return { status: 404, error: message };
+  }
+
+  if (
+    normalized.includes('already reviewed') ||
+    normalized.includes('only pending') ||
+    normalized.includes('already approved') ||
+    normalized.includes('already rejected')
+  ) {
+    return { status: 409, error: message };
+  }
+
+  if (normalized.includes('forbidden') || normalized.includes('not authorized')) {
+    return { status: 403, error: message };
+  }
+
+  if (normalized.includes('required') || normalized.includes('invalid')) {
+    return { status: 400, error: message };
+  }
+
+  return { status: 500, error: message };
+};
+
+const invokeClinicRegistrationReview = async (
+  req: express.Request,
+  input: {
+    registrationId: string;
+    action: 'approve' | 'reject';
+    activationType: 'testing' | 'active';
+    rejectionReason?: string;
+  }
+) => {
+  const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/+$/, '');
+  const apikey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+  const authHeader = req.header('authorization') || '';
+
+  if (!supabaseUrl || !apikey || !authHeader) {
+    throw new Error('Clinic review function is not configured');
+  }
+
+  const response = await fetch(`${supabaseUrl}/functions/v1/review-clinic-registration`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey,
+      Authorization: authHeader,
+    },
+    body: JSON.stringify(input),
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(
+      String(payload?.error || payload?.message || `Clinic review failed with status ${response.status}`)
+    );
+  }
+
+  if (payload?.success === false) {
+    throw new Error(String(payload?.error || payload?.message || 'Clinic review failed'));
+  }
+
+  return payload;
+};
+
 app.post(
   '/api/clinics',
   rateLimit({ windowMs: 15 * 60 * 1000, limit: 30 }),
@@ -1445,12 +1525,12 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         .select('id, auth_user_id, user_role, tenant_id, facility_id, verified, created_at, full_name'),
       supabaseAdmin
         .from('staff_registration_requests')
-        .select('id, facility_id, auth_user_id, status, created_at')
+        .select('id, facility_id, tenant_id, auth_user_id, name, email, requested_role, status, created_at, requested_at')
         .eq('status', 'pending'),
       supabaseAdmin
         .from('clinic_registrations')
         .select(
-          'id, clinic_name, admin_name, admin_email, admin_phone, location, country, status, created_at, tenant_id, facility_id'
+          'id, clinic_name, admin_name, admin_email, admin_phone, location, address, country, email, phone_number, status, created_at, tenant_id, facility_id'
         )
         .eq('status', 'pending')
         .order('created_at', { ascending: false })
@@ -1580,7 +1660,19 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         const fac = facilityMap.get(a.facility_id);
         if (fac && fac.tenant_id !== filterTenantId) return false;
       }
-      if (q && !String(a.auth_user_id || '').toLowerCase().includes(q)) return false;
+      if (
+        q &&
+        ![
+          a.auth_user_id,
+          a.name,
+          a.email,
+          a.requested_role,
+        ]
+          .filter(Boolean)
+          .some((value: string) => value.toLowerCase().includes(q))
+      ) {
+        return false;
+      }
       return true;
     });
 
@@ -1618,6 +1710,9 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
         facility_id: registration.facility_id,
         status: registration.status,
         created_at: registration.created_at,
+        address: registration.address,
+        email: registration.email,
+        phone_number: registration.phone_number,
         notes: registration.admin_phone || registration.admin_email,
         tenant_name: registration.tenant_id ? tenantMap.get(registration.tenant_id)?.name || '' : '',
         facility_name: registration.facility_id ? facilityMap.get(registration.facility_id)?.name || '' : '',
@@ -1625,6 +1720,7 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
       ...filteredStaffApprovals.map((approval) => ({
         ...approval,
         request_type: 'staff_registration',
+        created_at: approval.requested_at || approval.created_at,
       })),
     ].sort((left, right) => String(right.created_at || '').localeCompare(String(left.created_at || '')));
 
@@ -1872,6 +1968,100 @@ app.get('/api/super-admin/dashboard', requireUser, async (req, res) => {
   } catch (err) {
     console.error('super-admin/dashboard failed', err);
     return res.status(500).json({ error: 'Unexpected error fetching super admin data' });
+  }
+});
+
+app.post('/api/super-admin/approvals/:id/review', requireUser, superAdminGuard, async (req, res) => {
+  const parsed = superAdminApprovalDecisionSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid review payload' });
+  }
+
+  const { id } = req.params;
+  const { requestType, action, activationType = 'testing', rejectionReason } = parsed.data;
+
+  try {
+    if (requestType === 'clinic_registration') {
+      const result = await invokeClinicRegistrationReview(req, {
+        registrationId: id,
+        action,
+        activationType,
+        rejectionReason,
+      });
+
+      return res.json({
+        success: true,
+        requestType,
+        action,
+        result,
+      });
+    }
+
+    if (action === 'approve') {
+      const { error } = await supabaseAdmin.rpc('backend_approve_staff_registration_request', {
+        p_actor_role: req.user?.role || null,
+        p_actor_facility_id: req.user?.facilityId || null,
+        p_actor_tenant_id: req.user?.tenantId || null,
+        p_actor_profile_id: req.user?.profileId || null,
+        p_request_id: id,
+        p_reason: rejectionReason || null,
+        p_actor_ip_address: req.ip || null,
+        p_actor_user_agent: req.get('user-agent') || null,
+        p_request_trace_id: null,
+      });
+
+      if (error) {
+        const mapped = mapSuperAdminApprovalError(error.message || 'Failed to approve staff registration request');
+        return res.status(mapped.status).json({ error: mapped.error });
+      }
+
+      return res.json({ success: true, requestType, action });
+    }
+
+    const { data: requestRow, error: loadError } = await supabaseAdmin
+      .from('staff_registration_requests')
+      .select('id, tenant_id, facility_id, status')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (loadError) {
+      return res.status(500).json({ error: loadError.message });
+    }
+
+    if (!requestRow?.id) {
+      return res.status(404).json({ error: 'Request not found' });
+    }
+
+    if (String(requestRow.status || '').toLowerCase() !== 'pending') {
+      return res.status(409).json({ error: 'Only pending requests can be rejected' });
+    }
+
+    const reviewedAt = new Date().toISOString();
+    const { data: rejectedRow, error: rejectError } = await supabaseAdmin
+      .from('staff_registration_requests')
+      .update({
+        status: 'rejected',
+        rejection_reason: rejectionReason || 'Rejected by super admin',
+        reviewed_at: reviewedAt,
+        reviewed_by: req.user?.profileId || null,
+      })
+      .eq('id', id)
+      .eq('status', 'pending')
+      .select('id')
+      .maybeSingle();
+
+    if (rejectError) {
+      return res.status(500).json({ error: rejectError.message });
+    }
+
+    if (!rejectedRow?.id) {
+      return res.status(409).json({ error: 'Only pending requests can be rejected' });
+    }
+
+    return res.json({ success: true, requestType, action });
+  } catch (error: any) {
+    const mapped = mapSuperAdminApprovalError(error?.message || 'Failed to review approval');
+    return res.status(mapped.status).json({ error: mapped.error });
   }
 });
 
