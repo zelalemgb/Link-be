@@ -86,3 +86,39 @@ test('public clinic registration POST is exempt from CSRF validation', async () 
     supabaseAdmin.from = originalFrom;
   }
 });
+
+test('direct clinic registration POST is exempt from CSRF validation', async () => {
+  const { csrfProtection } = await loadModules();
+
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.cookies = {};
+    next();
+  });
+  app.use(csrfProtection);
+  app.post('/api/auth/register-clinic', async (_req, res) => {
+    return res.status(201).json({ success: true });
+  });
+
+  const response = await request(app)
+    .post('/api/auth/register-clinic')
+    .send({
+      clinic: {
+        name: 'Opian Health Hospital',
+        country: 'Ethiopia',
+        location: 'Addis Ababa',
+        address: 'Bole',
+        phoneNumber: '+251911000111',
+      },
+      admin: {
+        name: 'Zelalem Gizachew',
+        email: 'zelalem.giz@example.com',
+        phoneNumber: '+251922333444',
+        password: 'StrongPass#1234',
+      },
+    });
+
+  assert.equal(response.status, 201);
+  assert.equal(response.body.success, true);
+});
