@@ -1817,6 +1817,8 @@ router.post('/register-clinic', async (req, res) => {
                 user_role: 'admin',
                 role: 'admin',
                 facility_id: facilityId,
+                facility_name: normalizedClinicName,
+                facility_name_hint: normalizedClinicName,
                 tenant_id: tenantId,
             },
         });
