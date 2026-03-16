@@ -114,11 +114,57 @@ const completeClinicAdminOnboardingSchema = z.object({
     name: z.string().min(2).max(120).optional(),
 });
 
+const clinicAdminOnboardingRegistrationSchema = z.object({
+    facilityId: z.string().uuid(),
+    adminEmail: z.string().email(),
+    password: z.string().min(8).max(128),
+    name: z.string().min(2).max(120).optional(),
+});
+
+const directClinicRegistrationSchema = z.object({
+    clinic: z.object({
+        name: z.string().min(2).max(100),
+        country: z.string().min(2),
+        location: z.string().min(2),
+        address: z.string().min(5),
+        phoneNumber: z.string().min(8).max(20),
+        email: z.string().email().optional().nullable(),
+    }),
+    admin: z.object({
+        name: z.string().min(2).max(100),
+        email: z.string().email(),
+        phoneNumber: z.string().min(8).max(20),
+        password: z.string().min(8).max(128),
+    }),
+});
+
 const completeProviderOnboardingSchema = z.object({
     fullName: z.string().min(2).max(120).optional(),
     phoneNumber: z.string().min(8).max(24).optional().nullable(),
     workspaceName: z.string().min(2).max(160).optional(),
 });
+
+const soloProviderRegistrationSchema = z.object({
+    email: z.string().email(),
+    password: z.string().min(8).max(128),
+    fullName: z.string().min(2).max(120),
+    phoneNumber: z.string().min(8).max(24).optional().nullable(),
+});
+
+const sendSignupVerificationEmail = async (email: string) => {
+    try {
+        const { error } = await supabaseAdmin.auth.resend({
+            type: 'signup',
+            email,
+        });
+
+        if (error) {
+            console.warn('Verification email resend failed:', error.message);
+        }
+    } catch (emailError: any) {
+        console.warn('Verification email send failed:', emailError?.message || emailError);
+    }
+};
 
 /**
  * GET /api/auth/profile
@@ -389,6 +435,79 @@ router.get('/facilities', requireUser, async (req, res) => {
 });
 
 /**
+ * POST /api/auth/clinic-admin-onboarding/register
+ * Creates the auth account for an approved clinic admin without forcing
+ * email confirmation before first sign-in. The app enforces verification
+ * later through the 3-day grace-period gate.
+ */
+router.post('/clinic-admin-onboarding/register', async (req, res) => {
+    const parsed = clinicAdminOnboardingRegistrationSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
+    }
+
+    try {
+        const { facilityId, adminEmail, password, name } = parsed.data;
+        const normalizedEmail = normalizeEmail(adminEmail);
+
+        const { data: facility, error: facilityError } = await supabaseAdmin
+            .from('facilities')
+            .select('id, tenant_id, verified, admin_user_id, name')
+            .eq('id', facilityId)
+            .maybeSingle();
+
+        if (facilityError || !facility) {
+            return res.status(404).json({ error: 'Facility not found' });
+        }
+
+        if (!facility.verified) {
+            return res.status(403).json({ error: 'Facility is not approved' });
+        }
+
+        if (facility.admin_user_id) {
+            return res.status(409).json({ error: 'Facility admin has already been assigned' });
+        }
+
+        const resolvedName = name?.trim() || normalizedEmail.split('@')[0];
+        const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+            email: normalizedEmail,
+            password,
+            email_confirm: true,
+            user_metadata: {
+                name: resolvedName,
+                full_name: resolvedName,
+                role: 'admin',
+                user_role: 'admin',
+                facility_id: facility.id,
+                tenant_id: facility.tenant_id,
+            },
+        });
+
+        if (authError || !authData.user) {
+            const message = authError?.message || 'Failed to create auth account';
+            if (/already.*registered|duplicate/i.test(message)) {
+                return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
+            }
+            return res.status(400).json({ error: message });
+        }
+
+        await sendSignupVerificationEmail(normalizedEmail);
+
+        return res.status(201).json({
+            success: true,
+            authUserId: authData.user.id,
+            facilityId: facility.id,
+            tenantId: facility.tenant_id,
+            facilityName: facility.name,
+            email: normalizedEmail,
+        });
+    } catch (err: any) {
+        console.error('Clinic admin onboarding registration error:', err?.message || err);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
  * POST /api/auth/clinic-admin-onboarding/complete
  * Finalizes clinic-admin account linkage after sign-up.
  */
@@ -450,7 +569,7 @@ router.post('/clinic-admin-onboarding/complete', requireUser, async (req, res) =
                     tenant_id: facility.tenant_id,
                     user_role: 'admin',
                     verified: true,
-                    email_verified: true,
+                    email_verified: false,
                 })
                 .select('id')
                 .single();
@@ -469,7 +588,7 @@ router.post('/clinic-admin-onboarding/complete', requireUser, async (req, res) =
                     tenant_id: facility.tenant_id,
                     user_role: 'admin',
                     verified: true,
-                    email_verified: true,
+                    email_verified: false,
                 })
                 .eq('id', userProfile.id);
 
@@ -549,6 +668,57 @@ router.post('/clinic-admin-onboarding/complete', requireUser, async (req, res) =
         });
     } catch (err: any) {
         console.error('Clinic admin onboarding completion error:', err?.message || err);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * POST /api/auth/register-provider
+ * Creates a solo provider auth account without blocking first login on
+ * email confirmation. The app still enforces verification after the 3-day
+ * grace period.
+ */
+router.post('/register-provider', async (req, res) => {
+    const parsed = soloProviderRegistrationSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
+    }
+
+    try {
+        const normalizedEmail = normalizeEmail(parsed.data.email);
+        const normalizedFullName = parsed.data.fullName.trim();
+        const normalizedPhoneNumber = parsed.data.phoneNumber?.replace(/\s+/g, '') || null;
+
+        const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+            email: normalizedEmail,
+            password: parsed.data.password,
+            email_confirm: true,
+            user_metadata: {
+                name: normalizedFullName,
+                full_name: normalizedFullName,
+                phone_number: normalizedPhoneNumber,
+                role: 'provider',
+                user_role: 'doctor',
+            },
+        });
+
+        if (authError || !authData.user) {
+            const message = authError?.message || 'Failed to create auth account';
+            if (/already.*registered|duplicate/i.test(message)) {
+                return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
+            }
+            return res.status(400).json({ error: message });
+        }
+
+        await sendSignupVerificationEmail(normalizedEmail);
+
+        return res.status(201).json({
+            success: true,
+            authUserId: authData.user.id,
+            email: normalizedEmail,
+        });
+    } catch (err: any) {
+        console.error('Provider registration error:', err?.message || err);
         return res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -781,7 +951,7 @@ router.post('/provider-onboarding/complete', requireUser, async (req, res) => {
                     role: 'provider',
                     user_role: 'doctor',
                     verified: true,
-                    email_verified: true,
+                    email_verified: false,
                 })
                 .select('id')
                 .single();
@@ -800,7 +970,7 @@ router.post('/provider-onboarding/complete', requireUser, async (req, res) => {
                 role: 'provider',
                 user_role: 'doctor',
                 verified: true,
-                email_verified: true,
+                email_verified: false,
             };
             if (normalizedPhoneNumber) {
                 providerUserUpdatePayload.phone_number = normalizedPhoneNumber;
@@ -1517,6 +1687,255 @@ router.get('/invitation/:token', async (req, res) => {
     } catch (error: any) {
         console.error('Get invitation error:', error?.message || error);
         return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * POST /api/auth/register-clinic
+ * Single-step clinic registration: creates auth user, tenant, facility,
+ * user profile, and assigns clinic-admin role. Returns session for immediate login.
+ * Email verification is soft-required for the first 3 days, then hard-required.
+ */
+router.post('/register-clinic', async (req, res) => {
+    const parsed = directClinicRegistrationSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid payload' });
+    }
+
+    const { clinic, admin } = parsed.data;
+    const normalizedAdminEmail = normalizeEmail(admin.email);
+    const normalizedClinicName = clinic.name.trim();
+
+    try {
+        // 1. Create Supabase auth user
+        // email_confirm: true so Supabase allows signInWithPassword immediately.
+        // Real email verification is tracked via users.email_verified + EmailVerificationGate
+        // which gives a 3-day grace period before requiring verification.
+        const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+            email: normalizedAdminEmail,
+            password: admin.password,
+            email_confirm: true,
+            user_metadata: {
+                name: admin.name.trim(),
+                user_role: 'admin',
+                role: 'admin',
+            },
+        });
+
+        if (authError || !authData.user) {
+            const msg = authError?.message || 'Failed to create auth account';
+            if (/already.*registered|duplicate/i.test(msg)) {
+                return res.status(409).json({ error: 'An account with this email already exists. Please sign in instead.' });
+            }
+            return res.status(400).json({ error: msg });
+        }
+
+        const authUserId = authData.user.id;
+
+        // 2. Create tenant
+        const { data: tenantInsert, error: tenantErr } = await supabaseAdmin
+            .from('tenants')
+            .insert({
+                name: normalizedClinicName,
+                is_active: true,
+                workspace_type: 'clinic',
+                setup_mode: 'recommended',
+                team_mode: 'solo',
+                enabled_modules: [
+                    'patients', 'visits', 'records', 'referrals', 'follow_up', 'link_agent', 'cdss_core',
+                    'reception', 'triage', 'cashier', 'lab', 'imaging', 'pharmacy', 'patient_app_sync', 'hew_referral_handoff',
+                ],
+            })
+            .select('id')
+            .single();
+
+        if (tenantErr || !tenantInsert?.id) {
+            // Cleanup: delete auth user on failure
+            await supabaseAdmin.auth.admin.deleteUser(authUserId).catch(() => {});
+            throw new Error(tenantErr?.message || 'Failed to create tenant');
+        }
+
+        const tenantId = tenantInsert.id as string;
+
+        // 3. Provision 30-day trial
+        try {
+            await provisionTrial(tenantId);
+        } catch (trialErr: any) {
+            console.error('Trial provisioning failed during direct registration:', trialErr?.message);
+        }
+
+        // 4. Generate clinic code
+        const { data: codeData, error: codeErr } = await supabaseAdmin.rpc('generate_clinic_code', {
+            clinic_name_input: normalizedClinicName,
+        });
+
+        const clinicCode = (codeData as string) || normalizedClinicName.substring(0, 3).toUpperCase() + Math.random().toString(36).substring(2, 6).toUpperCase();
+
+        if (codeErr) {
+            console.warn('Clinic code generation via RPC failed, using fallback:', codeErr.message);
+        }
+
+        // 5. Create facility (auto-verified, no approval needed)
+        const { data: facilityInsert, error: facilityErr } = await supabaseAdmin
+            .from('facilities')
+            .insert({
+                name: normalizedClinicName,
+                tenant_id: tenantId,
+                clinic_code: clinicCode,
+                country: clinic.country.trim(),
+                location: clinic.location.trim(),
+                address: clinic.address.trim(),
+                phone_number: clinic.phoneNumber.replace(/\s+/g, ''),
+                email: clinic.email ? clinic.email.trim().toLowerCase() : null,
+                verified: true,
+                verification_status: 'approved',
+                activation_status: 'testing',
+                admin_user_id: authUserId,
+                notes: JSON.stringify({
+                    admin_name: admin.name.trim(),
+                    admin_email: normalizedAdminEmail,
+                    admin_phone: admin.phoneNumber.replace(/\s+/g, ''),
+                    registered_via: 'direct_registration',
+                }),
+            })
+            .select('id')
+            .single();
+
+        if (facilityErr || !facilityInsert?.id) {
+            // Cleanup
+            try { await supabaseAdmin.from('tenants').delete().eq('id', tenantId); } catch {}
+            try { await supabaseAdmin.auth.admin.deleteUser(authUserId); } catch {}
+            throw new Error(facilityErr?.message || 'Failed to create facility');
+        }
+
+        const facilityId = facilityInsert.id as string;
+
+        // 6. Update auth user metadata with facility/tenant IDs
+        await supabaseAdmin.auth.admin.updateUserById(authUserId, {
+            user_metadata: {
+                name: admin.name.trim(),
+                user_role: 'admin',
+                role: 'admin',
+                facility_id: facilityId,
+                tenant_id: tenantId,
+            },
+        });
+
+        // 7. Create user profile
+        const userName = admin.name.trim();
+        const { data: userProfile, error: profileErr } = await supabaseAdmin
+            .from('users')
+            .insert({
+                auth_user_id: authUserId,
+                name: userName,
+                full_name: userName,
+                email: normalizedAdminEmail,
+                facility_id: facilityId,
+                tenant_id: tenantId,
+                user_role: 'admin',
+                verified: true,
+                email_verified: false,
+            })
+            .select('id')
+            .single();
+
+        if (profileErr || !userProfile?.id) {
+            console.error('User profile creation failed:', profileErr?.message);
+        }
+
+        // 8. Assign clinic-admin RBAC role
+        if (userProfile?.id) {
+            const { data: clinicAdminRole } = await supabaseAdmin
+                .from('roles')
+                .select('id')
+                .or('slug.eq.clinic-admin,name.eq.clinic_admin')
+                .maybeSingle();
+
+            if (clinicAdminRole?.id) {
+                try {
+                    const { error: roleInsertErr } = await supabaseAdmin.from('user_roles').insert({
+                        user_id: userProfile.id,
+                        role_id: clinicAdminRole.id,
+                        facility_id: facilityId,
+                        tenant_id: tenantId,
+                        is_active: true,
+                        assigned_by: userProfile.id,
+                    });
+                    if (roleInsertErr) {
+                        console.error('Role assignment failed:', roleInsertErr.message);
+                    }
+                } catch (roleErr: any) {
+                    console.error('Role assignment failed:', roleErr?.message);
+                }
+            }
+        }
+
+        // 9. Provision workspace defaults
+        if (userProfile?.id) {
+            try {
+                await provisionWorkspaceDefaults({
+                    tenantId,
+                    facilityId,
+                    userId: userProfile.id,
+                    workspaceType: 'clinic',
+                    setupMode: 'recommended',
+                    teamMode: 'solo',
+                });
+            } catch (provErr: any) {
+                console.error('Workspace provisioning failed:', provErr?.message);
+            }
+        }
+
+        // 10. Also record in clinic_registrations for audit trail
+        try {
+            const { error: auditErr } = await supabaseAdmin.from('clinic_registrations').insert({
+                clinic_name: normalizedClinicName,
+                country: clinic.country.trim(),
+                location: clinic.location.trim(),
+                address: clinic.address.trim(),
+                phone_number: clinic.phoneNumber.replace(/\s+/g, ''),
+                email: clinic.email ? clinic.email.trim().toLowerCase() : null,
+                admin_name: admin.name.trim(),
+                admin_email: normalizedAdminEmail,
+                admin_phone: admin.phoneNumber.replace(/\s+/g, ''),
+                status: 'approved',
+                facility_id: facilityId,
+                tenant_id: tenantId,
+            });
+            if (auditErr) console.warn('Audit registration record failed:', auditErr.message);
+        } catch (auditErr: any) {
+            console.warn('Audit registration record failed:', auditErr?.message);
+        }
+
+        // 11. Send verification email via Supabase
+        try {
+            const { error: resendErr } = await supabaseAdmin.auth.resend({
+                type: 'signup',
+                email: normalizedAdminEmail,
+            });
+            if (resendErr) console.warn('Verification email resend failed:', resendErr.message);
+        } catch (emailErr: any) {
+            console.warn('Verification email send failed:', emailErr?.message);
+        }
+
+        return res.status(201).json({
+            success: true,
+            facilityId,
+            tenantId,
+            clinicCode,
+            authUserId,
+            email: normalizedAdminEmail,
+            adminName: admin.name.trim(),
+            // The frontend will sign in using email/password directly after receiving success
+        });
+    } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        console.error('Direct clinic registration failed:', errMsg, err?.stack || '');
+        return res.status(500).json({
+            error: process.env.NODE_ENV === 'production'
+                ? 'Registration failed. Please try again.'
+                : `Registration failed: ${errMsg}`,
+        });
     }
 });
 

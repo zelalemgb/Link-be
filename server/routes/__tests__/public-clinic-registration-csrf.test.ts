@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
 import request from 'supertest';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const ensureSupabaseEnv = () => {
   process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'http://127.0.0.1';
@@ -121,4 +123,10 @@ test('direct clinic registration POST is exempt from CSRF validation', async () 
 
   assert.equal(response.status, 201);
   assert.equal(response.body.success, true);
+});
+
+test('auth router exposes the direct clinic registration route', () => {
+  const authSource = fs.readFileSync(path.resolve('server/routes/auth.ts'), 'utf8');
+  assert.match(authSource, /router\.post\('\/register-clinic', async \(req, res\) => \{/);
+  assert.match(authSource, /directClinicRegistrationSchema/);
 });
