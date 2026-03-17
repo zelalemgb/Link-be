@@ -129,9 +129,14 @@ const analyticsSchema = z.object({
   facilityId: z.string().uuid().optional(),
 });
 
-router.get('/:table', async (req, res) => {
+const delegatedTableRoutes = new Set(['departments', 'wards']);
+
+router.get('/:table', async (req, res, next) => {
   if (!ensureAdmin(req, res)) return;
   const tableKey = req.params.table;
+  if (delegatedTableRoutes.has(tableKey)) {
+    return next();
+  }
   const config = genericTables[tableKey];
   if (!config) {
     return res.status(404).json({ error: 'Unsupported table' });
@@ -166,9 +171,12 @@ router.get('/:table', async (req, res) => {
   }
 });
 
-router.post('/:table', async (req, res) => {
+router.post('/:table', async (req, res, next) => {
   if (!ensureAdmin(req, res)) return;
   const tableKey = req.params.table;
+  if (delegatedTableRoutes.has(tableKey)) {
+    return next();
+  }
   const config = genericTables[tableKey];
   if (!config) {
     return res.status(404).json({ error: 'Unsupported table' });
@@ -205,9 +213,12 @@ router.post('/:table', async (req, res) => {
   }
 });
 
-router.put('/:table/:id', async (req, res) => {
+router.put('/:table/:id', async (req, res, next) => {
   if (!ensureAdmin(req, res)) return;
   const tableKey = req.params.table;
+  if (delegatedTableRoutes.has(tableKey)) {
+    return next();
+  }
   const config = genericTables[tableKey];
   if (!config) {
     return res.status(404).json({ error: 'Unsupported table' });
@@ -263,9 +274,12 @@ router.put('/:table/:id', async (req, res) => {
   }
 });
 
-router.delete('/:table/:id', async (req, res) => {
+router.delete('/:table/:id', async (req, res, next) => {
   if (!ensureAdmin(req, res)) return;
   const tableKey = req.params.table;
+  if (delegatedTableRoutes.has(tableKey)) {
+    return next();
+  }
   const config = genericTables[tableKey];
   if (!config) {
     return res.status(404).json({ error: 'Unsupported table' });
@@ -316,9 +330,12 @@ router.delete('/:table/:id', async (req, res) => {
   }
 });
 
-router.post('/:table/bulk', async (req, res) => {
+router.post('/:table/bulk', async (req, res, next) => {
   if (!ensureAdmin(req, res)) return;
   const tableKey = req.params.table;
+  if (delegatedTableRoutes.has(tableKey)) {
+    return next();
+  }
   const config = genericTables[tableKey];
   if (!config) {
     return res.status(404).json({ error: 'Unsupported table' });
