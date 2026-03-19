@@ -5,7 +5,7 @@ const CSRF_COOKIE = 'csrf_token';
 const CSRF_HEADER = 'x-csrf-token';
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const PUBLIC_CSRF_EXEMPT_PATHS = [
-  /^\/api\/auth\/(initiate-registration|verify-registration-code|register-staff|register-clinic|request-password-reset)$/,
+  /^\/api\/auth\/(initiate-registration|verify-registration-code|register-staff|register-clinic|register-provider|request-password-reset)$/,
   /^\/api\/clinics$/,
   /^\/api\/platform-audit\/events$/,
   /^\/api\/staff-invitations\/[^/]+\/register$/,

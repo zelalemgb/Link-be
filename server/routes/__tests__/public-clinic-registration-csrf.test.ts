@@ -125,6 +125,33 @@ test('direct clinic registration POST is exempt from CSRF validation', async () 
   assert.equal(response.body.success, true);
 });
 
+test('solo provider registration POST is exempt from CSRF validation', async () => {
+  const { csrfProtection } = await loadModules();
+
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.cookies = {};
+    next();
+  });
+  app.use(csrfProtection);
+  app.post('/api/auth/register-provider', async (_req, res) => {
+    return res.status(201).json({ success: true });
+  });
+
+  const response = await request(app)
+    .post('/api/auth/register-provider')
+    .send({
+      email: 'solo@example.com',
+      password: 'StrongPass#1234',
+      fullName: 'Solo Provider',
+      phoneNumber: '+251911000111',
+    });
+
+  assert.equal(response.status, 201);
+  assert.equal(response.body.success, true);
+});
+
 test('auth router exposes the direct clinic registration route', () => {
   const authSource = fs.readFileSync(path.resolve('server/routes/auth.ts'), 'utf8');
   assert.match(authSource, /router\.post\('\/register-clinic', async \(req, res\) => \{/);

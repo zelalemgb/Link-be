@@ -7,6 +7,7 @@ import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import cookieParser from 'cookie-parser';
 import crypto from 'crypto';
+import multer from 'multer';
 
 // Config & Middleware
 import { supabaseAdmin } from './config/supabase';
@@ -28,6 +29,7 @@ import patientPortalRouter from './routes/patient-portal';
 import facilitiesRouter from './routes/facilities';
 import staffInvitationsRouter from './routes/staff-invitations';
 import adminDataRouter from './routes/admin-data';
+import frontendSupabaseRouter from './routes/frontend-supabase';
 import doctorRouter from './routes/doctor';
 import mobileRouter from './routes/mobile';
 import monitoringRouter from './routes/monitoring';
@@ -44,14 +46,21 @@ import webhookRouter from './routes/webhook';
 import agentRouter from './routes/agent';
 import dhis2Router from './routes/dhis2';
 import { subscriptionGuard } from './middleware/subscriptionGuard';
-import { recordResponseStatus } from './services/monitoring';
+import { assertMonitoringPersistenceReady, recordResponseStatus } from './services/monitoring';
 import { recordPlatformActivityEvent } from './services/platform-activity';
 import { buildPlatformActivitySearchClauses, buildPlatformFailureFilter } from './services/platformActivityFilters';
 import { matchesPlatformTrafficScope, resolvePlatformTrafficScope } from './services/platformTrafficScope';
 import { normalizeWorkspaceMetadata } from './services/workspaceMetadata';
+import { assertSharedRateLimitStoreReady, createRateLimitStore } from './services/sharedRateLimitStore';
 
 export const app = express();
 const port = process.env.PORT || 4000;
+const featureRequestAttachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10_000_000,
+  },
+});
 
 const isProduction = process.env.NODE_ENV === 'production';
 const corsOriginsRaw = process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || '';
@@ -200,14 +209,14 @@ app.use(
           if (!isProduction) {
             return originCallback(null, true);
           }
-          return originCallback(new Error('CORS not configured'));
+          return originCallback(null, false);
         }
 
         if (allowedOriginSet.has(normalizedOrigin)) {
           return originCallback(null, true);
         }
 
-        return originCallback(new Error('Origin not allowed by CORS'));
+        return originCallback(null, false);
       },
       credentials: true,
     });
@@ -249,6 +258,7 @@ const globalLimiter = rateLimit({
   limit: Number.isFinite(globalRateLimitPerWindow) && globalRateLimitPerWindow > 0
     ? globalRateLimitPerWindow
     : 240,
+  store: createRateLimitStore('api-global', globalRateLimitWindowMs),
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' },
@@ -301,16 +311,19 @@ const AUTH_PUBLIC_RATE_LIMIT_PATHS = new Set([
   '/request-password-reset',
   '/initiate-registration',
   '/verify-registration-code',
+  '/verification-codes/send',
+  '/verification-codes/verify',
   '/register-staff',
 ]);
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   limit: 15, // 15 attempts per 15 minutes
+  store: createRateLimitStore('api-auth-public', 15 * 60 * 1000),
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { error: 'Too many authentication attempts. Please try again later.' },
-  keyGenerator: (req) => req.ip || req.header('x-forwarded-for') || 'unknown',
+  keyGenerator: (req) => resolveClientIp(req),
   // Only throttle anonymous auth attempts (registration/reset/verification).
   // Authenticated profile and onboarding calls should not be blocked by this limiter.
   skip: (req) => !AUTH_PUBLIC_RATE_LIMIT_PATHS.has(req.path),
@@ -319,8 +332,9 @@ const authLimiter = rateLimit({
 const patientAuthLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
+  store: createRateLimitStore('api-patient-auth', 15 * 60 * 1000),
   message: { error: 'Too many login attempts. Please try again later.' },
-  keyGenerator: (req) => req.ip || req.header('x-forwarded-for') || 'unknown',
+  keyGenerator: (req) => resolveClientIp(req),
 });
 
 // Mount public and self-managed routes first.
@@ -337,6 +351,7 @@ app.use('/api/platform-audit', platformAuditRouter);
 app.use(subscriptionGuard);
 
 // Mount protected application routes after subscription enforcement.
+app.use('/api/frontend-supabase', frontendSupabaseRouter);
 app.use('/api/master-data', masterDataRouter);
 app.use('/api/patients', patientsRouter);
 app.use('/api/staff', staffRouter);
@@ -534,7 +549,12 @@ const invokeClinicApprovalEmail = async (
 
 app.post(
   '/api/clinics',
-  rateLimit({ windowMs: 15 * 60 * 1000, limit: 30 }),
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 30,
+    store: createRateLimitStore('api-clinic-registration', 15 * 60 * 1000),
+    keyGenerator: (req) => resolveClientIp(req),
+  }),
   async (req, res) => {
     const parsed = clinicRegistrationSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -1044,6 +1064,46 @@ app.post('/api/feature-requests', requireUser, async (req, res) => {
     return res.status(500).json({ error: 'Unexpected error' });
   }
 });
+
+app.post(
+  '/api/feature-requests/attachments',
+  requireUser,
+  featureRequestAttachmentUpload.single('file'),
+  async (req, res) => {
+    try {
+      const author = await resolveFeatureRequestAuthor(req);
+      if (!author?.profileId) {
+        return res.status(403).json({ error: 'User profile required' });
+      }
+      if (!req.file) {
+        return res.status(400).json({ error: 'File is required' });
+      }
+
+      const fileExt = (req.file.originalname.split('.').pop() || 'bin').toLowerCase();
+      const objectPath = `feedback-attachments/${author.profileId}/${Date.now()}-${crypto.randomUUID()}.${fileExt}`;
+
+      const { error: uploadError } = await supabaseAdmin.storage
+        .from('public')
+        .upload(objectPath, req.file.buffer, {
+          contentType: req.file.mimetype || 'application/octet-stream',
+          upsert: false,
+        });
+
+      if (uploadError) {
+        return res.status(500).json({ error: uploadError.message || 'Upload failed' });
+      }
+
+      const { data } = supabaseAdmin.storage
+        .from('public')
+        .getPublicUrl(objectPath);
+
+      return res.status(201).json({ publicUrl: data.publicUrl });
+    } catch (err: any) {
+      console.error('feature request attachment upload failed', err);
+      return res.status(500).json({ error: err?.message || 'Unexpected error' });
+    }
+  }
+);
 
 app.get('/api/feature-requests/me', requireUser, async (req, res) => {
   const authUserId = req.user?.authUserId;
@@ -2179,7 +2239,17 @@ app.use((_req, res) => {
 });
 
 if (require.main === module) {
-  app.listen(port, () => {
-    console.log(`API server listening on :${port}`);
+  (async () => {
+    await Promise.all([
+      assertSharedRateLimitStoreReady(),
+      assertMonitoringPersistenceReady(),
+    ]);
+
+    app.listen(port, () => {
+      console.log(`API server listening on :${port}`);
+    });
+  })().catch((error) => {
+    console.error('API server startup checks failed:', error);
+    process.exit(1);
   });
 }
