@@ -61,6 +61,9 @@ const userProfileCache = new UserProfileCache();
 type VerifiedTokenIdentity = {
     authUserId: string;
     email?: string;
+    tenantId?: string;
+    facilityId?: string;
+    role?: Role;
 };
 
 interface TokenCacheEntry {
@@ -118,6 +121,21 @@ class ValidatedTokenCache {
 }
 
 const validatedTokenCache = new ValidatedTokenCache();
+
+const readMetadataString = (value: unknown) => {
+    if (typeof value !== 'string') return undefined;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+};
+
+const extractScopeMetadata = (metadata: unknown) => {
+    const source = metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : {};
+    return {
+        tenantId: readMetadataString(source.tenant_id),
+        facilityId: readMetadataString(source.facility_id),
+        role: readMetadataString(source.user_role) || readMetadataString(source.role),
+    };
+};
 
 type JwkRecord = {
     kid?: string;
@@ -294,9 +312,13 @@ const verifySupabaseJwtLocally = async (token: string): Promise<VerifiedTokenIde
         return null;
     }
 
+    const metadataScope = extractScopeMetadata((verified as JwtPayload & { user_metadata?: unknown }).user_metadata);
+
     return {
         authUserId: verified.sub,
         email: typeof verified.email === 'string' ? verified.email.trim().toLowerCase() : undefined,
+        ...metadataScope,
+        role: metadataScope.role || readMetadataString((verified as JwtPayload & { role?: unknown }).role),
     };
 };
 
@@ -396,46 +418,57 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
 
         let authUserId: string | undefined;
         let authEmail: string | undefined;
+        let metadataScope = {
+            tenantId: verifiedIdentity?.tenantId,
+            facilityId: verifiedIdentity?.facilityId,
+            role: verifiedIdentity?.role,
+        };
 
         if (verifiedIdentity) {
             authUserId = verifiedIdentity.authUserId;
             authEmail = verifiedIdentity.email;
         } else {
             const { data, error } = await supabaseAdmin.auth.getUser(token);
-        if (error || !data?.user) {
-            if (isAuthDebug) {
-                console.error('[AUTH DEBUG] getUser error:', error?.message || 'No user data');
-            }
+            if (error || !data?.user) {
+                if (isAuthDebug) {
+                    console.error('[AUTH DEBUG] getUser error:', error?.message || 'No user data');
+                }
 
-            if (!data?.user && !error) {
+                if (!data?.user && !error) {
+                    return {
+                        ok: false,
+                        status: 401,
+                        error: 'Invalid token',
+                        authFailure: true,
+                    };
+                }
+
+                const classified = classifyAuthProviderFailure(error);
+                if (!classified.authFailure) {
+                    const cachedUser = getCachedValidatedUser(token);
+                    if (cachedUser) {
+                        return {
+                            ok: true,
+                            user: cachedUser,
+                        };
+                    }
+                }
                 return {
                     ok: false,
-                    status: 401,
-                    error: 'Invalid token',
-                    authFailure: true,
+                    status: classified.status,
+                    error: classified.error,
+                    authFailure: classified.authFailure,
                 };
             }
 
-            const classified = classifyAuthProviderFailure(error);
-            if (!classified.authFailure) {
-                const cachedUser = getCachedValidatedUser(token);
-                if (cachedUser) {
-                    return {
-                        ok: true,
-                        user: cachedUser,
-                    };
-                }
-            }
-            return {
-                ok: false,
-                status: classified.status,
-                error: classified.error,
-                authFailure: classified.authFailure,
-            };
-        }
-
+            const providerMetadataScope = extractScopeMetadata((data.user as any)?.user_metadata);
             authUserId = data.user.id;
             authEmail = data.user.email?.trim().toLowerCase() || undefined;
+            metadataScope = {
+                ...metadataScope,
+                ...providerMetadataScope,
+                role: providerMetadataScope.role || readMetadataString((data.user as any)?.role) || metadataScope.role,
+            };
         }
 
         if (!authUserId) {
@@ -506,10 +539,10 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
         const resolvedUser: AuthUser = {
             authUserId,
             profileId: profile?.id,
-            tenantId: profile?.tenant_id,
-            facilityId: profile?.facility_id,
+            tenantId: profile?.tenant_id || metadataScope.tenantId,
+            facilityId: profile?.facility_id || metadataScope.facilityId,
             email: authEmail,
-            role: (profile?.user_role as Role | null) || 'staff',
+            role: ((profile?.user_role as Role | null) || metadataScope.role || 'staff') as Role,
         };
 
         validatedTokenCache.set(token, resolvedUser);

@@ -17,13 +17,17 @@ const loadModules = async () => {
   const configModule = await import('../../config/supabase');
   return {
     requireUser: authModule.requireUser,
+    requireScopedUser: authModule.requireScopedUser,
     supabaseAdmin: (configModule as any).supabaseAdmin,
   };
 };
 
-const buildApp = (requireUser: any) => {
+const buildApp = (requireUser: any, requireScopedUser?: any) => {
   const app = express();
   app.get('/secure', requireUser, (_req, res) => {
+    res.json({ ok: true });
+  });
+  app.get('/scoped-secure', requireUser, requireScopedUser || ((_req: any, _res: any, next: any) => next()), (_req, res) => {
     res.json({ ok: true });
   });
   return app;
@@ -231,6 +235,86 @@ test('requireUser accepts a locally verified Supabase JWT when auth provider is 
     const app = buildApp(requireUser);
     const response = await request(app)
       .get('/secure')
+      .set('authorization', `Bearer ${token}`);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { ok: true });
+  } finally {
+    global.fetch = originalFetch;
+    (supabaseAdmin as any).auth = originalAuth;
+    (supabaseAdmin as any).from = originalFrom;
+  }
+});
+
+test('requireScopedUser accepts clinic scope from signed auth metadata when profile row is missing', async () => {
+  const { requireUser, requireScopedUser, supabaseAdmin } = await loadModules();
+  const originalAuth = (supabaseAdmin as any).auth;
+  const originalFrom = (supabaseAdmin as any).from;
+  const originalFetch = global.fetch;
+
+  try {
+    const { privateKey, publicKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+    });
+    const kid = 'test-bootstrap-scope-kid';
+    const publicJwk = publicKey.export({ format: 'jwk' }) as Record<string, unknown>;
+
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          keys: [{ ...publicJwk, kid, alg: 'RS256', use: 'sig' }],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+          },
+        }
+      )) as typeof fetch;
+
+    (supabaseAdmin as any).auth = {
+      getUser: async () => ({
+        data: { user: null },
+        error: { status: 503, message: 'upstream unavailable' },
+      }),
+    };
+
+    (supabaseAdmin as any).from = () => ({
+      select: () => ({
+        eq: () => ({
+          limit: () => ({
+            maybeSingle: async () => ({
+              data: null,
+              error: null,
+            }),
+          }),
+        }),
+      }),
+    });
+
+    const token = jwt.sign(
+      {
+        email: 'clinic.admin@linkhc.org',
+        role: 'authenticated',
+        user_metadata: {
+          user_role: 'admin',
+          tenant_id: 'tenant-bootstrap',
+          facility_id: 'facility-bootstrap',
+        },
+      },
+      privateKey,
+      {
+        algorithm: 'RS256',
+        keyid: kid,
+        issuer: `${process.env.SUPABASE_URL}/auth/v1`,
+        subject: 'auth-user-bootstrap',
+        expiresIn: '10m',
+      }
+    );
+
+    const app = buildApp(requireUser, requireScopedUser);
+    const response = await request(app)
+      .get('/scoped-secure')
       .set('authorization', `Bearer ${token}`);
 
     assert.equal(response.status, 200);
