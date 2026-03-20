@@ -36,6 +36,23 @@ export type PlatformActivityEvent = {
   timezone?: string | null;
   locale?: string | null;
   occurredAt?: string | null;
+  frontendReleaseSha?: string | null;
+  frontendAssetBundle?: string | null;
+  serviceWorkerState?: string | null;
+  serviceWorkerScriptUrl?: string | null;
+  networkOnline?: boolean | null;
+  networkEffectiveType?: string | null;
+  authBootstrapPhase?: string | null;
+  scopeSource?: string | null;
+  requestId?: string | null;
+  errorFingerprint?: string | null;
+  failureKind?: string | null;
+  serverDecisionReason?: string | null;
+  routeFrom?: string | null;
+  activeFacilityId?: string | null;
+  failingChunkUrl?: string | null;
+  boundaryName?: string | null;
+  componentStack?: string | null;
   metadata?: Record<string, unknown> | null;
 };
 
@@ -72,6 +89,11 @@ const clampInt = (value: unknown, max = 24 * 60 * 60 * 1000) => {
   return Math.min(Math.round(value), max);
 };
 
+const clampBoolean = (value: unknown) => {
+  if (typeof value !== 'boolean') return null;
+  return value;
+};
+
 const asIsoTimestampOrNow = (value?: string | null) => {
   if (!value) return new Date().toISOString();
   const parsed = new Date(value);
@@ -102,7 +124,7 @@ const resolveAppOriginHint = () =>
     512
   );
 
-const resolveReleaseSha = () =>
+const resolveBackendReleaseSha = () =>
   clampText(
     process.env.RELEASE_SHA ||
       process.env.GIT_SHA ||
@@ -110,6 +132,21 @@ const resolveReleaseSha = () =>
       process.env.K_REVISION,
     128
   );
+
+const deriveFailureKind = (event: PlatformActivityEvent) => {
+  const explicit = clampText(event.failureKind, 64);
+  if (explicit) return explicit;
+
+  const errorMessage = String(event.errorMessage || '').toLowerCase();
+  if (event.category === 'error') return 'client_crash';
+  if (errorMessage.includes('chunk') || errorMessage.includes('dynamically imported module')) return 'chunk_load';
+  if (errorMessage.includes('failed to fetch') || errorMessage.includes('network') || errorMessage.includes('internet_disconnected')) {
+    return 'transport';
+  }
+  if (typeof event.responseStatus === 'number') return 'http_response';
+  if (errorMessage.includes('auth') || errorMessage.includes('session')) return 'auth_bootstrap';
+  return null;
+};
 
 const mergeMetadata = (
   event: PlatformActivityEvent,
@@ -120,7 +157,46 @@ const mergeMetadata = (
     ...metadata,
     environment: clampText((metadata as Record<string, unknown>).environment, 32) || resolveDeploymentEnvironment(),
     app_origin: clampText((metadata as Record<string, unknown>).app_origin, 512) || resolveAppOriginHint(),
-    release_sha: clampText((metadata as Record<string, unknown>).release_sha, 128) || resolveReleaseSha(),
+    frontend_release_sha:
+      clampText(event.frontendReleaseSha, 128) ||
+      clampText((metadata as Record<string, unknown>).frontend_release_sha, 128) ||
+      clampText((metadata as Record<string, unknown>).release_sha, 128),
+    backend_release_sha:
+      clampText((metadata as Record<string, unknown>).backend_release_sha, 128) || resolveBackendReleaseSha(),
+    frontend_asset_bundle:
+      clampText(event.frontendAssetBundle, 320) || clampText((metadata as Record<string, unknown>).frontend_asset_bundle, 320),
+    service_worker_state:
+      clampText(event.serviceWorkerState, 64) || clampText((metadata as Record<string, unknown>).service_worker_state, 64),
+    service_worker_script_url:
+      clampText(event.serviceWorkerScriptUrl, 512) ||
+      clampText((metadata as Record<string, unknown>).service_worker_script_url, 512),
+    network_online:
+      clampBoolean(event.networkOnline) ?? ((metadata as Record<string, unknown>).network_online as boolean | null | undefined) ?? null,
+    network_effective_type:
+      clampText(event.networkEffectiveType, 64) || clampText((metadata as Record<string, unknown>).network_effective_type, 64),
+    auth_bootstrap_phase:
+      clampText(event.authBootstrapPhase, 64) || clampText((metadata as Record<string, unknown>).auth_bootstrap_phase, 64),
+    scope_source:
+      clampText(event.scopeSource, 64) || clampText((metadata as Record<string, unknown>).scope_source, 64),
+    request_id:
+      asUuidOrNull(event.requestId) || asUuidOrNull((metadata as Record<string, unknown>).request_id as string | null | undefined),
+    error_fingerprint:
+      clampText(event.errorFingerprint, 256) || clampText((metadata as Record<string, unknown>).error_fingerprint, 256),
+    failure_kind:
+      deriveFailureKind(event) || clampText((metadata as Record<string, unknown>).failure_kind, 64),
+    server_decision_reason:
+      clampText(event.serverDecisionReason, 128) || clampText((metadata as Record<string, unknown>).server_decision_reason, 128),
+    route_from:
+      clampText(event.routeFrom, 512) || clampText((metadata as Record<string, unknown>).route_from, 512),
+    active_facility_id:
+      asUuidOrNull(event.activeFacilityId) ||
+      asUuidOrNull((metadata as Record<string, unknown>).active_facility_id as string | null | undefined),
+    failing_chunk_url:
+      clampText(event.failingChunkUrl, 512) || clampText((metadata as Record<string, unknown>).failing_chunk_url, 512),
+    boundary_name:
+      clampText(event.boundaryName, 160) || clampText((metadata as Record<string, unknown>).boundary_name, 160),
+    component_stack:
+      clampText(event.componentStack, 4000) || clampText((metadata as Record<string, unknown>).component_stack, 4000),
     actor_role_hint: clampText(event.actorRole, 128),
     actor_email_hint: clampText(event.actorEmail, 320),
     request_path: clampText(event.requestPath, 512),
@@ -173,6 +249,60 @@ export const recordPlatformActivityEvents = async (
     referrer: clampText(event.referrer, 512),
     timezone: clampText(event.timezone, 120),
     locale: clampText(event.locale, 64),
+    frontend_release_sha:
+      clampText(event.frontendReleaseSha, 128) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.frontend_release_sha, 128) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.release_sha, 128),
+    backend_release_sha: resolveBackendReleaseSha(),
+    frontend_asset_bundle:
+      clampText(event.frontendAssetBundle, 320) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.frontend_asset_bundle, 320),
+    service_worker_state:
+      clampText(event.serviceWorkerState, 64) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.service_worker_state, 64),
+    service_worker_script_url:
+      clampText(event.serviceWorkerScriptUrl, 512) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.service_worker_script_url, 512),
+    network_online:
+      clampBoolean(event.networkOnline) ??
+      ((event.metadata as Record<string, unknown> | null | undefined)?.network_online as boolean | null | undefined) ??
+      null,
+    network_effective_type:
+      clampText(event.networkEffectiveType, 64) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.network_effective_type, 64),
+    auth_bootstrap_phase:
+      clampText(event.authBootstrapPhase, 64) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.auth_bootstrap_phase, 64),
+    scope_source:
+      clampText(event.scopeSource, 64) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.scope_source, 64),
+    request_id:
+      asUuidOrNull(event.requestId) ||
+      asUuidOrNull((event.metadata as Record<string, unknown> | null | undefined)?.request_id as string | null | undefined),
+    error_fingerprint:
+      clampText(event.errorFingerprint, 256) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.error_fingerprint, 256),
+    failure_kind:
+      deriveFailureKind(event) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.failure_kind, 64),
+    server_decision_reason:
+      clampText(event.serverDecisionReason, 128) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.server_decision_reason, 128),
+    route_from:
+      clampText(event.routeFrom, 512) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.route_from, 512),
+    active_facility_id:
+      asUuidOrNull(event.activeFacilityId) ||
+      asUuidOrNull((event.metadata as Record<string, unknown> | null | undefined)?.active_facility_id as string | null | undefined),
+    failing_chunk_url:
+      clampText(event.failingChunkUrl, 512) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.failing_chunk_url, 512),
+    boundary_name:
+      clampText(event.boundaryName, 160) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.boundary_name, 160),
+    component_stack:
+      clampText(event.componentStack, 4000) ||
+      clampText((event.metadata as Record<string, unknown> | null | undefined)?.component_stack, 4000),
     metadata: mergeMetadata(event, context),
     occurred_at: asIsoTimestampOrNow(event.occurredAt),
   }));
