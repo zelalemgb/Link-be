@@ -58,6 +58,7 @@ test('requireUser returns 429 when auth provider is rate-limited', async () => {
     assert.deepEqual(response.body, {
       error: 'Auth service rate limit reached. Please try again later.',
     });
+    assert.equal(response.headers['x-server-decision-reason'], 'auth_rate_limited');
   } finally {
     (supabaseAdmin as any).auth = originalAuth;
     (supabaseAdmin as any).from = originalFrom;
@@ -89,10 +90,36 @@ test('requireUser returns 503 when auth provider is unavailable', async () => {
     assert.deepEqual(response.body, {
       error: 'Authentication service temporarily unavailable. Please retry.',
     });
+    assert.equal(response.headers['x-server-decision-reason'], 'auth_service_unavailable');
   } finally {
     (supabaseAdmin as any).auth = originalAuth;
     (supabaseAdmin as any).from = originalFrom;
   }
+});
+
+test('requireScopedUser tags missing scope responses with a decision reason header', async () => {
+  const { requireScopedUser } = await loadModules();
+  const app = express();
+  app.get(
+    '/scoped-only',
+    (req, _res, next) => {
+      (req as any).user = {
+        authUserId: 'auth-user-1',
+        role: 'admin',
+      };
+      next();
+    },
+    requireScopedUser,
+    (_req, res) => {
+      res.json({ ok: true });
+    }
+  );
+
+  const response = await request(app).get('/scoped-only');
+
+  assert.equal(response.status, 403);
+  assert.equal(response.body.error, 'Missing tenant or facility context');
+  assert.equal(response.headers['x-server-decision-reason'], 'missing_scope_context');
 });
 
 test('requireUser falls back to a recently validated token when auth provider becomes unavailable', async () => {

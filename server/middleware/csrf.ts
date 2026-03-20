@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
+import { respondWithDecisionReason } from '../utils/decisionReason';
 
 const CSRF_COOKIE = 'csrf_token';
 const CSRF_HEADER = 'x-csrf-token';
@@ -52,7 +53,7 @@ export const csrfProtection = (req: Request, res: Response, next: NextFunction) 
   const headerToken = req.header(CSRF_HEADER);
 
   if (!cookieToken || !headerToken || cookieToken !== headerToken) {
-    return res.status(403).json({ error: 'CSRF validation failed' });
+    return respondWithDecisionReason(res, 403, { error: 'CSRF validation failed' }, 'csrf_validation_failed');
   }
 
   return next();

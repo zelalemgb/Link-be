@@ -3,6 +3,7 @@ import { createHash, createPublicKey, KeyObject } from 'crypto';
 import jwt, { Algorithm, JwtHeader, JwtPayload } from 'jsonwebtoken';
 import { supabaseAdmin } from '../config/supabase';
 import { recordAuthFailure } from '../services/monitoring';
+import { respondWithDecisionReason } from '../utils/decisionReason';
 
 const { ADMIN_API_SECRET, AUTH_DEBUG } = process.env;
 const isAuthDebug = AUTH_DEBUG === 'true';
@@ -228,7 +229,7 @@ export interface AuthUser {
 
 type ResolvedAuthResult =
     | { ok: true; user: AuthUser }
-    | { ok: false; status: number; error: string; authFailure: boolean };
+    | { ok: false; status: number; error: string; authFailure: boolean; decisionReason: string };
 
 declare global {
     namespace Express {
@@ -254,6 +255,7 @@ const classifyAuthProviderFailure = (error: any) => {
             status: 401,
             error: 'Invalid token',
             authFailure: true,
+            decisionReason: 'invalid_token',
         };
     }
 
@@ -266,6 +268,7 @@ const classifyAuthProviderFailure = (error: any) => {
             status: 429,
             error: 'Auth service rate limit reached. Please try again later.',
             authFailure: false,
+            decisionReason: 'auth_rate_limited',
         };
     }
 
@@ -273,6 +276,7 @@ const classifyAuthProviderFailure = (error: any) => {
         status: 503,
         error: 'Authentication service temporarily unavailable. Please retry.',
         authFailure: false,
+        decisionReason: 'auth_service_unavailable',
     };
 };
 
@@ -332,7 +336,7 @@ export const requireUser = async (req: Request, res: Response, next: NextFunctio
         if (resolved.authFailure) {
             recordAuthFailure(req.requestId);
         }
-        return res.status(resolved.status).json({ error: resolved.error });
+        return respondWithDecisionReason(res, resolved.status, { error: resolved.error }, resolved.decisionReason);
     }
 
     req.user = resolved.user;
@@ -361,7 +365,7 @@ export const optionalUser = async (req: Request, _res: Response, next: NextFunct
 
 export const requireScopedUser = (req: Request, res: Response, next: NextFunction) => {
     if (!req.user) {
-        return res.status(401).json({ error: 'Missing user context' });
+        return respondWithDecisionReason(res, 401, { error: 'Missing user context' }, 'missing_user_context');
     }
 
     if (req.user.role === 'super_admin') {
@@ -369,7 +373,12 @@ export const requireScopedUser = (req: Request, res: Response, next: NextFunctio
     }
 
     if (!req.user.tenantId || !req.user.facilityId) {
-        return res.status(403).json({ error: 'Missing tenant or facility context' });
+        return respondWithDecisionReason(
+            res,
+            403,
+            { error: 'Missing tenant or facility context' },
+            'missing_scope_context'
+        );
     }
 
     return next();
@@ -377,7 +386,12 @@ export const requireScopedUser = (req: Request, res: Response, next: NextFunctio
 
 export const superAdminGuard = (req: Request, res: Response, next: NextFunction) => {
     if (!req.user || req.user.role !== 'super_admin') {
-        return res.status(403).json({ error: 'Forbidden: Super Admin access required' });
+        return respondWithDecisionReason(
+            res,
+            403,
+            { error: 'Forbidden: Super Admin access required' },
+            'forbidden_super_admin_required'
+        );
     }
     next();
 };
@@ -387,7 +401,7 @@ export const adminKeyGuard = (req: Request, res: Response, next: NextFunction) =
     if (key && key === ADMIN_API_SECRET) {
         next();
     } else {
-        res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
+        respondWithDecisionReason(res, 401, { error: 'Unauthorized: Invalid API Key' }, 'invalid_admin_api_key');
     }
 };
 
@@ -403,6 +417,7 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
             status: 401,
             error: 'Missing bearer token',
             authFailure: true,
+            decisionReason: 'missing_bearer_token',
         };
     }
 
@@ -440,6 +455,7 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
                         status: 401,
                         error: 'Invalid token',
                         authFailure: true,
+                        decisionReason: 'invalid_token',
                     };
                 }
 
@@ -458,6 +474,7 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
                     status: classified.status,
                     error: classified.error,
                     authFailure: classified.authFailure,
+                    decisionReason: classified.decisionReason,
                 };
             }
 
@@ -477,6 +494,7 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
                 status: 401,
                 error: 'Invalid token',
                 authFailure: true,
+                decisionReason: 'invalid_token',
             };
         }
 
@@ -511,6 +529,7 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
                     status: 500,
                     error: 'Failed to fetch user profile',
                     authFailure: true,
+                    decisionReason: 'profile_lookup_failed',
                 };
             }
 
@@ -565,6 +584,7 @@ const resolveRequestUser = async (req: Request): Promise<ResolvedAuthResult> => 
             status: 500,
             error: 'Internal auth error',
             authFailure: false,
+            decisionReason: 'internal_auth_error',
         };
     }
 };

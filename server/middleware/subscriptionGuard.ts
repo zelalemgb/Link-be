@@ -14,6 +14,7 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { getSubscriptionStatus } from '../services/subscriptionService';
+import { respondWithDecisionReason } from '../utils/decisionReason';
 
 // Routes always allowed regardless of subscription state
 const BYPASS_PREFIXES = [
@@ -86,13 +87,18 @@ export async function subscriptionGuard(req: Request, res: Response, next: NextF
     }
 
     // Block writes
-    return res.status(402).json({
-      error: 'subscription_required',
-      message: subscriptionStatus.message || 'Your subscription has expired. Please renew to continue.',
-      subscriptionStatus: subscriptionStatus.status,
-      daysRemaining: subscriptionStatus.daysRemaining,
-      upgradeUrl: `${process.env.FRONTEND_URL || ''}/subscribe`,
-    });
+    return respondWithDecisionReason(
+      res,
+      402,
+      {
+        error: 'subscription_required',
+        message: subscriptionStatus.message || 'Your subscription has expired. Please renew to continue.',
+        subscriptionStatus: subscriptionStatus.status,
+        daysRemaining: subscriptionStatus.daysRemaining,
+        upgradeUrl: `${process.env.FRONTEND_URL || ''}/subscribe`,
+      },
+      'subscription_required'
+    );
 
   } catch (err: any) {
     // On error, allow through (fail open — don't block clinical operations)

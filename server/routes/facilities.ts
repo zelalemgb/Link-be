@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { supabaseAdmin } from '../config/supabase';
 import { requireUser, requireScopedUser } from '../middleware/auth';
 import { normalizeWorkspaceMetadata } from '../services/workspaceMetadata';
+import { respondWithDecisionReason } from '../utils/decisionReason';
 
 const router = Router();
 
@@ -193,7 +194,7 @@ router.get('/:id', requireUser, requireScopedUser, async (req, res) => {
   try {
     const hasAccess = await resolveFacilityAccess(req, parsed.data);
     if (!hasAccess) {
-      return res.status(403).json({ error: 'Forbidden: Facility access denied' });
+      return respondWithDecisionReason(res, 403, { error: 'Forbidden: Facility access denied' }, 'facility_access_denied');
     }
 
     let query = supabaseAdmin
@@ -237,7 +238,7 @@ router.get('/:id/basic', requireUser, requireScopedUser, async (req, res) => {
   try {
     const hasAccess = await resolveFacilityAccess(req, parsed.data);
     if (!hasAccess) {
-      return res.status(403).json({ error: 'Forbidden: Facility access denied' });
+      return respondWithDecisionReason(res, 403, { error: 'Forbidden: Facility access denied' }, 'facility_access_denied');
     }
 
     let query = supabaseAdmin
@@ -287,7 +288,7 @@ router.put('/:id', requireUser, requireScopedUser, async (req, res) => {
   try {
     const hasAccess = await resolveFacilityAccess(req, parsedId.data);
     if (!hasAccess) {
-      return res.status(403).json({ error: 'Forbidden: Facility access denied' });
+      return respondWithDecisionReason(res, 403, { error: 'Forbidden: Facility access denied' }, 'facility_access_denied');
     }
 
     let query = supabaseAdmin
@@ -339,7 +340,7 @@ router.patch('/:id/workspace/modules', requireUser, requireScopedUser, async (re
   try {
     const hasAccess = await resolveFacilityAccess(req, parsedId.data);
     if (!hasAccess) {
-      return res.status(403).json({ error: 'Forbidden: Facility access denied' });
+      return respondWithDecisionReason(res, 403, { error: 'Forbidden: Facility access denied' }, 'facility_access_denied');
     }
 
     let facilityQuery = supabaseAdmin
